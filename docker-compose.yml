@@ -5,8 +5,8 @@ services:
     build:
       context: ./apps/edge_manager
     ports:
-      - "8001:80"       # FastAPI
-      - "50051:50051" # gRPC
+      - "8001:8001"
+      - "443:50051" # 50051 포트 대신 호스트의 443 포트를 사용
     environment:
       - MODULE_NAME=edge_manager
       - REDIS_URL=redis://redis:6379
