@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package edge;
+
+service EdgeManager {
+  // 양방향 스트리밍(Bi-directional Streaming):
+  // 엣지은 영상 분석 중간 결과나 ONVIF 메타데이터를 전송하고,
+  // 서버는 각 장치에 대한 카메라 제어 등의 명령을 전송합니다.
+  rpc StreamDataAndControl (stream EdgeStreamRequest) returns (stream ServerControlResponse) {}
+}
+
+message VideoFeatureData {
+    int64 timestamp = 1;
+    string frame_id = 2;
+    int32 camera_id = 3;         // 특징맵이 추출된 엣지 내 카메라 ID
+    bytes feature_map = 4;       // 이미지 피처맵 텐서 데이터 (직렬화)
+    bytes voxel_data = 5;        // 상대 좌표계 복셀 기반 중간 결과물 (직렬화)
+    bytes compressed_image = 6;  // (선택) 디버깅용 
+}
+
+message OnvifMetadata {
+    string camera_id = 1;
+    string config_json = 2; // ONVIF에서 가져온 정보(PTZ, 캘리브레이션 등)를 담은 JSON 문자열
+}
+
+// 엣지 -> 서버 수신 데이터 구조
+message EdgeStreamRequest {
+  string device_id = 1;
+
+  oneof payload {
+    VideoFeatureData video_data = 2;
+    OnvifMetadata onvif_data = 3;
+    string heartbeat = 4; // 연결 확인용 핑
+  }
+}
+
+// 서버 -> 엣지 송신 제어 명령 구조
+message ServerControlResponse {
+  string command = 1;      // 예: "RESTART_CAMERA", "UPDATE_PTZ", "STOP_STREAM"
+  string parameters = 2;   // JSON 형태로 파라미터 전달 (선택)
+}

@@ -1,0 +1,106 @@
+version: '3.8'
+
+services:
+  edge_manager:
+    build:
+      context: ./apps/edge_manager
+    ports:
+      - "8001:80"       # FastAPI
+      - "50051:50051" # gRPC
+    environment:
+      - MODULE_NAME=edge_manager
+      - REDIS_URL=redis://redis:6379
+    networks:
+      - dt_network
+    depends_on:
+      - redis
+
+  dl_worker:
+    build:
+      context: ./apps/dl_worker
+    ports:
+      - "8002:80"
+    environment:
+      - MODULE_NAME=dl_worker
+      - REDIS_URL=redis://redis:6379
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - dt_network
+    depends_on:
+      - redis
+
+  camera_manager:
+    build:
+      context: ./apps/camera_manager
+    ports:
+      - "8003:80"
+    environment:
+      - MODULE_NAME=camera_manager
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://dt_admin:dt_password@postgres_db:5432/dt_metadata
+    networks:
+      - dt_network
+    depends_on:
+      - redis
+      - postgres_db
+
+  sim_backend:
+    build:
+      context: ./apps/sim_backend
+    ports:
+      - "8004:80"
+    environment:
+      - MODULE_NAME=sim_backend
+      - REDIS_URL=redis://redis:6379
+    networks:
+      - dt_network
+    depends_on:
+      - redis
+
+  frontend_api:
+    build:
+      context: ./apps/frontend_api
+    ports:
+      - "8005:80"
+    environment:
+      - MODULE_NAME=frontend_api
+      - REDIS_URL=redis://redis:6379
+    networks:
+      - dt_network
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - dt_network
+    # 성능 최적화를 위해 디스크 저장을 최소화하고 메모리에만 올리도록 설정
+    command: redis-server --save "" --appendonly no
+
+  postgres_db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: dt_admin
+      POSTGRES_PASSWORD: dt_password
+      POSTGRES_DB: dt_metadata
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - dt_network
+
+networks:
+  dt_network:
+    driver: bridge
+
+volumes:
+  pgdata:
