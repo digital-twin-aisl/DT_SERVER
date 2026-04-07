@@ -21,61 +21,72 @@ class EdgeManagerServicer(edge_communication_pb2_grpc.EdgeManagerServicer):
     async def StreamDataAndControl(self, request_iterator, context):
         device_id = None
         print("========== [gRPC] 엣지 디바이스 스트림 시작 ==========")
+        
+        # 1. 안전한 비동기 태스크 생성 (__anext__() 대신 read() 사용)
+        receive_task = asyncio.create_task(request_iterator.read())
+        send_task = None
+        
         try:
-            # 첫 번째 메시지를 받아 device_id 식별 및 큐 등록
-            first_request = await request_iterator.__anext__()
-            device_id = first_request.device_id
-            print(f"========== [gRPC] 엣지 연결 확인: {device_id} ==========")
-            
-            # 해당 엣지 전용 명령 큐(Queue) 할당
-            if device_id not in edge_control_queues:
-                edge_control_queues[device_id] = asyncio.Queue()
-
-            # 첫 메시지는 데이터일 수 있으므로 그대로 처리 로직으로 넘김
-            asyncio.create_task(self._process_single_request(first_request, device_id))
-            
-            # 송신(Server->Edge)과 수신(Edge->Server) 태스크를 분리
-            # await request_iterator (단순 yield stream 사용)
             while True:
-                 # queue에서 송신할 메시지 대기 중에는 request_iterator._anext() 에서도 대기하는
-                 # 듀얼 루프를 통합하기 위한 병렬 wait 구조. gRPC Async 특성상 yield가 가장 직관적
-                 
-                 # 수신 대기 task
-                 recv_task = asyncio.create_task(request_iterator.__anext__())
-                 # 송신(큐) 대기 task
-                 send_task = asyncio.create_task(edge_control_queues[device_id].get())
+                # 엣지 큐가 할당되었으나 send_task가 없으면 대기 태스크 생성
+                if send_task is None and device_id is not None:
+                    send_task = asyncio.create_task(edge_control_queues[device_id].get())
+                
+                tasks = [receive_task]
+                if send_task:
+                    tasks.append(send_task)
+                    
+                done, pending = await asyncio.wait(
+                    tasks, 
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # --- 수신(Uplink) 처리 ---
+                if receive_task in done:
+                    request = receive_task.result()
+                    
+                    # 연결 강제 종료 또는 클라이언트가 스트림을 닫았을 때
+                    if request is grpc.aio.EOF or request is None:
+                        print(f"========== [gRPC] 스트림 EOF 도달 (정상 종료) ==========")
+                        break
+                    
+                    # 첫 연결 시 device_id 저장
+                    if not device_id and request.device_id:
+                        device_id = request.device_id
+                        print(f"========== [gRPC] 엣지 연결 확인: {device_id} ==========")
+                        # 해당 엣지 전용 명령 큐 할당
+                        if device_id not in edge_control_queues:
+                            edge_control_queues[device_id] = asyncio.Queue()
 
-                 done, pending = await asyncio.wait(
-                     [recv_task, send_task], 
-                     return_when=asyncio.FIRST_COMPLETED
-                 )
+                    # 개별 데이터 처리 분기 (Redis 발행 등)
+                    await self._process_single_request(request, device_id)
+                    
+                    # 다음 데이터 수신을 위해 루프 갱신
+                    receive_task = asyncio.create_task(request_iterator.read())
 
-                 # 1. 엣지에서 올라온 메시지(Uplink) 수신 처리
-                 if recv_task in done:
-                     request = recv_task.result()
-                     await self._process_single_request(request, device_id)
-                 else:
-                     recv_task.cancel() # 송신이 먼저 뜨면 수신 취소 후 다음루프 재시작
+                # --- 송신(Downlink) 처리 ---
+                if send_task and send_task in done:
+                    command_msg = send_task.result()
+                    await context.write(command_msg)
+                    
+                    # 다음 명령을 기다리기 위해 태스크 갱신
+                    send_task = asyncio.create_task(edge_control_queues[device_id].get())
 
-                 # 2. 서버에서 보낼 메시지 처리 (Downlink)
-                 if send_task in done:
-                     command_msg = send_task.result()
-                     yield command_msg # gRPC Response Stream으로 엣지에 발송
-                     edge_control_queues[device_id].task_done()
-                 else:
-                     send_task.cancel() 
-
-        except StopAsyncIteration:
-            print("========== [gRPC] 엣지가 연결을 종료함 ==========")
         except asyncio.CancelledError:
             print("========== [gRPC] 연결 종료 (Cancelled) ==========")
         except Exception as e:
             print(f"========== [gRPC] 스트리밍 오류: {e} ==========")
         finally:
+            # 잔여 태스크 취소
+            if not receive_task.done():
+                receive_task.cancel()
+            if send_task and not send_task.done():
+                send_task.cancel()
+                
             # 스트림 종료 시 큐 정리
             if device_id and device_id in edge_control_queues:
                 del edge_control_queues[device_id]
-            print(f"========== [gRPC] 엣지 연결 해제 완료: {device_id} ==========")
+                print(f"========== [gRPC] 엣지 연결 해제 완료: {device_id} ==========")
 
     async def _process_single_request(self, request, device_id):
         """개별 요청(데이터 업링크)에 대한 처리 (Video/ONVIF 등)"""
