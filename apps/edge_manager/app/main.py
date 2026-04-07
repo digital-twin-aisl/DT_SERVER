@@ -18,12 +18,20 @@ redis_pubsub = redis_client.pubsub()
 edge_control_queues = {}
 
 class EdgeManagerServicer(edge_communication_pb2_grpc.EdgeManagerServicer):
+    
+    async def _safe_recv(self, request_iterator):
+        """gRPC iterator의 내부 StopAsyncIteration 예외를 안전하게 캐치합니다."""
+        try:
+            return await request_iterator.__anext__()
+        except StopAsyncIteration:
+            return grpc.aio.EOF
+
     async def StreamDataAndControl(self, request_iterator, context):
         device_id = None
         print("========== [gRPC] 엣지 디바이스 스트림 시작 ==========")
         
-        # 1. 안전한 비동기 태스크 생성 (__anext__() 대신 read() 사용)
-        receive_task = asyncio.create_task(request_iterator.read())
+        # 1. 안전한 비동기 태스크 생성 (__anext__() 호출 시 발생하는 예외 방지)
+        receive_task = asyncio.create_task(self._safe_recv(request_iterator))
         send_task = None
         
         try:
@@ -62,7 +70,7 @@ class EdgeManagerServicer(edge_communication_pb2_grpc.EdgeManagerServicer):
                     await self._process_single_request(request, device_id)
                     
                     # 다음 데이터 수신을 위해 루프 갱신
-                    receive_task = asyncio.create_task(request_iterator.read())
+                    receive_task = asyncio.create_task(self._safe_recv(request_iterator))
 
                 # --- 송신(Downlink) 처리 ---
                 if send_task and send_task in done:
