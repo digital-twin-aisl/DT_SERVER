@@ -8,15 +8,18 @@
 
 엣지 노드(예: 192.168.0.x / 4G LTE LTE 망)와 클라우드/학내 서버(예: 공인 IP 210.xx.xx.xx)가 통신할 때 겪는 `NAT(Network Address Translation) 트래버셜` 또는 방화벽 인바운드 차단을 우회하기 위한 구조입니다.
 
-### 🛡️ 연결 시나리오 : Edge Initiated gRPC Streaming (Client $\rightarrow$ Server 단방향 수립)
+### 🛡️ 연결 시나리오 : 하이브리드 프로토콜 (WebRTC DataChannel + gRPC Keep-Alive)
 
-서버(방화벽 내부)가 직접 현장의 엣지 디바이스로 연결(TCP PUSH)을 시도하면 연결이 실패할 확률이 높습니다(포트 포워딩 필요).
-따라서 **엣지 디바이스가 서버의 공인(또는 VPN) IP의 `50051 (gRPC)` 포트로 먼저 연결을 맺고(Handshake), 이 거대한 튜브를 계속 열어두는(Keep-Alive) 방식**을 채택했습니다. (현재 작성된 `edge_manager`의 방식입니다.)
+실시간 분석 시스템의 지연 시간(Low Latency) 보장을 위해, 엣지 노드와 중앙 서버는 데이터 유형을 나누어 통신합니다.
 
-*   **[1단계]** `Edge` 전원 인가 시, `test_dummy_edge.py` 스크립트가 실행되어 `server_ip:50051` 로 gRPC `StreamDataAndControl` 호출.
-*   **[2단계]** `Server`는 해당 커넥션을 절대 끊지 않음. (HTTP/2의 멀티플렉싱).
-*   **[3단계]** `Server` 내부의 `camera_manager`에서 엣지의 카메라를 제어하고 싶을 때, 별도의 포트로 쏘지 않고 **열려있는 기존 gRPC 터널을 통해 응답(Yield)으로명령을 하달**.
-*   **[결과]** 엣지는 방화벽에 포트를 뚫어둘 필요 없이 아웃바운드 인터넷 연결만 가능하면 양방향 제어가 가능합니다.
+*   **고대역폭 실시간 데이터 (WebRTC UDP):** 10 FPS 수준의 무거운 영상 텐서는 Nginx를 통해 443 포트로 시그널링(`POST https://<서버IP>/api/edge/webrtc/offer`)을 맺고 P2P-UDP 채널을 수립합니다. 약간의 패킷 손실이 있더라도 최신 프레임을 100ms 내로 서버로 직통 전송합니다. 
+*   **신뢰성 및 제어 명령 (gRPC TCP):** Nginx가 단일로 열어둔 `443` 파이프로 터널을 뚫어두며, HTTP/2를 이용해 서버 $\rightarrow$ 엣지 역방향으로 카메라 조향 제어나 설정값을 안전하게 하달합니다.
+
+#### 동작 플로우:
+*   **[1단계]** `Edge` 전원 인가 시, Nginx의 `443` 포트를 통해 `/api/edge` 로 WebRTC SDP Offer를 던지고 텐서 전송용 UDP 세션을 수립.
+*   **[2단계]** 동시에, 수립된 `server_ip:443` (경로 `/edge_communication.EdgeManager`) 으로 gRPC TCP 커넥션을 영구적으로 열어 (`Keep-Alive`) 하베스팅 데이터 및 원격 제어 대기.
+*   **[3단계]** `Server` 내부의 `camera_manager`에서 엣지를 제어할 땐, 이 gRPC 터널을 통해 명령을 하달.
+*   **[결과]** 실시간 10 FPS는 Head-of-Line Blocking 없이 빠르고, 제어 명령은 방화벽 문제 없이 100% 신뢰성 있게 도달합니다.
 
 ---
 
@@ -35,11 +38,40 @@
 3. `camera_manager`는 엣지가 연산해 온 기초 데이터를 바탕으로 고도화된 `Intrinsic / Extrinsic Matrix`를 연산하여 PostgreSQL에 저장하고 배포합니다.
 
 ### 🏃 Step 3. 실시간 동적 추론 (Dynamic Inference Pipeline)
-1. 캘리브레이션이 완료되면, 엣지 디바이스는 가벼운 특징값(Feature Vector) 패킷을 초당 N프레임 단위로 무한 송신(Yield)합니다.
-2. 서버의 `dl_worker`는 GPU를 사용하여 수신된 패킷에서 3D 뼈대(Pose), 동적 모션, Bounding Box 등을 다듬어 추출해냅니다.
-3. 무거운 연산이 끝나는 즉시, 경량화된 JSON 형태 `{"persons": [...], "timestamp": ...}` 로 환산되어 Redis Pub/Sub에 올라갑니다.
+1. 캘리브레이션이 완료되면, 엣지 디바이스는 가벼운 특징값(Feature Vector) 패킷을 WebRTC DataChannel을 통해 100ms 파이프라인(10FPS)으로 무한 송신합니다.
+2. 서버는 `edge_manager` 내부에서 `Redis Stream`으로 텐서를 직접 던지고, 연결된 `dl_worker`가 이를 즉각 Pull해 GPU 추론(3D Pose, BBox 산출)을 거칩니다.
+3. 추론된 경량화 JSON 형태 `{"persons": [...], "timestamp": ...}` 데이터는 다시 Redis Pub/Sub에 발행되어 디지털 트윈 환경으로 흘러갑니다.
 
 ### 📺 Step 4. 디지털 트윈 동기화 구현 (Digital Twin Rendezvous)
-1. 교내 통합 관제실(또는 프론트엔드 URL `http://<서버IP>:8005/`)에 접속하면, SPA 방식의 **웹 대시보드**가 구동됩니다. 사용자는 "3D 트윈 뷰어" 탭을 켜고, 내장된 iframe을 통해 서버 백그라운드에 구동 중인 Isaac Sim의 화면(Pixel Steaming, WebRTC 포트 8211)을 직접 눈으로 확인합니다.
-2. `sim_backend`의 WebSocket 포트(`8004`)가 뿌려주는 3D 동적 메타데이터(`UpdateTransforms`)를 Isaac Sim의 내부 Extension `meta_sejong_script.py` 가 실시간으로 수신받아 3D 인간 아바타를 생성(Spawn)시킵니다.
-3. 웹페이지에 접속한 사용자가 마우스 클릭이나 래그를 하면(WebRTC Client JavaScript 작동), 이 제어 인풋값이 실시간으로 백그라운드의 Isaac Sim 뷰포트에 전송되어 서버 엔진의 실제 관찰 시점이 회전하고 이동합니다.
+1. 교내 통합 관제실(또는 프론트엔드 URL `https://<서버IP>:443/`)에 접속하면, SPA 방식의 **웹 대시보드**가 구동됩니다.
+2. 사용자는 "3D 트윈 뷰어" 탭을 통해 백그라운드의 Isaac Sim 렌더링 화면을 WebRTC 픽셀 스트리밍으로 직접 관찰합니다.
+3. `sim_backend`의 WebSocket 채널을 통해 뿌려지는 메타데이터를 Isaac Sim 내부의 `meta_sejong_script.py` Extension이 실시간 구독하여 3D 아바타 모션을 업데이트합니다.
+
+---
+
+## 3. 검증 및 테스트 명령어 가이드
+
+현 아키텍처의 WebRTC UDP(데이터) / gRPC TCP(제어) 하이브리드 병렬 동작을 테스트하려면 아래 명령어를 사용합니다.
+
+```bash
+# [서버] 1. 인프라 전체 기동 (Nginx 리버스 프록시 포함)
+docker compose up -d --build
+
+# [서버] 2. 컨테이너 상태 및 Redis/dl_worker 정상 대기 확인
+docker ps
+docker logs -f dt_server-dl_worker-1
+
+# [로컬/클라이언트] 3. 더미 엣지 디바이스 구동 (WebRTC 10FPS + gRPC KeepAlive)
+# (단일 443 포트 사용. 테스트 환경이므로 호스트 네트워크를 공유하여 접속 테스트)
+docker run --rm --network host -v $(pwd)/apps:/apps \
+  python:3.10-slim sh -c \
+  "pip install grpcio aiortc aiohttp requests protobuf dotenv urllib3 > /dev/null 2>&1 && \
+   HTTP_SERVER_URL=https://localhost:443/api/edge \
+   gRPC_SERVER_IP_PORT=localhost:443 \
+   PYTHONPATH=/ \
+   python /apps/edge_client/test_dummy_edge.py"
+
+# [서버] 4. 데이터 플로우 확인 (WebRTC 수신 -> Redis -> dl_worker 추론)
+docker logs dt_server-edge_manager-1 | grep WebRTC
+docker logs dt_server-dl_worker-1 | grep "추론 및 좌표 변환 완료"
+```

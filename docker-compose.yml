@@ -1,12 +1,28 @@
 version: '3.8'
 
 services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:8080"  # Frontend & API & Websocket
+      - "8443:8443"  # gRPC (Edge Manager)
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - dt_network
+    depends_on:
+      - frontend_api
+      - edge_manager
+      - sim_backend
+
   edge_manager:
     build:
       context: ./apps/edge_manager
     ports:
-      - "8001:8001"
-      - "443:50051" # 50051 포트 대신 호스트의 443 포트를 사용
+      - "8001:80"
+      - "10000-11000:10000-11000/udp" # webRTC UDP 포트 범위
+    expose:
+      - "50051"
     environment:
       - MODULE_NAME=edge_manager
       - REDIS_URL=redis://redis:6379

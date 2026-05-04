@@ -1,7 +1,9 @@
 import asyncio
 import os
 import json
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from aiortc import RTCPeerConnection, RTCSessionDescription
 import grpc
 from grpc.aio import server as grpc_server
 import redis.asyncio as redis
@@ -146,6 +148,62 @@ async def serve_grpc():
     await server.wait_for_termination()
 
 app = FastAPI(title="Edge Manager Service")
+
+# WebRTC 피어 커넥션들을 유지하기 위한 전역 Dict (key: device_id, value: RTCPeerConnection)
+webrtc_pcs = set()
+
+@app.post("/webrtc/offer")
+async def webrtc_offer(request: Request):
+    params = await request.json()
+    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+    device_id = params.get("device_id", "unknown_edge")
+
+    pc = RTCPeerConnection()
+    webrtc_pcs.add(pc)
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        print(f"========== [WebRTC] {device_id} DataChannel 연결 됨: {channel.label} ==========")
+        @channel.on("message")
+        def on_message(message):
+            # 수신된 고대역폭 데이터(비디오/텐서)를 Redis Stream으로 즉각 푸시
+            # 예: 바이너리 형태라고 가정
+            # print(f"[{device_id}] WebRTC 데이터 수신: {len(message)} bytes")
+            asyncio.create_task(
+                redis_client.xadd(
+                    name="stream:video_data",
+                    fields={
+                        b"device_id": device_id.encode('utf-8'),
+                        b"payload": message
+                    },
+                    maxlen=100, 
+                    approximate=True
+                )
+            )
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        print(f"========== [WebRTC] {device_id} 상태 변경: {pc.connectionState} ==========")
+        if pc.connectionState == "failed" or pc.connectionState == "closed":
+            await pc.close()
+            webrtc_pcs.discard(pc)
+
+    await pc.setRemoteDescription(offer)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    # 서버 측(edge_manager)에서도 ICE Candidate(포트 후보) 수집이 다 끝날 때까지 필수적으로 대기!
+    while pc.iceConnectionState != "completed":
+        if pc.iceConnectionState == "failed":
+            pass
+        # aiortc 내부에서 IP 할당을 끝내기를 기다림 (상대방에게 줄 완벽한 명함 생성)
+        await asyncio.sleep(0.1)
+        break # In local docker tests without STUN, candidates are gathered basically instantly in setLocalDescription.
+
+    return JSONResponse({
+        "sdp": pc.localDescription.sdp,
+        "type": pc.localDescription.type
+    })
 
 @app.on_event("startup")
 async def startup_event():

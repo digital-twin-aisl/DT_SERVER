@@ -11,19 +11,29 @@
 
 ## 2. 아키텍처 및 모듈 구성 (Microservices Architecture)
 
-빠른 장애 복구 및 역할 분담을 위해 5개의 독립된 마이크로서비스 컨테이너와 2개의 기반 인프라(DB, Message Queue)로 설계되었습니다.
+빠른 장애 복구 및 역할 분담을 위해 5개의 독립된 마이크로서비스 컨테이너와 2개의 기반 인프라(DB, Message Queue), 그리고 트래픽 분배를 위한 1개의 리버스 프록시(Nginx)로 설계되었습니다.
+특히 엣지와 서버 간 통신은 TCP 한계(Head-of-Line Blocking)를 극복하기 위해 **"제어 채널(gRPC)과 데이터 채널(WebRTC)"의 하이브리드 프로토콜**로 구성됩니다.
 
-1. **`edge_manager` (포트 : 8001 / gRPC 50051)**
-   - **역할:** 다수의 엣지 디바이스와 양방향 `gRPC` 스트림 채널을 맺고 데이터를 수집/명령을 하달하는 게이트웨이.
-   - **통신:** 딥러닝용 대용량 텐서(Tensor) 데이터의 직렬화(Protobuf) 고속 처리.
-2. **`dl_worker` (포트 : 8002)**
-   - **역할:** 엣지로부터 받은 중간 결과물을 Redis Queue를 통해 수신한 뒤, PyTorch/TensorRT 기반의 무거운 추론 모델을 돌려 객체의 3D 위치(Pose, Bounding Box)를 연산.
+1. **`nginx` (리버스 프록시 / 포트: 단일 443 포트 멀티플렉싱)**
+   - **역할:** 랩실 등 인바운드 방화벽 제약 환경에서 단 하나의 외부 포트(443) 개방으로 모든 트래픽(API, WebRTC 시그널링, gRPC, WebSocket)의 안정적인 분배를 위해 사용됩니다.
+   - **라우팅:** 외부 `443` 포트로 들어오는 트래픽을 경로 기반으로 분기합니다. 
+     - `/edge_communication.` (gRPC) $\rightarrow$ `edge_manager:50051`
+     - `/api/` (WebRTC 시그널링, 일반 API) $\rightarrow$ `edge_manager:80`
+     - `/ws/` (WebSocket) $\rightarrow$ `sim_backend:80`
+     - 기타 최상위 경로 $\rightarrow$ `frontend_api:80`
+
+2. **`edge_manager` (포트 : 8001 / gRPC 내부 50051)**
+   - **역할:** 다수의 엣지 디바이스와 두 가지 채널(gRPC, WebRTC)을 맺고 데이터를 수집 및 명령을 하달하는 게이트웨이.
+   - **제어(Control):** gRPC를 통해 유실되면 안 되는 신뢰성 데이터 및 제어 하달(Keep-Alive).
+   - **데이터(Data):** WebRTC DataChannel (UDP)을 통해 무거운 10FPS 딥러닝 텐서/영상 데이터를 저지연 수신.
+3. **`dl_worker` (포트 : 8002)**
+   - **역할:** 엣지로부터 받은 중간 결과물을 Redis Queue를 통해 수신한 뒤, PyTorch/TensorRT 기반의 무거운 추론 모델을 돌려 객체의 3D 위치(Pose, Bounding Box) 단일 연산.
    - **특징:** 도커 구동 시 GPU 리소스를 전면적으로 할당(`capabilities: [gpu]`) 받음.
-3. **`camera_manager` (포트 : 8003)**
+4. **`camera_manager` (포트 : 8003)**
    - **역할:** 엣지에 연결된 카메라들의 ONVIF 메타데이터 관리, 캘리브레이션 파라미터(Intrinsic/Extrinsic) 연산 및 PostgreSQL DB 저장.
-4. **`sim_backend` (포트 : 8004)**
+5. **`sim_backend` (포트 : 8004)**
    - **역할:** 딥러닝 추론이 끝난 3D 동적 데이터를 WebSocket을 통해 Isaac Sim 환경과 Frontend 3D 뷰어에 실시간(Real-time) 브로드캐스팅.
-5. **`frontend_api` (포트 : 8005)**
+6. **`frontend_api` (포트 : 8005)**
    - **역할:** 사용자가 접속하여 시스템 전체의 상태(엣지 연결 상태, 카메라 조작 등)를 모니터링하고 제어 명령을 내릴 수 있는 통합 API 엔드포인트(BFF - Backend For Frontend).
 
 ### 2.1. 인프라 요소 (Data Layer)
