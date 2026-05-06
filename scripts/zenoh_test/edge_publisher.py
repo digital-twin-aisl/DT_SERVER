@@ -18,10 +18,10 @@ def run_publisher():
     
     # 2. 두 가지 QoS(Quality of Service) 퍼블리셔 생성
     # - Best Effort: 텐서 데이터 (1MB, 초당 10번). 유실 허용, 최저 지연 우선. (UDP 특성)
-    pub_tensor = session.declare_publisher("dt/edge/tensor", reliability=zenoh.Reliability.BEST_EFFORT())
+    pub_tensor = session.declare_publisher("dt/edge/tensor", reliability=zenoh.Reliability.BEST_EFFORT)
     
     # - Reliable: 제어 데이터 (작은 크기). 유실 불가, 재전송 보장. (TCP 특성)
-    pub_control = session.declare_publisher("dt/edge/control", reliability=zenoh.Reliability.RELIABLE())
+    pub_control = session.declare_publisher("dt/edge/control", reliability=zenoh.Reliability.RELIABLE)
     
     print("퍼블리셔 생성 완료! 통신 테스트를 시작합니다...\n")
     

@@ -52,8 +52,8 @@ def run_subscriber():
     session = zenoh.open(conf)
     
     # 엣지와 동일한 QoS 설정으로 토픽 구독
-    sub_tensor = session.declare_subscriber("dt/edge/tensor", tensor_handler, reliability=zenoh.Reliability.BEST_EFFORT())
-    sub_control = session.declare_subscriber("dt/edge/control", control_handler, reliability=zenoh.Reliability.RELIABLE())
+    sub_tensor = session.declare_subscriber("dt/edge/tensor", tensor_handler)
+    sub_control = session.declare_subscriber("dt/edge/control", control_handler)
     
     print("수신 대기 중... (종료 후 결과를 저장하려면 Ctrl+C 를 누르세요)\n")
     try:
