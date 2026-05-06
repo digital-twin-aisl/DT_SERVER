@@ -5,40 +5,29 @@ services:
     image: nginx:alpine
     ports:
       - "8080:8080"  # Frontend & API & Websocket
-      - "8443:8443"  # gRPC (Edge Manager)
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     networks:
       - dt_network
     depends_on:
-      - frontend_api
-      - edge_manager
-      - sim_backend
+      - foxglove_bridge
 
-  edge_manager:
-    build:
-      context: ./apps/edge_manager
+  zenoh_router:
+    image: eclipse/zenoh-bridge-dds:latest
     ports:
-      - "8001:80"
-      - "10000-11000:10000-11000/udp" # webRTC UDP 포트 범위
-    expose:
-      - "50051"
-    environment:
-      - MODULE_NAME=edge_manager
-      - REDIS_URL=redis://redis:6379
+      - "7447:7447/tcp"  # Zenoh 라우터 리스너 (TCP)
+      - "7447:7447/udp"  # Zenoh 라우터 리스너 (UDP)
+    command: ["-l", "tcp/0.0.0.0:7447", "-l", "udp/0.0.0.0:7447"]
     networks:
       - dt_network
-    depends_on:
-      - redis
 
   dl_worker:
     build:
       context: ./apps/dl_worker
-    ports:
-      - "8002:80"
     environment:
       - MODULE_NAME=dl_worker
-      - REDIS_URL=redis://redis:6379
+      - CAMERA_MANAGER_URL=http://camera_manager:80
+      - ROS_DOMAIN_ID=0
     deploy:
       resources:
         reservations:
@@ -49,7 +38,7 @@ services:
     networks:
       - dt_network
     depends_on:
-      - redis
+      - zenoh_router
 
   camera_manager:
     build:
@@ -66,31 +55,17 @@ services:
       - redis
       - postgres_db
 
-  sim_backend:
+  foxglove_bridge:
     build:
-      context: ./apps/sim_backend
+      context: ./apps/foxglove_bridge
     ports:
-      - "8004:80"
+      - "8765:8765"  # Foxglove WebSocket 기본 포트
     environment:
-      - MODULE_NAME=sim_backend
-      - REDIS_URL=redis://redis:6379
+      - ROS_DOMAIN_ID=0
     networks:
       - dt_network
     depends_on:
-      - redis
-
-  frontend_api:
-    build:
-      context: ./apps/frontend_api
-    ports:
-      - "8005:80"
-    environment:
-      - MODULE_NAME=frontend_api
-      - REDIS_URL=redis://redis:6379
-    networks:
-      - dt_network
-    depends_on:
-      - redis
+      - zenoh_router
 
   redis:
     image: redis:alpine

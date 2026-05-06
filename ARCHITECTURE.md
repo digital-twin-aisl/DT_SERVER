@@ -1,57 +1,63 @@
-# 실시간 동적 엣지-서버 분산 컴퓨팅 디지털트윈 백엔드 시스템
+# ROS 2 기반 차세대 디지털 트윈 아키텍처 기획안 (V2)
 
-## 1. 프로젝트 개요 (Overview)
-
-본 프로젝트는 원격지에 위치한 Jetson Orin 기반의 엣지 디바이스 군(Fleet)이 수집한 실시간 비디오(RTSP) 데이터 및 딥러닝 특징값(Feature)을 중앙 서버로 고속 전송하여, 무거운 딥러닝 추론을 거친 뒤 Isaac Sim 기반의 디지털 트윈(Digital Twin) 환경과 동기화하는 **실시간 3D 렌더링/분석 백엔드 인프라**입니다.
-
-- **대상 공간**: 교내 야외 복도 환경 (실제 환경과 디지털 트윈 환경 간의 포즈, 동적 모션 동기화)
-- **주요 워크플로우**: `Edge (Data Extraction)` $\rightarrow$ `Server (Deep Learning)` $\rightarrow$ `Isaac Sim (3D Rendering)` $\rightarrow$ `Frontend (GUI 제어)`
+본 문서는 기존의 커스텀 하이브리드 통신망(WebRTC+gRPC)과 커스텀 웹소켓 백엔드를 걷어내고, **로보틱스 생태계의 글로벌 표준인 ROS 2 기반으로 전체 시스템을 전면 재구성(Refactoring)** 하는 아키텍처 V2 기획서입니다.
 
 ---
 
-## 2. 아키텍처 및 모듈 구성 (Microservices Architecture)
+## 1. 패러다임 전환 (Paradigm Shift)
 
-빠른 장애 복구 및 역할 분담을 위해 5개의 독립된 마이크로서비스 컨테이너와 2개의 기반 인프라(DB, Message Queue), 그리고 트래픽 분배를 위한 1개의 리버스 프록시(Nginx)로 설계되었습니다.
-특히 엣지와 서버 간 통신은 TCP 한계(Head-of-Line Blocking)를 극복하기 위해 **"제어 채널(gRPC)과 데이터 채널(WebRTC)"의 하이브리드 프로토콜**로 구성됩니다.
+기존 시스템의 방대한 커스텀 통신/렌더링 코드를 오픈소스 생태계의 검증된 모듈로 대체하여 유지보수성을 극대화합니다.
 
-1. **`nginx` (리버스 프록시 / 포트: 단일 443 포트 멀티플렉싱)**
-   - **역할:** 랩실 등 인바운드 방화벽 제약 환경에서 단 하나의 외부 포트(443) 개방으로 모든 트래픽(API, WebRTC 시그널링, gRPC, WebSocket)의 안정적인 분배를 위해 사용됩니다.
-   - **라우팅:** 외부 `443` 포트로 들어오는 트래픽을 경로 기반으로 분기합니다. 
-     - `/edge_communication.` (gRPC) $\rightarrow$ `edge_manager:50051`
-     - `/api/` (WebRTC 시그널링, 일반 API) $\rightarrow$ `edge_manager:80`
-     - `/ws/` (WebSocket) $\rightarrow$ `sim_backend:80`
-     - 기타 최상위 경로 $\rightarrow$ `frontend_api:80`
-
-2. **`edge_manager` (포트 : 8001 / gRPC 내부 50051)**
-   - **역할:** 다수의 엣지 디바이스와 두 가지 채널(gRPC, WebRTC)을 맺고 데이터를 수집 및 명령을 하달하는 게이트웨이.
-   - **제어(Control):** gRPC를 통해 유실되면 안 되는 신뢰성 데이터 및 제어 하달(Keep-Alive).
-   - **데이터(Data):** WebRTC DataChannel (UDP)을 통해 무거운 10FPS 딥러닝 텐서/영상 데이터를 저지연 수신.
-3. **`dl_worker` (포트 : 8002)**
-   - **역할:** 엣지로부터 받은 중간 결과물을 Redis Queue를 통해 수신한 뒤, PyTorch/TensorRT 기반의 무거운 추론 모델을 돌려 객체의 3D 위치(Pose, Bounding Box) 단일 연산.
-   - **특징:** 도커 구동 시 GPU 리소스를 전면적으로 할당(`capabilities: [gpu]`) 받음.
-4. **`camera_manager` (포트 : 8003)**
-   - **역할:** 엣지에 연결된 카메라들의 ONVIF 메타데이터 관리, 캘리브레이션 파라미터(Intrinsic/Extrinsic) 연산 및 PostgreSQL DB 저장.
-5. **`sim_backend` (포트 : 8004)**
-   - **역할:** 딥러닝 추론이 끝난 3D 동적 데이터를 WebSocket을 통해 Isaac Sim 환경과 Frontend 3D 뷰어에 실시간(Real-time) 브로드캐스팅.
-6. **`frontend_api` (포트 : 8005)**
-   - **역할:** 사용자가 접속하여 시스템 전체의 상태(엣지 연결 상태, 카메라 조작 등)를 모니터링하고 제어 명령을 내릴 수 있는 통합 API 엔드포인트(BFF - Backend For Frontend).
-
-### 2.1. 인프라 요소 (Data Layer)
-- **`Redis (alpine)`**: 마이크로서비스 간 초저지연 비동기 통신 버퍼.
-  - 대용량 비디오 데이터: `Redis Stream` (최신 프레임 유지, 유실 허용)
-  - 제어 명령/메타데이터: `Redis Pub/Sub` (즉각적인 명령 하달)
-- **`PostgreSQL (15-alpine)`**: 엣지 디바이스 및 카메라의 물리적 설정, 캘리브레이션 파라미터 영구 저장(Persistence).
+| 기존 아키텍처 (V1) | 🚀 ROS 2 기반 아키텍처 (V2) | 도입 효과 및 기대 이점 |
+| :--- | :--- | :--- |
+| 커스텀 gRPC + WebRTC + Redis | **ROS 2 + Zenoh (`rmw_zenoh`)** | 원격지 통신망(WAN) 라우팅을 Zenoh가 전담. ROS 2의 QoS(Reliable/Best Effort)를 그대로 사용하며, Nginx 포트 포워딩이나 TURN 서버 구축 불필요. |
+| 커스텀 딥러닝 큐 (`dl_worker`) | **ROS 2 Inference Node** | Redis 인프라 걷어냄. `/camera/tensor` 토픽을 구독하여 추론 후 `/tf` (Transform) 토픽으로 발행. |
+| 커스텀 `sim_backend` (WebSocket) | **Isaac Sim ROS 2 Bridge** | Isaac Sim에 내장된 OmniGraph ROS 2 익스텐션 활성화. 커스텀 통신 코드 없이 `/tf` 토픽을 받으면 아바타가 즉시 연동. |
+| 커스텀 Web 3D 대시보드 (`frontend`) | **Foxglove Studio + Foxglove Bridge** | Three.js 커스텀 코딩 불필요. 현존 최고의 로봇 관제 UI로 카메라, 3D Pose, 텔레메트리 즉시 시각화. |
 
 ---
 
-## 3. 현재까지 진행 상황 (Progress)
+## 2. V2 아키텍처 노드 및 네트워크 토폴로지
 
-- [x] **Phase 1: 인프라 셋업** - FastAPI 기반 5개 모듈 스캐폴딩 및 `docker-compose` 멀티 컨테이너 통합 구현.
-- [x] **Phase 2: 엣지 통신 (gRPC)** - Protobuf(`edge_communication.proto`) 작성 및 Bi-directional (양방향) 고속 스트리밍 구현 (`edge_manager`).
-- [x] **Phase 3: 비동기 큐 (Message Broker)** - 레이턴시 최소화를 위한 Redis 인메모리 컨테이너 연동 완료.
-- [x] **Phase 4: DB 및 제어 레이어** - `camera_manager` 내 PostgreSQL 연동 및 캘리브레이션 명령 로직 개발, Redis Pub/Sub을 타고 엣지로 내려가는 Downlink 파이프라인 검증 완료.
-- [x] **Phase 5: 데이터 파이프라인 (E2E Test)** - 더미 엣지 클라이언트 송신 $\rightarrow$ gRPC 수신 $\rightarrow$ 비동기 딥러닝 추론 대기열(`dl_worker`) $\rightarrow$ WebSocket (`sim_backend`) 브로드캐스트까지 완벽한 동기화 테스트 완료.
-- [x] **Phase 6: 핵심 알고리즘 통합** - PyTorch(pose, reid, mesh 파이프라인) 실시간 추론 로직 병합 및 의존성 이식, Camera Manager 캘리브레이션 연동을 통한 절대 좌표계(World Coordinate) 변환 로직 완전 적용.
-- [x] **Phase 7: Frontend API 개편 및 대시보드 연동** - FastAPI `frontend_api` 에 HTML/Three.js 기반 3D SPA 대시보드를 서빙하여, 웹 브라우저 상에서 디지털 트윈 현황(카메라, 마우스 제어 등) 실시간 연동.
-- [x] **Phase 8: Isaac Sim 클라이언트 렌더러 연동** - `isaac_sim_client` 디렉토리 내 Python Extension 구성(WebSocket 구독) 및 Headless WebRTC 스트리밍 파이프라인. Isaac Sim의 픽셀 프레임 자체를 WebRTC (port 8211)로 직접 릴레이하여 웹 통합 게이트웨이에 임베딩하는 방식 입증 완료.
-- [ ] **Phase 9: Production 고도화** - 실제 엣지 디바이스 하드웨어 프로파일링, 로드밸런싱 및 K8s 기반 MSA 배포, SMPL 메쉬 파라미터 세밀 조정.
+전체 시스템은 중앙 메세지 브로커 없이 각 마이크로서비스가 독립적인 **ROS 2 노드(Node)** 로 동작합니다.
+
+### 🌐 인프라: 통신 레이어
+*   **Zenoh Router:** 엣지(Jetson)와 서버(Cloud) 간의 WAN 통신을 책임집니다. 엣지의 ROS 2 노드들은 로컬 네트워크처럼 통신하지만, 밑단에서는 `rmw_zenoh`가 이를 가로채 UDP/QUIC 프로토콜로 암호화하여 클라우드로 초저지연 라우팅합니다. 방화벽 및 NAT 트래버설을 자체 지원합니다.
+
+### 💻 엣지 파트 (Jetson Orin)
+1. **`camera_capture_node`**: RTSP 카메라 스트림을 읽어 ROS 2의 `sensor_msgs/Image` 로 퍼블리시.
+2. **`edge_feature_node`**: 무거운 원본 영상 대신 특징점(Tensor)만 추출하여 커스텀 `TensorMsg`로 패키징 후 Best-Effort QoS로 퍼블리시.
+
+### ☁️ 클라우드/서버 파트
+1. **`inference_node`**: 서버 GPU를 독점. 엣지에서 넘어온 `TensorMsg`를 구독(Subscribe). 무거운 PyTorch 3D Pose 연산 후, 절대 좌표계 위치를 로보틱스 표준인 `tf2_msgs/TFMessage` 및 `geometry_msgs/PoseArray` 로 변환하여 퍼블리시.
+2. **`foxglove_bridge_node`**: Nginx를 거쳐 들어오는 웹 클라이언트(관제실) 접속 요청을 처리. ROS 2 토픽들을 WebSocket(또는 WebRTC)으로 자동 변환하여 프론트엔드로 송출.
+
+### 🎮 디지털 트윈 렌더링 파트
+1. **Isaac Sim (ROS 2 Bridge Extension)**: 어떠한 커스텀 Python 네트워크 스크립트도 불필요합니다. OmniGraph 내에서 `ROS2 Subscriber` 노드를 드래그 앤 드롭으로 배치하고 `/tf` 토픽을 아바타 관절(Articulation)에 연결하면 자동으로 동기화됩니다.
+
+---
+
+## 3. 새로운 시운전 시나리오 (Tutorial Scenario V2)
+
+커스텀 로직이 대폭 사라지며 시스템 기동이 극도로 단순해집니다.
+
+### 🎥 Step 1. 전원 인가 및 디스커버리 (Zero-Config Network)
+1. 서버 인프라(Zenoh Router, Foxglove, Inference Node)를 `docker compose up`으로 기동.
+2. 현장의 Jetson 엣지에 전원이 들어오면, 내장된 `rmw_zenoh`가 클라우드 라우터 IP를 찾아 자동으로 연결 수립. 별도의 시그널링이나 커넥션 맺기 로직 불필요.
+
+### 🏃 Step 2. 실시간 동적 추론 파이프라인
+1. Jetson에서 `/edge/camera1/tensor` 토픽(Best Effort QoS)으로 10FPS 데이터가 쏟아짐.
+2. 서버의 `inference_node` 콜백 함수가 이를 받아 즉각 추론 후, `/world_to_person_01` 이라는 표준 TF 토픽(Reliable QoS) 발행.
+
+### 📺 Step 3. 관제 및 시각화 (No Code Rendering)
+1. 관리자는 웹 브라우저로 `https://<서버IP>/foxglove` 접속. Foxglove Studio UI에서 클릭 몇 번으로 3D Scene에 `/tf` 좌표계를 올리면 현장 상황 모니터링 즉시 완료.
+2. 렌더링 서버에서는 Isaac Sim이 켜져 있으며, ROS Bridge가 `/tf`를 읽어들여 언리얼/유니티 수준의 고품질 픽셀 렌더링 화면을 송출.
+
+---
+
+## 4. 검증 및 테스트 (향후 Action Plan)
+
+기존 코드를 모두 버리는 것이 아니라 **통신과 데이터 규격만 ROS 2 생태계로 래핑(Wrapping)** 하는 작업입니다.
+*   **우선 과제 1:** 기존 FastAPI 기반의 `dl_worker` 추론 코드를 `rclpy` (ROS 2 Python) 노드 콜백 함수로 마이그레이션.
+*   **우선 과제 2:** Isaac Sim 내부의 커스텀 웹소켓 확장 프로그램을 비활성화하고, 기본 탑재된 `omni.isaac.ros2_bridge` 활성화 후 TF 트리 구성 연동 테스트.
+*   **우선 과제 3:** LAN 환경에서 ROS 2 동작 확인 후, `rmw_fastrtps`를 `rmw_zenoh`로 교체하여 LTE 망 테스트 진행.
