@@ -23,7 +23,8 @@ services:
 
   dl_worker:
     build:
-      context: ./apps/dl_worker
+      context: .
+      dockerfile: ./apps/dl_worker/Dockerfile
     environment:
       - MODULE_NAME=dl_worker
       - CAMERA_MANAGER_URL=http://camera_manager:80

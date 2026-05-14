@@ -7,3 +7,11 @@ protobuf>=4.24.0
 redis>=5.0.0
 numpy>=1.24.0
 httpx>=0.24.0
+# Phase 2: Pose Graph Optimization & Relocalization
+gtsam>=4.2
+scipy>=1.10.0
+opencv-python>=4.8.0
+# Phase 3: Online Targetless Extrinsic Calibration
+# (Phase 1/3 공유 의존성. LightGlue는 PyPI 미배포 모듈로,
+#  컨테이너 빌드 시 pip install git+https://github.com/cvg/LightGlue.git 별도 설치 필요)
+torch>=2.0.0

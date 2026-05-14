@@ -6,7 +6,25 @@ import sys
 
 # 기본 클라우드 접속 주소 (서버 IP로 변경 가능)
 CLOUD_ZENOH_IP = "127.0.0.1" 
-CLOUD_ZENOH_PORT = 7447
+CLOUD_ZENOH_PORT = 10050
+
+def echo_handler(sample):
+    recv_time = time.time()
+    raw_payload = sample.payload.to_bytes()
+    try:
+        end_idx = raw_payload.find(b'}') + 1
+        json_str = raw_payload[:end_idx].decode('utf-8')
+        data = json.loads(json_str)
+        
+        rtt_ms = (recv_time - data['timestamp']) * 1000
+        one_way_ms = rtt_ms / 2.0
+        
+        if "frame_id" in data:
+            print(f"  └─[Edge Echo] 텐서 {data['frame_id']:03d} | 왕복(RTT): {rtt_ms:.2f} ms | 편도: {one_way_ms:.2f} ms")
+        elif "cmd_id" in data:
+            print(f"  └─[Edge Echo] 제어 {data['cmd_id']:03d} | 왕복(RTT): {rtt_ms:.2f} ms | 편도: {one_way_ms:.2f} ms")
+    except Exception as e:
+        pass
 
 def run_publisher():
     # 1. 클라우드의 Zenoh 라우터에 연결 설정
@@ -15,6 +33,9 @@ def run_publisher():
     
     print(f"[{CLOUD_ZENOH_IP}] 클라우드 Zenoh 라우터에 연결 중...")
     session = zenoh.open(conf)
+    
+    # 2. 에코 수신용 Subscriber 생성 (RTT 계산용)
+    sub_echo = session.declare_subscriber("dt/cloud/echo", echo_handler)
     
     # 2. 두 가지 QoS(Quality of Service) 퍼블리셔 생성
     # - Best Effort: 텐서 데이터 (1MB, 초당 10번). 유실 허용, 최저 지연 우선. (UDP 특성)
@@ -26,7 +47,7 @@ def run_publisher():
     print("퍼블리셔 생성 완료! 통신 테스트를 시작합니다...\n")
     
     # 테스트 환경 파라미터
-    fps = 10
+    fps = 30
     duration = 10 # 10초간 전송
     total_frames = fps * duration
     interval = 1.0 / fps
@@ -38,7 +59,7 @@ def run_publisher():
             "frame_id": i,
             "timestamp": timestamp,
         }
-        # JSON 메타데이터 뒤에 1MB 크기가 되도록 더미 0바이트를 패딩하여 무거운 텐서를 흉내냄
+        # JSON 메타데이터 뒤에 1MB 크기가 되도록 더미 0바이트를 패딩
         json_bytes = json.dumps(payload).encode('utf-8')
         msg = json_bytes.ljust(1024 * 1024, b'0')
         
@@ -62,6 +83,7 @@ def run_publisher():
         print(f"[Control Reliable] Command {i} 전송 완료")
         time.sleep(0.5)
         
+    time.sleep(1.0) # 마지막 에코가 돌아올 때까지 약간 대기
     session.close()
     print("\n엣지 퍼블리셔 테스트가 정상적으로 종료되었습니다.")
 

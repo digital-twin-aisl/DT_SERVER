@@ -1,128 +1,230 @@
-import os
-import json
-import asyncio
-import httpx
+"""
+DL Inference ROS 2 Node — TF2 기반 실시간 센서 Pose 조회
 
+[Phase 1 리팩토링]
+- 기존: HTTP 호출로 camera_manager에서 정적 캘리브레이션 1회 캐싱
+- 개선: tf2_ros.TransformListener를 통해 /tf, /tf_static에서
+        센서 pose를 실시간 lookup → 이동형 센서, 온라인 캘리브레이션 지원
+"""
+import os
+import asyncio
+
+import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import ByteMultiArray
-from geometry_msgs.msg import TransformStamped
+from dt_interfaces.msg import TensorMsg
+from geometry_msgs.msg import TransformStamped, PoseArray, Pose
 from tf2_msgs.msg import TFMessage
+from tf2_ros import Buffer, TransformListener, TransformException
+from rclpy.qos import qos_profile_sensor_data
 
-from app.protos import edge_communication_pb2
 from app.core.inference import DLInferencer
+
 
 class DLInferenceNode(Node):
     def __init__(self):
         super().__init__('dl_inference_node')
-        
-        # 1. 수신부 (Subscriber): 엣지에서 들어오는 텐서 데이터(직렬화된 Protobuf 바이트) 수신
-        # (임시로 ByteMultiArray를 통해 바이트 수신. 추후 커스텀 Msg로 변경 가능)
+
+        # ── 1. TF2 Buffer & Listener ────────────────────────
+        # /tf_static (고정 센서 — StaticPosePublisher가 발행) 및
+        # /tf (이동 센서 — pose_graph_node가 발행)를 모두 수신
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # ── 2. Subscriber: 엣지 텐서 수신 ────────────────────
+        # [Architecture V2] 기존 ByteMultiArray + Protobuf 대신 
+        # 커스텀 TensorMsg를 직접 구독하여 타입 안전성 및 인트로스펙션 확보
+        # Best-Effort QoS 사용 (ARCHITECTURE.md 참조)
         self.subscription = self.create_subscription(
-            ByteMultiArray,
+            TensorMsg,
             '/edge/camera/tensor',
             self.tensor_callback,
-            10 # QoS (기본적으로 Reliable 맵핑, 커스텀 프로파일로 Best Effort 지정 가능)
+            qos_profile_sensor_data
         )
-        
-        # 2. 송신부 (Publisher): 추론이 완료된 3D Pose를 ROS 2 표준인 TFMessage로 발행
+
+        # ── 3. Publisher: 추론된 3D Pose → /tf 및 PoseArray ─────────────
         self.tf_publisher = self.create_publisher(TFMessage, '/tf', 10)
-        
-        # 3. 싱글톤 추론 모듈 로드
+        self.pose_array_publisher = self.create_publisher(PoseArray, '/person_poses', 10)
+
+        # ── 4. Inference module ─────────────────────────────
         self.inferencer = DLInferencer()
-        self.camera_manager_url = os.getenv("CAMERA_MANAGER_URL", "http://camera_manager:80")
-        
-        # 4. Redis를 걷어내고 메모리 내 캘리브레이션 캐싱 사용
-        self.calib_cache = {}
-        
-        self.get_logger().info("DL Inference ROS 2 Node has been started successfully.")
 
-    async def get_camera_calibration(self, edge_id: str, camera_id: int) -> dict:
-        """Camera Manager에서 캘리브레이션 정보를 동기화 (비동기)"""
-        cache_key = f"{edge_id}_{camera_id}"
-        if cache_key in self.calib_cache:
-            return self.calib_cache[cache_key]
-            
-        self.get_logger().info(f"[{cache_key}] Fetching calibration from camera_manager...")
-        
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{self.camera_manager_url}/api/cameras/{edge_id}/{camera_id}/calibration",
-                    timeout=5.0
-                )
-                resp.raise_for_status()
-                calibration_data = resp.json()
-        except Exception as e:
-            self.get_logger().warn(f"camera_manager call failed: {e}. Using default calibration.")
-            calibration_data = {
-                "x": 0.0, "y": 0.0, "z": 0.0,
-                "pitch": 0.0, "yaw": 0.0, "roll": 0.0
-            }
-        
-        self.calib_cache[cache_key] = calibration_data
-        return calibration_data
-
-    async def process_message_async(self, payload_bytes):
-        # Protobuf 파싱
-        video_data = edge_communication_pb2.VideoFeatureData()
-        video_data.ParseFromString(payload_bytes)
-        
-        device_id = "edge_device_default" # 실제로는 메타데이터에서 추출
-        
-        # 1. 캘리브레이션 파라미터 획득
-        calib_params = await self.get_camera_calibration(device_id, video_data.camera_id)
-        
-        # 2. 딥러닝 추론 및 좌표 변환
-        inference_result = self.inferencer.process_tensor(
-            feature_map=video_data.feature_map, 
-            voxel_data=video_data.voxel_data,
-            camera_id=video_data.camera_id,
-            calib_params=calib_params
+        # ── 5. world frame 설정 ─────────────────────────────
+        self.declare_parameter('world_frame', 'world')
+        self.world_frame = (
+            self.get_parameter('world_frame')
+            .get_parameter_value().string_value
         )
+
+        self.get_logger().info(
+            f"DL Inference Node started. "
+            f"Using TF2 for sensor pose lookup (world_frame={self.world_frame})"
+        )
+
+    # ────────────────────────────────────────────────────────
+    # TF2 기반 센서 Pose 조회 (HTTP 호출 제거)
+    # ────────────────────────────────────────────────────────
+
+    def get_sensor_pose(self, sensor_frame: str) -> TransformStamped:
+        """
+        TF2 Buffer에서 센서의 전역 pose를 실시간 조회
+
+        Args:
+            sensor_frame: TF child_frame_id (e.g. 'sensor_fixed_01', 'robot_01/camera_front')
+
+        Returns:
+            TransformStamped: world → sensor_frame 변환
+
+        Raises:
+            TransformException: TF를 아직 받지 못했거나, 해당 frame이 없는 경우
+        """
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.world_frame,
+                sensor_frame,
+                rclpy.time.Time()  # latest available
+            )
+            return transform
+        except TransformException as e:
+            self.get_logger().warn(
+                f'TF lookup failed ({self.world_frame} → {sensor_frame}): {e}'
+            )
+            raise
+
+    def transform_to_extrinsic_matrix(self, tf: TransformStamped) -> np.ndarray:
+        """
+        TransformStamped를 4x4 extrinsic matrix로 변환
+
+        Returns:
+            4x4 numpy array (world-to-camera transform)
+        """
+        t = tf.transform.translation
+        q = tf.transform.rotation
+
+        # Quaternion (x, y, z, w) → rotation matrix
+        R = self._quat_to_rotmat(q.x, q.y, q.z, q.w)
+
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R
+        T[:3, 3] = [t.x, t.y, t.z]
+        return T
+
+    @staticmethod
+    def _quat_to_rotmat(x, y, z, w) -> np.ndarray:
+        """Quaternion (x, y, z, w) → 3x3 rotation matrix"""
+        return np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y)],
+            [2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y)]
+        ], dtype=np.float64)
+
+    # ────────────────────────────────────────────────────────
+    # 추론 파이프라인
+    # ────────────────────────────────────────────────────────
+
+    def process_message(self, msg: TensorMsg):
+        """텐서 데이터 수신 → 추론 → TF 발행 (동기)"""
+        # [Architecture V2] Protobuf 파싱 과정 제거 (ROS 2 Native Message 직접 사용)
         
-        # 3. 추론된 결과를 ROS 2 표준 TFMessage로 변환하여 Publish (Isaac Sim 직결용)
+        # 센서 frame ID 결정 (메시지 메타데이터에서 추출)
+        sensor_frame = f'sensor_fixed_{msg.camera_id:02d}'
+
+        # 1. TF2에서 센서 pose 실시간 조회
+        try:
+            sensor_tf = self.get_sensor_pose(sensor_frame)
+            T_world_cam = self.transform_to_extrinsic_matrix(sensor_tf)
+        except TransformException:
+            self.get_logger().warn(
+                f'센서 {sensor_frame}의 TF를 찾을 수 없습니다. '
+                f'StaticPosePublisher가 실행 중인지 확인하세요.'
+            )
+            # Fallback: 단위 행렬 (원점에 위치)
+            T_world_cam = np.eye(4, dtype=np.float64)
+
+        # 2. 추론 수행 (T_world_cam을 직접 전달)
+        inference_result = self.inferencer.process_tensor(
+            feature_map=msg.feature_map,
+            voxel_data=msg.voxel_data,
+            camera_id=msg.camera_id,
+            calib_params=self._matrix_to_calib_dict(T_world_cam)
+        )
+
+        # 3. 추론 결과를 /tf 및 PoseArray로 발행
         tf_msg = TFMessage()
-        
+        pose_array_msg = PoseArray()
+        pose_array_msg.header.stamp = self.get_clock().now().to_msg()
+        pose_array_msg.header.frame_id = self.world_frame
+
         for person in inference_result.get("persons", []):
+            # TransformStamped 구성
             t = TransformStamped()
-            t.header.stamp = self.get_clock().now().to_msg()
-            t.header.frame_id = "world"  # 기준 좌표계 (Absolute World)
-            t.child_frame_id = f"person_{person.get('person_id', 0)}" # 대상 아바타 ID
-            
-            # 추론된 3D 위치(Translation) 삽입
-            t.transform.translation.x = float(person.get("pose", {}).get("x", 0.0))
-            t.transform.translation.y = float(person.get("pose", {}).get("y", 0.0))
-            t.transform.translation.z = float(person.get("pose", {}).get("z", 0.0))
-            
-            # 임시 기본 회전(Rotation) 삽입 (Quaternion)
+            t.header.stamp = pose_array_msg.header.stamp
+            t.header.frame_id = self.world_frame
+            t.child_frame_id = f"person_{person.get('track_id', 0)}"
+
+            pos = person.get("position", {})
+            t.transform.translation.x = float(pos.get("x", 0.0))
+            t.transform.translation.y = float(pos.get("y", 0.0))
+            t.transform.translation.z = float(pos.get("z", 0.0))
+
             t.transform.rotation.x = 0.0
             t.transform.rotation.y = 0.0
             t.transform.rotation.z = 0.0
             t.transform.rotation.w = 1.0
-            
+
             tf_msg.transforms.append(t)
-            
+
+            # Pose 구성
+            pose = Pose()
+            pose.position.x = t.transform.translation.x
+            pose.position.y = t.transform.translation.y
+            pose.position.z = t.transform.translation.z
+            pose.orientation = t.transform.rotation
+            pose_array_msg.poses.append(pose)
+
         if tf_msg.transforms:
             self.tf_publisher.publish(tf_msg)
-            self.get_logger().info(f"Published TF for {len(tf_msg.transforms)} persons. (Frame: {video_data.frame_id})")
+            self.pose_array_publisher.publish(pose_array_msg)
+            self.get_logger().info(
+                f"Published TF and PoseArray for {len(tf_msg.transforms)} persons "
+                f"from {sensor_frame} (Frame: {msg.frame_id})"
+            )
 
-    def tensor_callback(self, msg):
-        """ROS 2 토픽 수신 콜백 (비동기 루프 호출)"""
-        # ROS 2 rclpy는 기본적으로 동기 콜백이므로, asyncio 루프를 활용해 비동기 HTTP 통신 등을 처리합니다.
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-        payload_bytes = bytes(msg.data)
-        loop.run_until_complete(self.process_message_async(payload_bytes))
+    @staticmethod
+    def _matrix_to_calib_dict(T: np.ndarray) -> dict:
+        """
+        4x4 transform → legacy calib_params dict (호환용)
+
+        기존 inference.py의 transform_to_world()가 RPY+XYZ dict를
+        받으므로, 4x4 행렬에서 변환합니다.
+
+        Phase 2: T_world_cam_4x4 키를 함께 전달하여
+        inference.py가 4x4 행렬을 직접 사용할 수 있도록 지원.
+        """
+        from scipy.spatial.transform import Rotation
+        R = T[:3, :3]
+        r = Rotation.from_matrix(R)
+        roll, pitch, yaw = r.as_euler('xyz')
+        return {
+            'x': float(T[0, 3]),
+            'y': float(T[1, 3]),
+            'z': float(T[2, 3]),
+            'roll': float(roll),
+            'pitch': float(pitch),
+            'yaw': float(yaw),
+            # Phase 2: 4x4 행렬 직접 전달 (inference.py에서 우선 사용)
+            'T_world_cam_4x4': T.tolist(),
+        }
+
+    def tensor_callback(self, msg: TensorMsg):
+        """ROS 2 커스텀 메시지 수신 콜백"""
+        self.process_message(msg)
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = DLInferenceNode()
-    
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -130,6 +232,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

@@ -45,10 +45,25 @@ class DLInferencer:
         """
         엣지 카메라 기준 상대 좌표계(relative_pose)를 캘리브레이션 정보(Extrinsic Matrix)를
         이용해 Isaac Sim의 디지털 트윈 월드 절대 좌표계로 변환합니다.
-        회전 변환 (Roll, Pitch, Yaw) 및 병진 변환 (X, Y, Z) 적용
+
+        Phase 2: T_world_cam_4x4가 있으면 4x4 행렬을 직접 사용합니다.
+        없으면 기존 RPY 방식으로 fallback합니다.
         """
         rel_pos = np.array([relative_pose["x"], relative_pose["y"], relative_pose["z"]])
-        
+
+        # Phase 2: 4x4 행렬 직접 사용 (더 정확)
+        if 'T_world_cam_4x4' in calib_params:
+            T = np.array(calib_params['T_world_cam_4x4'])
+            R = T[:3, :3]
+            t = T[:3, 3]
+            world_pos = R @ rel_pos + t
+            return {
+                "x": float(world_pos[0]),
+                "y": float(world_pos[1]),
+                "z": float(world_pos[2])
+            }
+
+        # Legacy fallback: RPY 방식
         pitch = calib_params.get("pitch", 0.0)
         yaw = calib_params.get("yaw", 0.0)
         roll = calib_params.get("roll", 0.0)
