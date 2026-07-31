@@ -1,0 +1,34 @@
+# reqirements.txt
+# root
+tqdm
+gdown
+json-tricks
+prettytable
+scipy
+torchvision
+onnx-graphsurgeon
+numpy==1.24.4
+matplotlib
+easydict
+PyYAML
+tensorboardX
+vedo
+imageio
+pillow
+opencv-contrib-python==4.5.5.64
+pyrealsense2
+
+# reid
+ultralytics==8.3.141
+yacs==0.1.8
+termcolor==3.1.0
+tabulate==0.9.0
+pycuda
+onnxsim
+onnxoptimizer
+
+
+# protocol
+confluent-kafka
+eclipse-zenoh==1.9.0
+lz4
