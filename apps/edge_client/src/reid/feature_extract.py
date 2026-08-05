@@ -1,7 +1,8 @@
+# ruff: noqa: E402
+
 import os
 import sys
 import io
-import ctypes
 import atexit
 
 import cv2
@@ -16,12 +17,10 @@ from PIL import Image
 import onnx
 import onnxoptimizer
 from torch.onnx import OperatorExportTypes
-from onnxsim import simplify  
-
 import tensorrt as trt
 
 import pycuda.driver as cuda
-import pycuda.autoprimaryctx  
+import pycuda.autoprimaryctx  # noqa: F401 - initializes CUDA's primary context
 
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 fastreid_dir = os.path.join(base_dir, "reid", "fast-reid")

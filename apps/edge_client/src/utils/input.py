@@ -1,161 +1,119 @@
-import cv2, time,threading
-import os.path as osp
 import glob
-from multiprocessing import Process, Event, Pipe
-from multiprocessing import shared_memory
+import os.path as osp
+import threading
+import time
+from multiprocessing import Process, shared_memory
+
+import cv2
 import numpy as np
 
-class ExampleDataset(Process):
-    def __init__(self, paths, stop_event, conn, input_flag):
+
+class SharedFrameProcess(Process):
+    """Base process that exposes one shared-memory frame per video source."""
+
+    def __init__(self, paths, stop_event, conn):
         super().__init__(daemon=False)
-        self.paths = sorted(glob.glob(osp.join(paths, 'hdVideos', '*.mp4')))
+        self.paths = list(paths)
         self.stop_event = stop_event
         self.conn = conn
-        self.flag=input_flag
-        self.n = len(self.paths)
-        self.shms   = [None] * self.n
-        self.shapes = [None] * self.n
-        self.dtypes = [None] * self.n
+        self.shms = [None] * len(self.paths)
+        self.shapes = [None] * len(self.paths)
+        self.dtypes = [None] * len(self.paths)
+
+    def _open_sources(self):
+        captures = [cv2.VideoCapture(path) for path in self.paths]
+        for index, capture in enumerate(captures):
+            ok, frame = capture.read()
+            if not ok:
+                self.conn.send(("ERR", index))
+                continue
+
+            shm = shared_memory.SharedMemory(create=True, size=frame.nbytes)
+            self.shms[index] = shm
+            self.shapes[index] = frame.shape
+            self.dtypes[index] = frame.dtype
+            self.conn.send(
+                ("OK", index, shm.name, frame.shape, frame.dtype.str)
+            )
+            self._write_frame(index, frame)
+        return captures
+
+    def _write_frame(self, index, frame):
+        shape = self.shapes[index]
+        dtype = self.dtypes[index]
+        if frame.shape != shape:
+            frame = cv2.resize(frame, (shape[1], shape[0]))
+        if frame.dtype != dtype:
+            frame = frame.astype(dtype)
+        np.ndarray(shape, dtype=dtype, buffer=self.shms[index].buf)[:] = frame
+
+    def _release_sources(self, captures):
+        for capture in captures:
+            capture.release()
+        for shm in self.shms:
+            if shm is None:
+                continue
+            try:
+                shm.close()
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+
+
+class ExampleDataset(SharedFrameProcess):
+    def __init__(self, path, stop_event, conn, input_flag):
+        paths = sorted(glob.glob(osp.join(path, "hdVideos", "*.mp4")))
+        super().__init__(paths, stop_event, conn)
+        self.input_flag = input_flag
+
     def run(self):
-
-
-        caps = [cv2.VideoCapture(p) for p in self.paths]
+        captures = self._open_sources()
         try:
-            # 초기 프레임로 해상도 파악 및 공유메모리 생성
-            for i, cap in enumerate(caps):
-                ok, frame = cap.read()
-                if not ok:
-                    self.conn.send(("ERR", i))
-                    continue
-                h, w, c = frame.shape
-                shm = shared_memory.SharedMemory(create=True, size=frame.nbytes)
-                self.shms[i]   = shm
-                self.shapes[i] = (h, w, c)
-                self.dtypes[i] = frame.dtype
-
-                # 메타 전송
-                self.conn.send(("OK", i, shm.name, (h, w, c), frame.dtype.str))
-
-                # 초기 프레임 기록
-                buf = np.ndarray((h, w, c), dtype=frame.dtype, buffer=shm.buf)
-                buf[:] = frame
-
-            # 단일 루프: 모든 소스를 라운드로빈으로 읽고 각 shm에 덮어쓰기
             while not self.stop_event.is_set():
-                any_alive = False
-
-                if not self.flag.value:
+                if not self.input_flag.value:
                     time.sleep(0.01)
                     continue
 
-                for i, cap in enumerate(caps):
-                    if self.shms[i] is None:
+                read_frame = False
+                for index, capture in enumerate(captures):
+                    if self.shms[index] is None:
                         continue
-                    ret, frame = cap.read()
-                
-                    if not ret:
-                        continue
-                    any_alive = True
-                    h, w, c = self.shapes[i]
-                    dtype = self.dtypes[i]
-                    if frame.shape != (h, w, c) or frame.dtype != dtype:
-                        frame = cv2.resize(frame, (w, h))
-                        if frame.dtype != dtype:
-                            frame = frame.astype(dtype)
-                    buf = np.ndarray((h, w, c), dtype=dtype, buffer=self.shms[i].buf)
-                    buf[:] = frame
-                if not any_alive:
+                    ok, frame = capture.read()
+                    if ok:
+                        self._write_frame(index, frame)
+                        read_frame = True
+
+                if not read_frame:
                     break
-                # 과도한 CPU 사용 방지. 필요시 조정
                 time.sleep(0.05)
         finally:
-            for cap in caps:
-                cap.release()
-            for shm in self.shms:
-                if shm is not None:
-                    try:
-                        shm.close()
-                        shm.unlink()
-                    except:
-                        pass
+            self._release_sources(captures)
 
-class IPCamera(Process):
-    def __init__(self, paths, stop_event, conn, input_flag):
-        super().__init__(daemon=False)
 
-        self.paths = []
-        for i, video_path in enumerate(paths):
-            self.paths.append(video_path['url'])
-        self.stop_event = stop_event
-        self.conn = conn
-        self.n = len(self.paths)
-        self.events = [Event() for _ in range(self.n)]
-        self.shms = [None] * self.n
-        self.shapes = [None] * self.n
-        self.dtypes = [np.uint8] * self.n
+class IPCamera(SharedFrameProcess):
+    def __init__(self, cameras, stop_event, conn, input_flag=None):
+        del input_flag  # Kept in the signature for legacy callers.
+        super().__init__((camera["url"] for camera in cameras), stop_event, conn)
 
     def run(self):
-
-        caps = [cv2.VideoCapture(p) for p in self.paths]
+        captures = self._open_sources()
         try:
-            # 초기 프레임로 해상도 파악 및 공유메모리 생성
-            for i, cap in enumerate(caps):
-                ok, frame = cap.read()
-                if not ok:
-                    self.conn.send(("ERR", i))
-                    continue
-                h, w, c = frame.shape
-                nbytes = frame.nbytes
-                shm = shared_memory.SharedMemory(create=True, size=nbytes)
-                self.shms[i] = shm
-                self.shapes[i] = (h, w, c)
-
-                # 메타 전송
-                self.conn.send(("OK", i, shm.name, (h, w, c), frame.dtype.str))
-
-                # 초기 프레임 한 번 기록
-                buf = np.ndarray((h, w, c), dtype=frame.dtype, buffer=shm.buf)
-                buf[:] = frame
-                self.events[i].set()
-
-            # 카메라 리더 스레드 시작
-            for i, cap in enumerate(caps):
-                if self.shms[i] is None:
-                    continue
-                t = threading.Thread(target=self.camera_thread, args=(i, cap), daemon=True)
-                t.start()
-
-            # 신호 대기 루프만 유지
-            while not self.stop_event.is_set():
-                time.sleep(0.01)
-
+            for index, capture in enumerate(captures):
+                if self.shms[index] is not None:
+                    threading.Thread(
+                        target=self._read_camera,
+                        args=(index, capture),
+                        daemon=True,
+                    ).start()
+            self.stop_event.wait()
         finally:
             self.stop_event.set()
-            for cap in caps:
-                cap.release()
-            # 공유메모리 정리
-            for shm in self.shms:
-                if shm is not None:
-                    try:
-                        shm.close()
-                        shm.unlink()
-                    except:
-                        pass
+            self._release_sources(captures)
 
-    def camera_thread(self, i, cap):
-        h, w, c = self.shapes[i]
-        dtype = self.dtypes[i]
-        shm = self.shms[i]
-        buf = np.ndarray((h, w, c), dtype=dtype, buffer=shm.buf)
-
+    def _read_camera(self, index, capture):
         while not self.stop_event.is_set():
-            ret, frame = cap.read()
-            if not ret:
+            ok, frame = capture.read()
+            if ok:
+                self._write_frame(index, frame)
+            else:
                 time.sleep(0.005)
-                continue
-            # if frame.shape != (h, w, c) or frame.dtype != dtype:
-            #     # 간단화: 해상도 고정. 바뀌면 스킵 또는 리사이즈
-            #     frame = cv2.resize(frame, (w, h))
-            buf[:] = frame               # 0-copy 덮어쓰기
-            self.events[i].set()  
-        

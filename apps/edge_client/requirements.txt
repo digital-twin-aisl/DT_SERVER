@@ -1,34 +1,32 @@
-# reqirements.txt
-# root
-tqdm
-gdown
-json-tricks
-prettytable
-scipy
-torchvision
-onnx-graphsurgeon
+# Core inference
 numpy==1.24.4
-matplotlib
-easydict
+opencv-python>=4.6,<5
+Pillow
 PyYAML
-tensorboardX
-vedo
-imageio
-pillow
-opencv-contrib-python==4.5.5.64
-pyrealsense2
-
-# reid
+easydict
+scipy
 ultralytics==8.3.141
-yacs==0.1.8
-termcolor==3.1.0
+zstandard
+
+# ReID
 tabulate==0.9.0
-pycuda
-onnxsim
+termcolor==3.1.0
+tqdm
+yacs==0.1.8
+
+# ONNX / TensorRT integration
+# PyTorch, torchvision, and TensorRT must match JetPack.
+# install_root.sh validates them and installs torch2trt separately.
+onnx
 onnxoptimizer
+onnxsim
+pycuda
 
+# Utilities
+gdown
+imageio
+matplotlib
 
-# protocol
+# Protocols
 confluent-kafka
 eclipse-zenoh==1.9.0
-lz4
