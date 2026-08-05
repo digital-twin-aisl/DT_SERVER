@@ -9,6 +9,7 @@
 * 기본 Zenoh 토픽은 `meta-sejong/scene/v1`입니다.
 * Zenoh callback은 최신 Scene 하나만 queue에 저장합니다.
 * Isaac Sim update loop가 queue를 소비하므로 네트워크 스레드에서 USD를 직접
+* Isaac Sim update loop가 queue를 소비하므로 네트워크 스레드에서 USD를 직접
   수정하지 않습니다.
 * 수신된 `global_id`별로 `/World/MetaSejong_People/Person_<id>` 캡슐을
   생성하거나 이동합니다.

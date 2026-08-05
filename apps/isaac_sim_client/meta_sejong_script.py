@@ -1,4 +1,4 @@
-"""Receive live people scenes and visualize their roots in Isaac Sim.
+"""Receive live people scenes and visualize roots and poses in Isaac Sim.
 
 The default transport is Zenoh. WebSocket support remains available for the
 legacy sim_backend path by setting ISAAC_SCENE_TRANSPORT=websocket.
@@ -7,6 +7,7 @@ legacy sim_backend path by setting ISAAC_SCENE_TRANSPORT=websocket.
 import asyncio
 import atexit
 import json
+import math
 import os
 import queue
 import threading
@@ -14,7 +15,7 @@ import traceback
 
 import omni.kit.app
 import omni.usd
-from pxr import Gf, UsdGeom
+from pxr import Gf, Sdf, UsdGeom, UsdShade
 
 
 DEFAULT_USD_PATH = "/home/dojan/All/2025_SejongUniv_All.usd"
@@ -30,6 +31,28 @@ SIM_BACKEND_WS_URL = os.environ.get(
     "ws://127.0.0.1:8004/ws/sim",
 )
 USD_PEOPLE_ROOT = "/World/MetaSejong_People"
+USD_LOOKS_ROOT = "/World/MetaSejong_Looks"
+LIMBS = (
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (3, 4),
+    (4, 5),
+    (0, 9),
+    (9, 10),
+    (10, 11),
+    (2, 6),
+    (2, 12),
+    (6, 7),
+    (7, 8),
+    (12, 13),
+    (13, 14),
+)
+SUPPORTED_JOINT_FORMAT = "voxelpose_15j_xyz"
+FALLBACK_HEIGHT_METERS = 1.7
+FALLBACK_RADIUS_METERS = 0.3
+JOINT_RADIUS_METERS = 0.04
+BONE_RADIUS_METERS = 0.018
 
 if SCENE_TRANSPORT not in {"zenoh", "websocket", "both"}:
     raise ValueError(
@@ -61,45 +84,260 @@ class MetaSejongDigitalTwin:
         if self.stage is None:
             raise RuntimeError("USD stage is not ready")
         self.units_per_meter = UsdGeom.GetStageMetersPerUnit(self.stage)
+        self._people = {}
+        self._materials = {}
+        self._render_modes = {}
         self._ensure_root_group()
 
     def _ensure_root_group(self):
-        root_prim = self.stage.GetPrimAtPath(USD_PEOPLE_ROOT)
-        if not root_prim.IsValid():
-            UsdGeom.Xform.Define(self.stage, USD_PEOPLE_ROOT)
+        # Define unconditionally so an existing Scope/typeless prim is also
+        # promoted to an editable Xform in the current stage.
+        root = UsdGeom.Xform.Define(self.stage, USD_PEOPLE_ROOT)
+        root_xform = UsdGeom.Xformable(root)
+        op_types = {
+            op.GetOpType() for op in root_xform.GetOrderedXformOps()
+        }
+        if UsdGeom.XformOp.TypeTranslate not in op_types:
+            root_xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
+        if UsdGeom.XformOp.TypeOrient not in op_types:
+            root_xform.AddOrientOp(
+                UsdGeom.XformOp.PrecisionDouble
+            ).Set(Gf.Quatd(1.0))
+        if UsdGeom.XformOp.TypeScale not in op_types:
+            root_xform.AddScaleOp().Set(Gf.Vec3d(1.0, 1.0, 1.0))
+
+        looks_prim = self.stage.GetPrimAtPath(USD_LOOKS_ROOT)
+        if not looks_prim.IsValid():
+            UsdGeom.Scope.Define(self.stage, USD_LOOKS_ROOT)
+
+    def _position_meters_to_stage_units(self, position_meters) -> Gf.Vec3d:
+        """Interpret an incoming position in MetaSejong_People space."""
+        scale = 1.0 / self.units_per_meter
+        return Gf.Vec3d(
+            *(float(value) * scale for value in position_meters)
+        )
+
+    def _ensure_person_material(
+        self,
+        global_id: int,
+        color: Gf.Vec3f,
+    ) -> UsdShade.Material:
+        """Create an RTX-compatible surface material for one person ID."""
+        existing = self._materials.get(global_id)
+        if existing is not None:
+            return existing
+
+        material_path = f"{USD_LOOKS_ROOT}/Person_{global_id}"
+        material = UsdShade.Material.Define(self.stage, material_path)
+        shader = UsdShade.Shader.Define(
+            self.stage,
+            f"{material_path}/Shader",
+        )
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput(
+            "diffuseColor",
+            Sdf.ValueTypeNames.Color3f,
+        ).Set(color)
+        shader.CreateInput(
+            "roughness",
+            Sdf.ValueTypeNames.Float,
+        ).Set(0.5)
+        shader.CreateInput(
+            "metallic",
+            Sdf.ValueTypeNames.Float,
+        ).Set(0.0)
+        material.CreateSurfaceOutput().ConnectToSource(
+            shader.ConnectableAPI(),
+            "surface",
+        )
+        self._materials[global_id] = material
+        return material
+
+    def _ensure_person(self, global_id: int):
+        """Create one reusable fallback capsule and geometric skeleton."""
+        existing = self._people.get(global_id)
+        if existing is not None:
+            return existing
+
+        person_path = f"{USD_PEOPLE_ROOT}/Person_{global_id}"
+        person = UsdGeom.Xform.Define(self.stage, person_path)
+        person_xform = UsdGeom.Xformable(person)
+        person_xform.ClearXformOpOrder()
+        person_translate = person_xform.AddTranslateOp()
+
+        color = _id_color(global_id)
+        material = self._ensure_person_material(global_id, color)
+        UsdShade.MaterialBindingAPI.Apply(person.GetPrim()).Bind(material)
+        fallback = UsdGeom.Capsule.Define(
+            self.stage,
+            f"{person_path}/RootFallback",
+        )
+        fallback.GetHeightAttr().Set(
+            FALLBACK_HEIGHT_METERS / self.units_per_meter
+        )
+        fallback.GetRadiusAttr().Set(
+            FALLBACK_RADIUS_METERS / self.units_per_meter
+        )
+        fallback.GetAxisAttr().Set(UsdGeom.Tokens.z)
+        fallback.GetDisplayColorAttr().Set([color])
+
+        skeleton = UsdGeom.Xform.Define(self.stage, f"{person_path}/Skeleton")
+        UsdGeom.Imageable(skeleton.GetPrim()).MakeInvisible()
+        joint_translates = []
+        for joint_index in range(15):
+            joint = UsdGeom.Sphere.Define(
+                self.stage,
+                f"{person_path}/Skeleton/Joint_{joint_index:02d}",
+            )
+            joint.GetRadiusAttr().Set(
+                JOINT_RADIUS_METERS / self.units_per_meter
+            )
+            joint.GetDisplayColorAttr().Set([color])
+            joint_xform = UsdGeom.Xformable(joint)
+            joint_xform.ClearXformOpOrder()
+            joint_translates.append(joint_xform.AddTranslateOp())
+
+        bones = []
+        for bone_index in range(len(LIMBS)):
+            bone = UsdGeom.Cylinder.Define(
+                self.stage,
+                f"{person_path}/Skeleton/Bone_{bone_index:02d}",
+            )
+            bone.GetAxisAttr().Set(UsdGeom.Tokens.z)
+            bone.GetRadiusAttr().Set(
+                BONE_RADIUS_METERS / self.units_per_meter
+            )
+            bone.GetDisplayColorAttr().Set([color])
+            bone_xform = UsdGeom.Xformable(bone)
+            bone_xform.ClearXformOpOrder()
+            bones.append(
+                {
+                    "geometry": bone,
+                    "translate": bone_xform.AddTranslateOp(),
+                    "orient": bone_xform.AddOrientOp(
+                        UsdGeom.XformOp.PrecisionDouble
+                    ),
+                }
+            )
+
+        state = {
+            "person_prim": person.GetPrim(),
+            "person_translate": person_translate,
+            "fallback_prim": fallback.GetPrim(),
+            "skeleton_prim": skeleton.GetPrim(),
+            "joint_translates": joint_translates,
+            "bones": bones,
+        }
+        for legacy_name in ("Root", "Joints", "Bones"):
+            legacy_prim = self.stage.GetPrimAtPath(
+                f"{person_path}/{legacy_name}"
+            )
+            if legacy_prim.IsValid():
+                UsdGeom.Imageable(legacy_prim).MakeInvisible()
+        self._people[global_id] = state
+        return state
 
     def update_person_root(self, global_id: int, position_meters) -> None:
-        """Create or move the root capsule for one global ID."""
-        person_path = f"{USD_PEOPLE_ROOT}/Person_{global_id}"
-        person_prim = self.stage.GetPrimAtPath(person_path)
+        """Place a person using a MetaSejong_People-relative transform."""
+        state = self._ensure_person(global_id)
 
-        if not person_prim.IsValid():
-            capsule = UsdGeom.Capsule.Define(self.stage, person_path)
-            capsule.GetHeightAttr().Set(1.7 / self.units_per_meter)
-            capsule.GetRadiusAttr().Set(0.3 / self.units_per_meter)
-            capsule.GetDisplayColorAttr().Set([_id_color(global_id)])
+        UsdGeom.Imageable(state["person_prim"]).MakeVisible()
+        local_position = self._position_meters_to_stage_units(position_meters)
+        state["person_translate"].Set(local_position)
 
-            xformable = UsdGeom.Xformable(capsule)
-            xformable.ClearXformOpOrder()
-            xformable.AddTranslateOp()
-            person_prim = capsule.GetPrim()
+    def _show_fallback(self, global_id: int, reason: str) -> None:
+        state = self._ensure_person(global_id)
+        UsdGeom.Imageable(state["fallback_prim"]).MakeVisible()
+        UsdGeom.Imageable(state["skeleton_prim"]).MakeInvisible()
+        status = f"root:{reason}"
+        if self._render_modes.get(global_id) != status:
+            print(
+                f"[Meta Sejong] global_id={global_id} "
+                f"render=root reason={reason}"
+            )
+            self._render_modes[global_id] = status
 
-        UsdGeom.Imageable(person_prim).MakeVisible()
-        xformable = UsdGeom.Xformable(person_prim)
-        translate_op = next(
-            (
-                op
-                for op in xformable.GetOrderedXformOps()
-                if op.GetOpType() == UsdGeom.XformOp.TypeTranslate
-            ),
-            None,
-        )
-        if translate_op is None:
-            translate_op = xformable.AddTranslateOp()
+    def update_person_pose(
+        self,
+        global_id: int,
+        root_position_mm,
+        pose: dict | None,
+    ) -> None:
+        """Update joint points and limb curves relative to the person's root."""
+        if pose is None:
+            self._show_fallback(global_id, "pose_missing")
+            return
+        if not isinstance(pose, dict):
+            self._show_fallback(global_id, "pose_not_object")
+            return
+        if pose.get("joint_format") != SUPPORTED_JOINT_FORMAT:
+            self._show_fallback(
+                global_id,
+                f"unsupported_joint_format:{pose.get('joint_format')}",
+            )
+            return
+        if not isinstance(pose.get("joints"), list):
+            self._show_fallback(global_id, "joints_not_list")
+            return
 
-        scale = 1.0 / self.units_per_meter
-        x, y, z = (float(value) * scale for value in position_meters)
-        translate_op.Set(Gf.Vec3d(x, y, z))
+        raw_joints = pose["joints"]
+        if len(raw_joints) != 15 or any(
+            not isinstance(joint, list)
+            or len(joint) != 3
+            or not all(math.isfinite(float(value)) for value in joint)
+            for joint in raw_joints
+        ):
+            print(
+                f"[Meta Sejong] Ignoring invalid pose for global_id={global_id}"
+            )
+            self._show_fallback(global_id, "invalid_pose")
+            return
+
+        # Incoming roots and joints are expressed in MetaSejong_People space.
+        # Person_<id> carries the root translation, so its child geometry only
+        # needs the joint-to-root offset in the same coordinate system.
+        millimeters_per_stage_unit = 1000.0 * self.units_per_meter
+        relative_joints = [
+            Gf.Vec3f(
+                *(
+                    (float(joint[axis]) - float(root_position_mm[axis]))
+                    / millimeters_per_stage_unit
+                    for axis in range(3)
+                )
+            )
+            for joint in raw_joints
+        ]
+        state = self._ensure_person(global_id)
+
+        for translate_op, joint_position in zip(
+            state["joint_translates"],
+            relative_joints,
+        ):
+            translate_op.Set(Gf.Vec3d(joint_position))
+
+        z_axis = Gf.Vec3d(0.0, 0.0, 1.0)
+        for bone, (start_index, end_index) in zip(state["bones"], LIMBS):
+            start = Gf.Vec3d(relative_joints[start_index])
+            end = Gf.Vec3d(relative_joints[end_index])
+            delta = end - start
+            length = delta.GetLength()
+            if length <= 1e-6:
+                UsdGeom.Imageable(bone["geometry"].GetPrim()).MakeInvisible()
+                continue
+
+            UsdGeom.Imageable(bone["geometry"].GetPrim()).MakeVisible()
+            bone["geometry"].GetHeightAttr().Set(length)
+            bone["translate"].Set((start + end) * 0.5)
+            bone["orient"].Set(Gf.Rotation(z_axis, delta).GetQuat())
+
+        UsdGeom.Imageable(state["fallback_prim"]).MakeInvisible()
+        UsdGeom.Imageable(state["skeleton_prim"]).MakeVisible()
+        if self._render_modes.get(global_id) != "skeleton":
+            print(
+                f"[Meta Sejong] global_id={global_id} "
+                f"render=skeleton joints={len(raw_joints)}"
+            )
+            self._render_modes[global_id] = "skeleton"
 
     def apply_scene(self, scene: dict) -> None:
         """Apply one schema_version=1 SceneOutput snapshot."""
@@ -113,6 +351,11 @@ class MetaSejongDigitalTwin:
             # VoxelPose SceneOutput coordinates are millimeters.
             root_position_m = [value / 1000.0 for value in root_position_mm]
             self.update_person_root(global_id, root_position_m)
+            self.update_person_pose(
+                global_id,
+                root_position_mm,
+                person.get("pose"),
+            )
             active_paths.add(f"{USD_PEOPLE_ROOT}/Person_{global_id}")
 
         root_prim = self.stage.GetPrimAtPath(USD_PEOPLE_ROOT)
@@ -294,4 +537,3 @@ if SCENE_TRANSPORT in {"zenoh", "both"}:
 
 if SCENE_TRANSPORT in {"websocket", "both"}:
     asyncio.ensure_future(websocket_listener_task())
-

@@ -21,6 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from apps.server_worker.config.config import config as focus_config
 from apps.server_worker.config.config import update_config as update_focus_config
+from apps.server_worker.priority_engine import PriorityConfig, PriorityEngine
 from apps.server_worker.src.pose.core.config import config as sp3d_config
 from apps.server_worker.src.pose.core.config import (
     update_config as update_sp3d_config,
@@ -46,7 +47,9 @@ LodAssignments = dict[int, LodLevel]
 LodAssignCallback = Callable[[list[int]], LodAssignments]
 OUTPUT_SCHEMA_VERSION = 1
 DEFAULT_MAX_OUTPUT_PEOPLE = 10
+DEFAULT_LOD2_PEOPLE = 1
 MAX_ROOT_REPROJECTION_ERROR_PX = 250.0
+ROOT_POSITION_TO_METERS = 0.001
 
 # ===== TEMP VISER DEBUG: delete this block and the marked call in main() =====
 ENABLE_ZMQ_OUTPUT = False
@@ -210,6 +213,23 @@ def get_parser():
         type=int,
         default=DEFAULT_MAX_OUTPUT_PEOPLE,
         help="Maximum number of person entities emitted per synchronized scene",
+    )
+    parser.add_argument(
+        "--lod2-count",
+        type=int,
+        default=DEFAULT_LOD2_PEOPLE,
+        help="Number of highest-priority people assigned to LOD 2",
+    )
+    parser.add_argument(
+        "--priority-hazard",
+        action="append",
+        nargs=2,
+        type=float,
+        metavar=("X", "Y"),
+        help=(
+            "Hazard point in metre-based root world coordinates; may be repeated. "
+            "Defaults to the PriorityEngine hazard (2.0, 4.0)"
+        ),
     )
     parser.add_argument("--no-zmq", action="store_true")
     parser.add_argument("--zmq-host", default=None)
@@ -487,6 +507,79 @@ def lod_assign(
     return assignments
 
 
+def build_priority_input(
+    ids: list[list[int | None]],
+    roots: torch.Tensor,
+) -> dict[str, list[dict[str, Any]]]:
+    """Global ID와 root를 PriorityEngine의 metre 단위 입력으로 변환한다."""
+    if roots.ndim != 3 or roots.shape[-1] != 5:
+        raise ValueError("roots must have shape [num_edges, num_roots, 5]")
+    if len(ids) != roots.shape[0] or any(
+        len(edge_ids) != roots.shape[1] for edge_ids in ids
+    ):
+        raise ValueError("ids shape must match the Edge/root dimensions")
+
+    roots_cpu = roots.detach().cpu()
+    persons = []
+    seen_global_ids = set()
+    for edge_index, edge_ids in enumerate(ids):
+        for root_index, global_id in enumerate(edge_ids):
+            if global_id is None:
+                continue
+            if global_id in seen_global_ids:
+                raise ValueError(f"duplicate global ID in roots: {global_id}")
+            seen_global_ids.add(global_id)
+
+            raw_position = roots_cpu[edge_index, root_index, :3]
+            if not torch.isfinite(raw_position).all():
+                raise ValueError(f"root position must be finite: global_id={global_id}")
+            x, y, z = (
+                float(value) * ROOT_POSITION_TO_METERS
+                for value in raw_position.tolist()
+            )
+            persons.append(
+                {
+                    "track_id": global_id,
+                    "position": {"x": x, "y": y, "z": z},
+                }
+            )
+
+    return {"persons": persons}
+
+
+def assign_priority_lods(
+    ids: list[list[int | None]],
+    roots: torch.Tensor,
+    timestamps: list[float],
+    engine: PriorityEngine,
+    lod2_count: int,
+) -> LodAssignments:
+    """PriorityEngine rank 상위 인원을 LOD 2, 나머지를 LOD 1로 배정한다."""
+    if isinstance(lod2_count, bool) or not isinstance(lod2_count, int):
+        raise TypeError("lod2_count must be an integer")
+    if lod2_count < 0:
+        raise ValueError("lod2_count must not be negative")
+    if len(timestamps) != roots.shape[0] or not timestamps:
+        raise ValueError("timestamps must contain one value per Edge")
+
+    timestamp_values = [float(timestamp) for timestamp in timestamps]
+    if not all(math.isfinite(timestamp) for timestamp in timestamp_values):
+        raise ValueError("timestamps must be finite")
+    scene_timestamp = sum(timestamp_values) / len(timestamp_values)
+    ranked_result = engine.assign_priority(
+        build_priority_input(ids, roots),
+        timestamp=scene_timestamp,
+        selected_count=lod2_count,
+    )
+    assignments = {
+        int(person["track_id"]): 2 if int(person["rank"]) <= lod2_count else 1
+        for person in ranked_result["persons"]
+    }
+
+    # 기존 lod_assign의 ID 완전성 및 LOD 범위 검증을 그대로 적용한다.
+    return lod_assign(ids, lambda _global_ids: assignments)
+
+
 def select_lod2_roots(
     roots: torch.Tensor,
     ids: list[list[int | None]],
@@ -723,6 +816,8 @@ def main() -> None:
     logger.info("Starting server inference: args=%s", args)
     if args.max_output_people < 1:
         raise ValueError("--max-output-people must be at least 1")
+    if args.lod2_count < 0:
+        raise ValueError("--lod2-count must not be negative")
 
     if args.cfg_focus:
         logger.info("Loading focus config: %s", args.cfg_focus)
@@ -774,9 +869,17 @@ def main() -> None:
     reid = ClusteringSliding(edges=edge_ids, window_size=10)
     logger.info("[3/8] Re-ID clustering is ready: edges=%s", edge_ids)
     # LoD assignment
-    """
-    여기에 1. Zone 별 나눔 2. AoS 알고리즘 같은거 하면 됨
-    """
+    priority_hazards = (
+        tuple((float(x), float(y)) for x, y in args.priority_hazard)
+        if args.priority_hazard
+        else PriorityConfig().hazards
+    )
+    priority_engine = PriorityEngine(PriorityConfig(hazards=priority_hazards))
+    logger.info(
+        "Priority-based LOD assignment is ready: lod2_count=%d hazards=%s",
+        args.lod2_count,
+        priority_hazards,
+    )
     # pose_model
     """
     Edge마다 할당되면 개별 pose_model이 선언됨
@@ -871,7 +974,13 @@ def main() -> None:
                         edge_metadata,
                     )
 
-                    lod_by_id = lod_assign(ids, assign_all_lod2)
+                    lod_by_id = assign_priority_lods(
+                        ids,
+                        roots,
+                        timestamps,
+                        priority_engine,
+                        args.lod2_count,
+                    )
                     logger.debug("LOD assignments: %s", lod_by_id)
 
                     pose_result = run_pose_models(
