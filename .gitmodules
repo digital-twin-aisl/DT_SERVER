@@ -1,0 +1,3 @@
+[submodule "apps/calibration_worker/vggt-omega"]
+	path = apps/calibration_worker/vggt-omega
+	url = https://github.com/facebookresearch/vggt-omega.git
