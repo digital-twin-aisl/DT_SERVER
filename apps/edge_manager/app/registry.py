@@ -71,12 +71,15 @@ class EdgeRegistry:
         edge_id: str,
         message: dict[str, Any],
         received_at: float | None = None,
-    ) -> tuple[bool, dict[str, Any]]:
+    ) -> tuple[bool, bool, dict[str, Any]]:
         received_at = received_at or time.time()
 
-        def update(data: dict[str, Any]) -> tuple[tuple[bool, dict[str, Any]], bool]:
+        def update(
+            data: dict[str, Any],
+        ) -> tuple[tuple[bool, bool, dict[str, Any]], bool]:
             edges = data["edges"]
             created = edge_id not in edges
+            was_online = bool(edges.get(edge_id, {}).get("online"))
             record = edges.setdefault(
                 edge_id,
                 {
@@ -87,6 +90,7 @@ class EdgeRegistry:
                     "first_seen_at": received_at,
                 },
             )
+            record.pop("enabled", None)
             record.update(
                 {
                     "online": True,
@@ -95,7 +99,24 @@ class EdgeRegistry:
                     "edge_sent_at": message.get("sent_at"),
                 }
             )
-            return (created, dict(record)), True
+            came_online = not created and not was_online
+            return (created, came_online, dict(record)), True
+
+        return self._with_lock(update)
+
+    def mark_all_offline(self) -> list[str]:
+        """Reset ephemeral connection state when the manager starts."""
+
+        def update(data: dict[str, Any]) -> tuple[list[str], bool]:
+            changed = []
+            migrated = False
+            for edge_id, record in data["edges"].items():
+                if record.pop("enabled", None) is not None:
+                    migrated = True
+                if record.get("online"):
+                    record["online"] = False
+                    changed.append(edge_id)
+            return changed, bool(changed) or migrated
 
         return self._with_lock(update)
 

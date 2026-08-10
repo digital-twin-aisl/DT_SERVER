@@ -40,8 +40,16 @@ class EdgeTopics:
         return f"{self.base}/status"
 
     @property
+    def inference(self) -> str:
+        return f"{self.base}/inference"
+
+    @property
     def command(self) -> str:
         return f"{self.base}/command"
+
+    @property
+    def config(self) -> str:
+        return f"{self.base}/config"
 
     @property
     def ack(self) -> str:

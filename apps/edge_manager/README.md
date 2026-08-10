@@ -15,7 +15,8 @@ python -m apps.edge_manager --endpoint localhost:7447 serve
 
 ```bash
 python -m apps.edge_manager list
-python -m apps.edge_manager approve EDGE_ID --name jetson-01
+python -m apps.edge_manager --endpoint SERVER_IP:7447 \
+  approve EDGE_ID --name jetson-01
 python -m apps.edge_manager command EDGE_ID ping
 python -m apps.edge_manager revoke EDGE_ID
 python -m apps.edge_manager remove EDGE_ID
@@ -46,6 +47,11 @@ dt/edges/{edge_id}/ack
 
 현재 명령은 `ping`, `info`, `shutdown`을 지원합니다. `shutdown`은 Jetson을
 종료하는 명령이 아니라 edge agent 프로세스만 정상 종료합니다.
+
+`approve`는 `dt/edges/{edge_id}/config`로 설정을 발행하고, 엣지가
+`edge.local.json` 저장을 완료했다는 ACK를 보낸 뒤에만 registry를 승인 상태로
+변경합니다. 엣지가 보고한 endpoint 대신 다른 외부 주소를 저장해야 한다면
+`approve EDGE_ID --edge-endpoint PUBLIC_IP:7447`을 사용합니다.
 
 현재 최소 구현에서는 registry와 `server_worker`의 승인 엣지 목록을 자동으로
 동기화하지 않습니다. 서버 추론을 붙일 때는 승인된 엣지의 ID와

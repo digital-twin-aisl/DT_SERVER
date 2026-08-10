@@ -57,16 +57,18 @@ def serve(args: argparse.Namespace, registry: EdgeRegistry) -> None:
             expected_topic = EdgeTopics(edge_id, args.topic_root).status
             if str(sample.key_expr) != expected_topic:
                 raise ValueError("status topic and edge_id do not match")
-            created, record = registry.observe_status(edge_id, message)
+            created, came_online, _ = registry.observe_status(edge_id, message)
             if created:
                 print(f"Discovered pending edge: {edge_id}", flush=True)
+            elif came_online:
+                print(f"Edge is online: {edge_id}", flush=True)
         except Exception as exc:
             print(f"Invalid status message: {exc}", file=sys.stderr, flush=True)
 
     def on_ack(sample: Any) -> None:
         try:
             message = decode_json(sample.payload)
-            if message.get("kind") != "command_ack":
+            if message.get("kind") not in {"command_ack", "config_ack"}:
                 raise ValueError("unexpected message kind")
             edge_id = validate_edge_id(str(message["edge_id"]))
             expected_topic = EdgeTopics(edge_id, args.topic_root).ack
@@ -81,6 +83,7 @@ def serve(args: argparse.Namespace, registry: EdgeRegistry) -> None:
         except Exception as exc:
             print(f"Invalid ACK message: {exc}", file=sys.stderr, flush=True)
 
+    registry.mark_all_offline()
     config = make_zenoh_config(args.endpoint, args.zenoh_config)
     status_selector = f"{args.topic_root.strip('/')}/*/status"
     ack_selector = f"{args.topic_root.strip('/')}/*/ack"
@@ -120,6 +123,83 @@ def update_edge(
     except (KeyError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
     _print_record(record)
+
+
+def approve_edge(args: argparse.Namespace, registry: EdgeRegistry) -> None:
+    edge_id = validate_edge_id(args.edge_id)
+    record = registry.snapshot()["edges"].get(edge_id)
+    if record is None:
+        raise SystemExit(f"unknown edge: {edge_id}")
+
+    status = record.get("last_status") or {}
+    edge_endpoint = (
+        args.edge_endpoint
+        or status.get("zenoh_endpoint")
+        or args.endpoint
+    )
+    if not edge_endpoint:
+        raise SystemExit(
+            "edge endpoint is unknown; pass --edge-endpoint or start the edge "
+            "agent with --endpoint"
+        )
+
+    display_name = args.name or record.get("display_name") or edge_id
+    topics = EdgeTopics(edge_id, args.topic_root)
+    config_id = uuid4().hex
+    message = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "edge_config",
+        "edge_id": edge_id,
+        "config_id": config_id,
+        "sent_at": time.time(),
+        "data": {
+            "approved": True,
+            "display_name": display_name,
+            "zenoh_endpoint": edge_endpoint,
+            "topic_root": topics.root,
+            "topics": {
+                "status": topics.status,
+                "inference": topics.inference,
+                "command": topics.command,
+                "config": topics.config,
+                "ack": topics.ack,
+            },
+        },
+    }
+    received = threading.Event()
+    response: dict[str, Any] = {}
+
+    def on_ack(sample: Any) -> None:
+        try:
+            candidate = decode_json(sample.payload)
+            if (
+                candidate.get("kind") == "config_ack"
+                and candidate.get("config_id") == config_id
+            ):
+                response.update(candidate)
+                received.set()
+        except Exception:
+            return
+
+    config = make_zenoh_config(args.endpoint, args.zenoh_config)
+    with zenoh.open(config) as session:
+        subscriber = session.declare_subscriber(topics.ack, on_ack)
+        session.put(topics.config, encode_json(message))
+        if not received.wait(args.timeout):
+            raise SystemExit(
+                f"config sent but ACK timed out after {args.timeout:.1f}s: {config_id}"
+            )
+        _ = subscriber
+
+    registry.record_ack(edge_id, response)
+    if not response.get("success"):
+        raise SystemExit(f"edge rejected configuration: {response.get('error')}")
+    update_edge(
+        registry,
+        edge_id,
+        approved=True,
+        display_name=display_name,
+    )
 
 
 def send_command(args: argparse.Namespace, registry: EdgeRegistry) -> None:
@@ -196,6 +276,8 @@ def build_parser() -> argparse.ArgumentParser:
     approve = subparsers.add_parser("approve")
     approve.add_argument("edge_id")
     approve.add_argument("--name")
+    approve.add_argument("--edge-endpoint")
+    approve.add_argument("--timeout", type=float, default=5.0)
 
     for name in ("revoke", "remove"):
         command = subparsers.add_parser(name)
@@ -220,10 +302,9 @@ def main() -> None:
         elif args.subcommand == "list":
             list_edges(args, registry)
         elif args.subcommand == "approve":
-            fields: dict[str, Any] = {"approved": True}
-            if args.name:
-                fields["display_name"] = args.name
-            update_edge(registry, args.edge_id, **fields)
+            if args.timeout <= 0:
+                raise SystemExit("--timeout must be greater than zero")
+            approve_edge(args, registry)
         elif args.subcommand == "revoke":
             update_edge(registry, args.edge_id, approved=False)
         elif args.subcommand == "remove":
