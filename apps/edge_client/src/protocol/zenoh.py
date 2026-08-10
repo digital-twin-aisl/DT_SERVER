@@ -8,6 +8,23 @@ TOPIC = "edge/topic1"
 _STOP = object()
 
 
+def make_zenoh_config(endpoint=None, config_path=None):
+    if config_path:
+        return zenoh.Config.from_file(config_path)
+    if endpoint:
+        if "/" not in endpoint:
+            endpoint = f"tcp/{endpoint}"
+        return zenoh.Config.from_json5(
+            json.dumps(
+                {
+                    "mode": "client",
+                    "connect": {"endpoints": [endpoint]},
+                }
+            )
+        )
+    return zenoh.Config()
+
+
 class ZenohSender:
     """추론 스레드와 겹쳐 실행되는 최신 결과 우선 Zenoh 송신기."""
 
@@ -50,21 +67,7 @@ class ZenohSender:
         self.queue.put_nowait(payload)
 
     def _config(self):
-        if self.config_path:
-            return zenoh.Config.from_file(self.config_path)
-        if self.endpoint:
-            endpoint = self.endpoint
-            if "/" not in endpoint:
-                endpoint = f"tcp/{endpoint}"
-            return zenoh.Config.from_json5(
-                json.dumps(
-                    {
-                        "mode": "client",
-                        "connect": {"endpoints": [endpoint]},
-                    }
-                )
-            )
-        return zenoh.Config()
+        return make_zenoh_config(self.endpoint, self.config_path)
 
     def _run(self):
         try:

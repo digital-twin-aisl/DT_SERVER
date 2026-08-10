@@ -7,4 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ./app ./app
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "80"]
+ENV EDGE_REGISTRY_PATH=/var/lib/edge-manager/edges.json
+VOLUME ["/var/lib/edge-manager"]
+
+ENTRYPOINT ["python", "-m", "app"]
+CMD ["serve"]

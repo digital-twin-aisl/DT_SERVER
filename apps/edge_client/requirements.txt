@@ -28,5 +28,4 @@ imageio
 matplotlib
 
 # Protocols
-confluent-kafka
 eclipse-zenoh==1.9.0
