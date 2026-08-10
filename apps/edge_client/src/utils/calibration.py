@@ -5,9 +5,8 @@ import glob
 import cv2
 import pickle
 import numpy as np
-from torch.utils.data.dataloader import default_collate
 
-from apps.edge_client.src.utils.transforms import get_affine_transform, get_scale
+from apps.edge_client.src.utils.transforms import get_scale
 
 class CalibrationData:
     '''
@@ -55,11 +54,17 @@ class CalibrationData:
         with open(self.camera_calibration_paths, "r") as f:
             all_results = json.load(f)
         for camera_source in self.rtsp_cam:
-            cam_id_str = "".join(c for c in str(camera_source['url']) if c.isalnum() or c in '_-')
-            if cam_id_str not in all_results:
+            # New edge-local registrations use a stable logical camera ID so
+            # calibration keys never contain a physical endpoint or password.
+            cam_id_str = str(camera_source['id'])
+            legacy_id = "".join(
+                c for c in str(camera_source['url']) if c.isalnum() or c in '_-'
+            )
+            result_key = cam_id_str if cam_id_str in all_results else legacy_id
+            if result_key not in all_results:
                 raise KeyError(f"카메라 ID '{cam_id_str}'에 대한 캘리브레이션 결과를 찾을 수 없습니다.")
             
-            result = all_results[cam_id_str]
+            result = all_results[result_key]
             R, _ = cv2.Rodrigues(np.array(result["rvec"]))
             T = (
                 -np.dot(R.T, np.array(result["tvec"])) * 1000  # mm 단위 변환
@@ -87,9 +92,7 @@ class CalibrationData:
             with open(path, "rb") as f:
                 calib = pickle.load(f)
                 
-            M = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
             R, _ = cv2.Rodrigues(calib['rvec'])
-            # R = R.dot(M)
             T = (
                 -np.dot(R.T, calib['tvec']) * 1000
             )

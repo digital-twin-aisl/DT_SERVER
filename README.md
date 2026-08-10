@@ -83,7 +83,7 @@ apps/edge_client/install_root.sh \
 
 ## Edge client 설정 및 실행
 
-카메라 URL, Zenoh endpoint, topic과 모델 경로는 `apps/edge_client/config/config.py` 또는 `--cfg_focus`로 전달하는 YAML 파일에서 설정합니다.
+카메라는 `python apps/edge_client/camera_setup.py`로 엣지 로컬 설정에 등록합니다. Zenoh endpoint, topic과 모델 경로는 `apps/edge_client/config/config.py` 또는 `--cfg_focus`로 전달하는 YAML 파일에서 설정합니다.
 
 샘플 데이터로 실행:
 

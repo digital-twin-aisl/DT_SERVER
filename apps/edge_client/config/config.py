@@ -1,4 +1,5 @@
 from ast import literal_eval
+from pathlib import Path
 
 from easydict import EasyDict as edict
 import numpy as np
@@ -23,24 +24,11 @@ config.EXAMPLE.END_FRAME = None
 
 # lod
 config.DISTANCE = 1500
-config.CAMERAS = [
-    {
-        "id": "0",
-        "url": "rtsp://admin:byda13245@10.1.1.3:554",
-    },
-    {
-        "id": "1",
-        "url": "rtsp://admin:byda13245@10.1.1.2:554",
-    },
-    {
-        "id": "2",
-        "url": "rtsp://admin:byda13245@10.1.1.4:554",
-    },
-    {
-        "id": "3",
-        "url": "rtsp://admin:byda13245@10.1.1.5:554",
-    }
-]
+config.CAMERAS = []
+local_camera_config = Path(__file__).with_name("cameras.local.yaml")
+if local_camera_config.exists():
+    local_config = yaml.safe_load(local_camera_config.read_text()) or {}
+    config.CAMERAS = local_config.get("CAMERAS", [])
 config.SERVER = "localhost:7447"
 config.OUTPUT_TOPIC = "0_edge"
 config.YOLO = edict()
