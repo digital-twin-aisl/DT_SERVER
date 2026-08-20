@@ -41,6 +41,8 @@ ID는 기본적으로 `apps/edge_client/config/edge.local.json`에 저장되고 
   "edge_id": "edge-001",
   "approved": true,
   "display_name": "jetson-01",
+  "camera_config": "cameras.local.yaml",
+  "camera_ids": [2, 4, 6, 8],
   "zenoh_endpoint": "SERVER_IP:7447",
   "topic_root": "dt/edges",
   "topics": {
@@ -61,9 +63,15 @@ ID는 기본적으로 `apps/edge_client/config/edge.local.json`에 저장되고 
 
 ```bash
 python apps/edge_client/inference.py \
+  --edge-id-file apps/edge_client/config/edge_1.dataset.json \
+  --deployment apps/deployments/scene_0812_2.json \
   --tensorrt \
   --zenoh-endpoint SERVER_IP:7447
 ```
+
+Identity에 `camera_config`와 `camera_ids`가 있으면 실시간 추론은 해당 로컬
+RTSP 설정을 읽고 deployment의 카메라 순서와 대조합니다. `camera_config`의 상대
+경로는 identity 파일이 있는 디렉터리를 기준으로 합니다.
 
 기본 추론 토픽은 `dt/edges/{edge_id}/inference`입니다. 이전
 `--zenoh-topic` 옵션은 기존 실행 명령과의 호환만을 위해 숨김 상태로 남아

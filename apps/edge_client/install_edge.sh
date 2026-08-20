@@ -22,7 +22,24 @@ if [[ ! -x "${VENV_PATH}/bin/python" ]]; then
 fi
 
 source "${VENV_PATH}/bin/activate"
-python -m pip install --upgrade pip setuptools wheel packaging
+python -m pip install --upgrade pip "setuptools<82" wheel packaging
+
+FASTREID_PATH="${SCRIPT_DIR}/src/reid/fast-reid"
+if [[ ! -f "${FASTREID_PATH}/fastreid/__init__.py" ]]; then
+    if [[ ! -f "${REPOSITORY_ROOT}/.gitmodules" ]]; then
+        die "fast-reid is missing and this checkout has no submodule metadata"
+    fi
+    log "Initializing fast-reid submodule"
+    git -C "${REPOSITORY_ROOT}" submodule update --init --depth 1 -- \
+        apps/edge_client/src/reid/fast-reid
+fi
+
+VGGT_SOURCE="${REPOSITORY_ROOT}/apps/calibration_worker/vggt-omega"
+if [[ ! -f "${VGGT_SOURCE}/pyproject.toml" ]]; then
+    log "Initializing vggt-omega submodule"
+    git -C "${REPOSITORY_ROOT}" submodule update --init --depth 1 -- \
+        apps/calibration_worker/vggt-omega
+fi
 
 shopt -s nullglob
 COMMON_WHEELS=("${SCRIPT_DIR}"/wheels/dt_common-*.whl)
@@ -67,11 +84,10 @@ log "Downloading sample data and model files"
 python "${SCRIPT_DIR}/src/utils/download_from_drive.py"
 
 log "Verifying installation"
-python - <<'PY'
+PYTHONPATH="${FASTREID_PATH}${PYTHONPATH:+:${PYTHONPATH}}" python - <<'PY'
 import cv2
 import onnx
 import onnxoptimizer
-import pycuda.driver
 import tensorrt
 import torch
 import torchvision
@@ -79,6 +95,7 @@ import ultralytics
 import vggt_omega
 import zenoh
 import zstandard
+import fastreid
 from torch2trt import TRTModule, torch2trt
 
 if not torch.cuda.is_available():

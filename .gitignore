@@ -11,6 +11,8 @@ __pycache__/
 *$py.class
 .vscode
 *.pth.tar
+apps/edge_client/models/*.pth.tar.tensorrt/
+apps/edge_client/models/*.pth.tensorrt/
 
 # C extensions
 *.so

@@ -26,16 +26,19 @@ def get_flops(model, inp):
     return flop_counter.get_total_flops()
 
 class MultiPersonPoseNetSSV(nn.Module):
-    def __init__(self, backbone, cfg, inference_mode="posenet"):
+    def __init__(self, backbone, cfg, inference_mode="rootnet"):
         super(MultiPersonPoseNetSSV, self).__init__()
+        self.inference_mode = inference_mode
         self.backbone = backbone
         self.root_net = CuboidProposalNetSoft(cfg)
-        self.pose_net = PoseRegressionNet(cfg)
+        # Edge inference stops at root proposals.  Keep the pose regression
+        # network entirely off the edge GPU; the server owns that stage.
+        self.pose_net = (
+            None if inference_mode == "rootnet" else PoseRegressionNet(cfg)
+        )
         self.num_joints = cfg.NETWORK.NUM_JOINTS
         self.num_cand = cfg.MULTI_PERSON.MAX_PEOPLE_NUM
         self.num_views = cfg.NUM_VIEWS
-
-        self.inference_mode = inference_mode
 
     def _cal_root_distance(self, root, distance):
         if distance is None or distance == 0:

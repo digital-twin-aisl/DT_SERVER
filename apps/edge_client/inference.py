@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 
 import argparse
+import hashlib
 import multiprocessing as mp
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -14,9 +15,9 @@ import zstandard as zstd
 import cv2
 import numpy as np
 import torch
-from ultralytics import YOLO
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+EDGE_CLIENT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from apps.edge_client.src.protocol.zenoh import ZenohSender
@@ -27,10 +28,6 @@ from apps.edge_client.src.protocol.edge import (
     load_edge_metadata,
     load_or_create_edge_id,
 )
-from apps.edge_client.src.reid.feature_extract import (
-    build_trt_feature_extractor,
-    extract_features_from_persons_trt,
-)
 from apps.edge_client.src.reid.yolopose import extract_poses_from_frame
 from apps.edge_client.src.root.core.config import config as sp3d_config
 from apps.edge_client.src.root.core.config import update_config as update_sp3d_config
@@ -38,7 +35,16 @@ from apps.edge_client.src.root.models.multi_person_posenet_ssv import (
     get_multi_person_pose_net,
 )
 from apps.edge_client.src.utils.calibration import CalibrationData
-from apps.edge_client.src.utils.input import ExampleDataset, IPCamera
+from apps.edge_client.src.utils.input import (
+    ExampleDataset,
+    FrameUnavailableError,
+    IPCamera,
+    find_dataset_calibration,
+    load_camera_sources,
+    select_dataset_camera_ids,
+    select_live_cameras,
+    snapshot_shared_frames,
+)
 from apps.edge_client.src.utils.pre_process import PREPROCESS
 from apps.edge_client.src.utils.tensorrt import load_tensorrt_model
 from apps.edge_client.config.config import config as focus_config
@@ -46,16 +52,35 @@ from apps.edge_client.config.config import update_config as update_focus_config
 from dt_common.spatial.workspace import build_edge_workspace, load_spatial_context
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Edge inference with Zenoh")
-    parser.add_argument("--cfg_focus", type=str)
+    parser.add_argument("--cfg-focus", "--cfg_focus", dest="cfg_focus")
     parser.add_argument(
         "--deployment",
         help="Shared scene, calibration, edge assignment, and workspace manifest",
     )
-    parser.add_argument("--example_folder", type=str)
+    parser.add_argument("--example-folder", "--example_folder", dest="example_folder")
     parser.add_argument("--tensorrt", action="store_true")
+    parser.add_argument(
+        "--rebuild-tensorrt",
+        action="store_true",
+        help="Force regeneration of the configuration-specific pose engines",
+    )
     parser.add_argument("--dataset", action="store_true")
+    parser.add_argument(
+        "--camera-config",
+        help="Edge-private YAML containing live RTSP camera sources",
+    )
+    parser.add_argument(
+        "--rtsp-transport",
+        choices=("tcp", "udp"),
+        default="tcp",
+    )
+    parser.add_argument("--rtsp-open-timeout-ms", type=int, default=8000)
+    parser.add_argument("--rtsp-read-timeout-ms", type=int, default=3000)
+    parser.add_argument("--rtsp-reconnect-delay", type=float, default=0.5)
+    parser.add_argument("--rtsp-max-frame-age", type=float, default=2.0)
+    parser.add_argument("--rtsp-max-skew", type=float, default=0.5)
     parser.add_argument("--zenoh-endpoint", type=str)
     parser.add_argument("--zenoh-config", type=str)
     parser.add_argument("--zenoh-topic", type=str, help=argparse.SUPPRESS)
@@ -67,10 +92,126 @@ def parse_args():
         action="store_true",
         help="Run inference without publishing results to Zenoh",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--no-reid",
+        action="store_true",
+        help="Skip YOLO/ReID extraction and run only multi-view 3D inference",
+    )
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        help="Stop after this many frames (useful for dataset smoke tests)",
+    )
+    args = parser.parse_args(argv)
+    if args.dataset and not args.example_folder:
+        parser.error("--dataset requires --example-folder")
+    if args.max_frames is not None and args.max_frames < 1:
+        parser.error("--max-frames must be at least 1")
+    if min(args.rtsp_open_timeout_ms, args.rtsp_read_timeout_ms) < 1:
+        parser.error("RTSP timeouts must be positive")
+    if min(
+        args.rtsp_reconnect_delay,
+        args.rtsp_max_frame_age,
+        args.rtsp_max_skew,
+    ) <= 0:
+        parser.error("RTSP reconnect/freshness values must be positive")
+    return args
 
 
-def load_models(use_tensorrt):
+def resolve_edge_path(value, *, must_exist=True):
+    """Resolve app-relative defaults while preserving explicit cwd-relative paths."""
+    path = Path(value).expanduser()
+    candidates = (
+        [path]
+        if path.is_absolute()
+        else [Path.cwd() / path, EDGE_CLIENT_ROOT / path]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    resolved = candidates[-1].resolve()
+    if must_exist:
+        raise FileNotFoundError(f"required path does not exist: {resolved}")
+    return resolved
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_dataset_spatial_context(dataset_path, spatial_context):
+    """Prevent absolute-USD datasets from using the legacy fixed workspace."""
+    calibration_path = find_dataset_calibration(dataset_path)
+    if calibration_path is None:
+        return
+    if spatial_context is None:
+        raise ValueError(
+            "a dataset with calibration_result*.json requires --deployment; "
+            "the deployment builds its Ground/AOI workspace instead of using "
+            "the legacy 80x80x20 cube"
+        )
+    calibration_sha256 = file_sha256(calibration_path)
+    if calibration_sha256 != spatial_context.calibration_sha256:
+        raise ValueError(
+            "dataset calibration does not match the deployment calibration: "
+            f"{calibration_path}"
+        )
+
+
+def resolve_live_cameras(args, edge_metadata, spatial_context, edge_id):
+    """Resolve one ordered RTSP source for every edge camera ID."""
+    identity_camera_ids = edge_metadata.get("camera_ids")
+    deployment_camera_ids = (
+        None
+        if spatial_context is None
+        else list(spatial_context.edge_camera_ids[edge_id])
+    )
+    if identity_camera_ids is not None:
+        identity_camera_ids = [int(value) for value in identity_camera_ids]
+        if (
+            deployment_camera_ids is not None
+            and identity_camera_ids != deployment_camera_ids
+        ):
+            raise ValueError(
+                f"identity camera_ids {identity_camera_ids} do not match "
+                f"deployment camera_ids {deployment_camera_ids} for {edge_id}"
+            )
+    required_camera_ids = deployment_camera_ids or identity_camera_ids
+
+    camera_config_value = args.camera_config or edge_metadata.get("camera_config")
+    if camera_config_value:
+        camera_config_path = Path(camera_config_value).expanduser()
+        if not camera_config_path.is_absolute():
+            if args.camera_config:
+                camera_config_path = resolve_edge_path(camera_config_path)
+            else:
+                camera_config_path = (
+                    Path(args.edge_id_file).parent / camera_config_path
+                ).resolve()
+        if not camera_config_path.is_file():
+            raise FileNotFoundError(
+                f"camera config not found: {camera_config_path}"
+            )
+        cameras = load_camera_sources(camera_config_path)
+    else:
+        cameras = focus_config.CAMERAS
+    selected = select_live_cameras(
+        cameras,
+        required_camera_ids,
+        sp3d_config.NUM_VIEWS,
+    )
+    print(
+        "Selected live RTSP cameras: "
+        + ", ".join(str(camera["id"]) for camera in selected)
+    )
+    return selected
+
+
+def load_models(use_tensorrt, use_reid, rebuild_tensorrt=False):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.enabled = sp3d_config.CUDNN.ENABLED
     torch.backends.cudnn.benchmark = sp3d_config.CUDNN.BENCHMARK
@@ -82,21 +223,51 @@ def load_models(use_tensorrt):
     # ProjectLayer copies cfg.TRANSFORM while the pose model is constructed.
     # Build preprocessing first so that the affine transform is available.
     pose_preprocess = PREPROCESS(sp3d_config)
-    checkpoint = focus_config.POSENET.CKPT
+    checkpoint = resolve_edge_path(focus_config.POSENET.CKPT)
     pose_model = get_multi_person_pose_net(sp3d_config, inference_mode="rootnet")
-    pose_model.load_state_dict(torch.load(checkpoint, weights_only=False))
+    checkpoint_state = torch.load(
+        checkpoint,
+        map_location=device,
+        weights_only=False,
+    )
+    checkpoint_state = {
+        name: value
+        for name, value in checkpoint_state.items()
+        if not name.startswith("pose_net.")
+    }
+    pose_model.load_state_dict(checkpoint_state)
+    del checkpoint_state
     pose_model = pose_model.eval().to(device)
     if use_tensorrt:
         pose_model = load_tensorrt_model(
-            pose_model, checkpoint, sp3d_config, mode="fp16"
+            pose_model,
+            checkpoint,
+            sp3d_config,
+            mode="fp16",
+            force_rebuild=rebuild_tensorrt,
         )
 
-    return (
-        pose_preprocess,
-        pose_model,
-        build_trt_feature_extractor(),
-        YOLO(focus_config.YOLO.MODEL),
-    )
+    reid_engine = None
+    yolo_model = None
+    if use_reid:
+        from ultralytics import YOLO
+        from apps.edge_client.src.reid.feature_extract import (
+            build_feature_extractor,
+            build_trt_feature_extractor,
+        )
+
+        if use_tensorrt:
+            reid_engine = (
+                "tensorrt",
+                build_trt_feature_extractor(
+                    force_rebuild=rebuild_tensorrt,
+                ),
+            )
+        else:
+            reid_engine = ("pytorch", build_feature_extractor())
+        yolo_model = YOLO(str(resolve_edge_path(focus_config.YOLO.MODEL)))
+
+    return pose_preprocess, pose_model, reid_engine, yolo_model
 
 
 PAYLOAD_HEADER = struct.Struct("!4sd")
@@ -132,11 +303,20 @@ def attach_input_buffers(parent, process):
 
     for _ in buffers:
         if not parent.poll(15):
+            if not process.is_alive():
+                raise RuntimeError(
+                    "input process exited during camera initialization"
+                )
             raise TimeoutError("카메라 공유 메모리 초기화 시간 초과")
 
         message = parent.recv()
         if message[0] != "OK":
-            raise RuntimeError(f"카메라 {message[1]} 초기화 실패")
+            _, index, *details = message
+            camera_id = details[0] if details else index
+            reason = details[1] if len(details) > 1 else "unknown error"
+            raise RuntimeError(
+                f"camera {camera_id} initialization failed: {reason}"
+            )
 
         _, index, name, shape, dtype = message
         buffers[index] = (
@@ -166,12 +346,32 @@ def create_input_process(
     input_flag,
     edge_id,
     spatial_context,
+    live_cameras=None,
 ):
     if args.dataset:
         print("Starting synchronized dataset input")
-        process = ExampleDataset(args.example_folder, stop_event, child, input_flag)
+        camera_ids = (
+            list(spatial_context.edge_camera_ids[edge_id])
+            if spatial_context is not None
+            else select_dataset_camera_ids(
+                args.example_folder,
+                edge_id,
+                sp3d_config.NUM_VIEWS,
+            )
+        )
+        process = ExampleDataset(
+            args.example_folder,
+            stop_event,
+            child,
+            input_flag,
+            camera_ids=camera_ids,
+        )
         if spatial_context is None:
-            CalibrationData(sp3d_config, example_path=args.example_folder)
+            CalibrationData(
+                sp3d_config,
+                example_path=args.example_folder,
+                camera_ids=camera_ids,
+            )
         else:
             expected_ids = list(spatial_context.edge_camera_ids[edge_id])
             if process.camera_ids != expected_ids:
@@ -187,9 +387,11 @@ def create_input_process(
             )
         return process
 
-    print("Starting synchronized IP camera input")
+    print("Starting live RTSP camera input")
+    if not live_cameras:
+        raise ValueError("live RTSP input requires configured camera sources")
     if spatial_context is None:
-        CalibrationData(sp3d_config, cameras=focus_config.CAMERAS)
+        CalibrationData(sp3d_config, cameras=live_cameras)
     else:
         CalibrationData(
             sp3d_config,
@@ -197,7 +399,17 @@ def create_input_process(
             camera_ids=spatial_context.edge_camera_ids[edge_id],
             world_origin_m=spatial_context.world_origin_m,
         )
-    return IPCamera(focus_config.CAMERAS, stop_event, child, input_flag)
+    return IPCamera(
+        live_cameras,
+        stop_event,
+        child,
+        input_flag,
+        transport=args.rtsp_transport,
+        open_timeout_ms=args.rtsp_open_timeout_ms,
+        read_timeout_ms=args.rtsp_read_timeout_ms,
+        reconnect_delay=args.rtsp_reconnect_delay,
+        expected_size=sp3d_config.NETWORK.IMAGE_SIZE_ORIG,
+    )
 
 
 def extract_reid(
@@ -208,6 +420,13 @@ def extract_reid(
     edge_id,
     camera_ids,
 ):
+    if reid_engine is None or yolo_model is None:
+        return []
+    from apps.edge_client.src.reid.feature_extract import (
+        extract_features_from_persons,
+        extract_features_from_persons_trt,
+    )
+
     features = []
     for index, image in enumerate(images):
         try:
@@ -219,9 +438,14 @@ def extract_reid(
                 frame_num=frame_num,
             )
             if persons:
-                features.extend(
-                    extract_features_from_persons_trt(*reid_engine, persons)
-                )
+                backend, extractor = reid_engine
+                if backend == "tensorrt":
+                    extracted = extract_features_from_persons_trt(
+                        *extractor, persons
+                    )
+                else:
+                    extracted = extract_features_from_persons(*extractor, persons)
+                features.extend(extracted)
         except Exception:
             print(f"ReID error: frame={frame_num}, camera={index + 1}")
             traceback.print_exc()
@@ -231,14 +455,36 @@ def extract_reid(
 def main():
     args = parse_args()
     if args.cfg_focus:
-        update_focus_config(args.cfg_focus)
-    update_sp3d_config(focus_config.POSENET.CONFIG)
+        update_focus_config(resolve_edge_path(args.cfg_focus))
+    update_sp3d_config(resolve_edge_path(focus_config.POSENET.CONFIG))
+    use_tensorrt = args.tensorrt or bool(focus_config.POSENET.TENSORRT)
+    if args.dataset:
+        args.example_folder = str(resolve_edge_path(args.example_folder))
+    if args.deployment:
+        args.deployment = str(resolve_edge_path(args.deployment))
+    args.edge_id_file = str(
+        resolve_edge_path(args.edge_id_file, must_exist=False)
+    )
+    if args.zenoh_config:
+        args.zenoh_config = str(resolve_edge_path(args.zenoh_config))
     edge_id = load_or_create_edge_id(args.edge_id_file, args.edge_id)
     spatial_context = (
         load_spatial_context(args.deployment) if args.deployment else None
     )
+    if args.dataset:
+        validate_dataset_spatial_context(args.example_folder, spatial_context)
     sp3d_config.SPATIAL_CONTEXT = spatial_context
     edge_metadata = load_edge_metadata(args.edge_id_file)
+    live_cameras = (
+        None
+        if args.dataset
+        else resolve_live_cameras(
+            args,
+            edge_metadata,
+            spatial_context,
+            edge_id,
+        )
+    )
     topic_root = args.topic_root or edge_metadata.get("topic_root") or DEFAULT_TOPIC_ROOT
     zenoh_endpoint = (
         args.zenoh_endpoint
@@ -265,6 +511,7 @@ def main():
             input_flag,
             edge_id,
             spatial_context,
+            live_cameras,
         )
         if spatial_context is not None:
             expected_ids = list(spatial_context.edge_camera_ids[edge_id])
@@ -304,8 +551,12 @@ def main():
         camera_ids = input_process.camera_ids
 
         pose_preprocess, pose_model, reid_engine, yolo_model = load_models(
-            args.tensorrt
+            use_tensorrt,
+            not args.no_reid,
+            args.rebuild_tensorrt,
         )
+        if args.no_reid:
+            print("ReID output disabled")
 
         if args.no_zenoh:
             print("Zenoh output disabled")
@@ -318,16 +569,36 @@ def main():
             )
 
         frame_num = 0
+        last_input_warning = 0.0
         with torch.inference_mode():
             while not stop_event.is_set():
                 started_at = time.time()
                 frame_timestamp = (
                     frame_num / input_process.fps if args.dataset else started_at
                 )
-                image_batches = [
-                    np.ndarray(shape, dtype=dtype, buffer=shm.buf)
-                    for shm, shape, dtype in buffers
-                ]
+                try:
+                    image_batches = snapshot_shared_frames(
+                        buffers,
+                        input_process.frame_locks,
+                        (
+                            None
+                            if args.dataset
+                            else input_process.frame_timestamps
+                        ),
+                        max_age=(
+                            None if args.dataset else args.rtsp_max_frame_age
+                        ),
+                        max_skew=(
+                            None if args.dataset else args.rtsp_max_skew
+                        ),
+                    )
+                except FrameUnavailableError as exc:
+                    now = time.monotonic()
+                    if now - last_input_warning >= 2.0:
+                        print(f"Live input waiting: {exc}")
+                        last_input_warning = now
+                    time.sleep(0.01)
+                    continue
                 frame_outputs = extract_reid(
                     reid_engine,
                     yolo_model,
@@ -363,6 +634,8 @@ def main():
                     f"dropped={sender.dropped if sender is not None else 0}"
                 )
                 frame_num += 1
+                if args.max_frames is not None and frame_num >= args.max_frames:
+                    break
                 if args.dataset:
                     input_flag.value = True
                     while input_flag.value and input_process.is_alive():

@@ -65,6 +65,25 @@ python apps/edge_client/agent.py init
 apps/edge_client/config/cameras.local.yaml
 ```
 
+실시간 추론에서는 identity의 `camera_config`와 `camera_ids`를 사용합니다. 상대
+`camera_config` 경로는 identity 파일 위치를 기준으로 해석하며, `camera_ids`는
+deployment에 지정된 순서와 정확히 일치해야 합니다. 예를 들어 `edge_1`은 다음과
+같이 실행합니다.
+
+```bash
+python apps/edge_client/inference.py \
+  --edge-id-file apps/edge_client/config/edge_1.dataset.json \
+  --deployment apps/deployments/scene_0812_2.json \
+  --tensorrt
+```
+
+기본 RTSP 전송은 TCP입니다. 시작할 때 모든 카메라의 첫 프레임과 보정 해상도를
+검증하고, 실행 중 연결이 끊기면 자동으로 다시 연결합니다. 끊어진 카메라의 마지막
+프레임을 계속 추론에 넣지는 않습니다. 필요할 때만 `--rtsp-transport udp`,
+`--rtsp-open-timeout-ms`, `--rtsp-read-timeout-ms`, `--rtsp-max-frame-age`,
+`--rtsp-max-skew`로 동작을 조정할 수 있습니다. 다른 로컬 설정을 쓰려면
+`--camera-config`가 identity 값보다 우선합니다.
+
 Intrinsic을 나중에 입력하거나 체커보드로 측정하려면 다음 명령을 사용합니다.
 
 ```bash

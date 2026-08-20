@@ -25,6 +25,13 @@ model_ids = {
     'POC_posenet.pth.tar': '1q3D8VWAvR6fBcQEHRsFKL3nx1EJYwCaQ',
 }
 
+model_urls = {
+    'market_bot_R50-ibn.pth': (
+        'https://github.com/JDAI-CV/fast-reid/releases/download/'
+        'v0.1.1/market_bot_R50-ibn.pth'
+    ),
+}
+
 def download_from_google_drive(file_id, output_path):
     os.makedirs(osp.dirname(output_path), exist_ok=True)
     url = f'https://drive.google.com/uc?id={file_id}'
@@ -53,6 +60,22 @@ def run():
             print(f"{model_name} already exists")
             continue
         download_from_google_drive(model_id, output_path)
+        print(f"Downloaded {model_name}")
+
+    for model_name, url in model_urls.items():
+        output_path = osp.join(
+            PWD,
+            '..',
+            'reid',
+            'fast-reid',
+            'weights',
+            model_name,
+        )
+        if osp.exists(output_path):
+            print(f"{model_name} already exists")
+            continue
+        os.makedirs(osp.dirname(output_path), exist_ok=True)
+        gdown.download(url, output_path, quiet=False)
         print(f"Downloaded {model_name}")
 
     print("Download completed")

@@ -16,11 +16,14 @@ yacs==0.1.8
 
 # ONNX / TensorRT integration
 # PyTorch, torchvision, and TensorRT must match JetPack.
-# install_root.sh validates them and installs torch2trt separately.
-onnx
+# install_edge.sh validates them and installs torch2trt separately.
+onnx==1.17.0
+onnx-graphsurgeon==0.5.8
+onnxscript==0.7.1
+onnx-ir==0.2.1
+ml-dtypes==0.5.1
 onnxoptimizer
 onnxsim
-pycuda
 
 # Utilities
 gdown

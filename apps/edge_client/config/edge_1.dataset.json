@@ -1,3 +1,5 @@
 {
-  "edge_id": "edge_1"
+  "edge_id": "edge_1",
+  "camera_config": "cameras.local.yaml",
+  "camera_ids": [2, 4, 6, 8]
 }

@@ -42,44 +42,22 @@ PyTorch wheel 선택은 [NVIDIA PyTorch for Jetson 설치 문서](https://docs.n
 
 ### 기본 설치
 
-CUDA PyTorch와 torchvision이 이미 설치된 Jetson에서는 저장소 루트에서 다음을 실행합니다.
+Jetson에서는 저장소 루트에서 다음을 실행합니다.
 
 ```bash
-chmod +x apps/edge_client/install_root.sh
-apps/edge_client/install_root.sh
+chmod +x apps/edge_client/install_edge.sh
+apps/edge_client/install_edge.sh
 source apps/edge_client/.venv/bin/activate
 ```
 
 스크립트는 다음 작업을 수행합니다.
 
-1. JetPack 6/L4T R36 및 CUDA PyTorch 확인
-2. `apps/edge_client/.venv` 생성
-3. `apps/edge_client/requirements.txt` 설치
+1. 시스템 패키지와 `apps/edge_client/.venv` 준비
+2. Jetson용 CUDA PyTorch와 edge client 의존성 설치
+3. 누락된 FastReID/VGGT-Omega 서브모듈 초기화
 4. `torch2trt` 설치
-5. 샘플 영상, 캘리브레이션 데이터, pose checkpoint 다운로드
+5. 샘플 데이터, pose checkpoint, ReID checkpoint 다운로드
 6. CUDA와 주요 Python import 검증
-
-PyTorch 또는 torchvision을 별도 wheel로 설치해야 한다면 다음처럼 지정합니다.
-
-```bash
-apps/edge_client/install_root.sh \
-  --torch-wheel /path/to/torch-wheel.whl \
-  --torchvision-wheel /path/to/torchvision-wheel.whl
-```
-
-주요 옵션:
-
-| 옵션 | 설명 |
-| --- | --- |
-| `--venv PATH` | 가상환경 위치 변경 |
-| `--system` | 가상환경 대신 시스템 Python 사용 |
-| `--python COMMAND` | 사용할 Python 명령 지정 |
-| `--skip-apt` | Ubuntu 패키지 설치 생략 |
-| `--skip-torch2trt` | torch2trt 설치 생략 |
-| `--skip-assets` | 샘플 데이터 및 모델 다운로드 생략 |
-| `--force` | 지정 wheel과 torch2trt 재설치 |
-
-전체 옵션은 `apps/edge_client/install_root.sh --help`로 확인할 수 있습니다.
 
 ## Edge client 설정 및 실행
 
@@ -106,6 +84,40 @@ python inference.py --tensorrt --zenoh-endpoint SERVER_IP:7447
 ```
 
 Zenoh 송신 없이 로컬 추론만 확인하려면 `--no-zenoh`를 추가합니다.
+
+`data/data_0812_1`처럼 두 edge의 영상 8개와 `edge_info.txt`가 함께 있는
+데이터셋은 실행할 edge identity를 지정하면 해당 4개 카메라를 자동 선택합니다.
+저장소 루트에서도 동일하게 실행할 수 있습니다.
+
+```bash
+apps/edge_client/.venv/bin/python apps/edge_client/inference.py \
+  --dataset \
+  --example-folder apps/edge_client/data/data_0812_1 \
+  --edge-id edge_1 \
+  --edge-id-file apps/edge_client/config/edge_1.dataset.json \
+  --deployment apps/deployments/scene_0812_2.json \
+  --tensorrt \
+  --no-zenoh
+```
+
+첫 프레임만 빠르게 검증하려면 `--max-frames 1`을, ReID 엔진/모델을 제외하고
+3D pose 경로만 검증하려면 `--no-reid`를 추가합니다.
+
+USD calibration 데이터셋은 `--deployment`가 필수입니다. 이 manifest의 Ground와
+edge AOI를 `workspace.py` 정책으로 계산한 결과 현재 `edge_1`은 `328x108x20`,
+`edge_2`는 `300x108x16` cube를 사용합니다. deployment 없이 학습 기준의 고정
+`80x80x20` cube로 실행하는 오류는 시작 단계에서 차단됩니다.
+
+Edge 모델은 backbone heatmap과 root candidate까지만 계산합니다. 관절별 3D pose
+regression은 server worker가 담당하며, edge rootnet 모드에서는 `PoseRegressionNet`
+가 생성되거나 checkpoint에서 GPU로 적재되지 않습니다.
+
+`--tensorrt`를 처음 사용하면 pose와 FastReID checkpoint의 SHA-256, 입력/cube
+크기, precision과 Jetson/TensorRT 버전을 조합한 전용 FP16 엔진을 각각 생성하고
+PyTorch 출력과 비교 검증합니다. 같은 설정의 다음 실행부터는 생성된 엔진을 자동
+재사용합니다. 체크포인트나 설정이 바뀌면 별도 엔진을 자동 생성하며, 두 엔진을
+강제로 다시 만들려면 `--rebuild-tensorrt`를 사용합니다.
+`config.POSENET.TENSORRT: true`로 설정해도 `--tensorrt`와 동일하게 동작합니다.
 
 ## 종료 및 상태 확인
 

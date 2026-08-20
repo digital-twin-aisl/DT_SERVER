@@ -12,6 +12,7 @@ from dt_common.calibration.voxelpose import (
 )
 from apps.edge_client.src.utils.transforms import get_scale
 from apps.edge_client.src.utils.input import discover_dataset_videos
+from apps.edge_client.src.utils.input import find_dataset_calibration
 
 class CalibrationData:
     '''
@@ -41,6 +42,7 @@ class CalibrationData:
         self.rtsp_cam = cameras
         self.cams = []
         self.example_path = example_path
+        self.camera_ids = None if camera_ids is None else list(camera_ids)
 
         self.orig_image_size= np.array(cfg.NETWORK.IMAGE_SIZE_ORIG)
         self.image_size=np.array(cfg.NETWORK.IMAGE_SIZE)
@@ -106,19 +108,13 @@ class CalibrationData:
             
             
     def update_from_dataset(self):
-        result_paths = sorted(
-            glob.glob(osp.join(self.example_path, "calibration_result*.json"))
-        )
-        if result_paths:
-            if len(result_paths) != 1:
-                raise ValueError(
-                    "dataset must contain exactly one calibration_result JSON"
-                )
-            camera_ids = [
+        result_path = find_dataset_calibration(self.example_path)
+        if result_path is not None:
+            camera_ids = self.camera_ids or [
                 camera_id
                 for camera_id, _ in discover_dataset_videos(self.example_path)
             ]
-            result = load_calibration_result(result_paths[0])
+            result = load_calibration_result(result_path)
             self.cams = select_voxelpose_cameras(result, camera_ids)
             return
 
