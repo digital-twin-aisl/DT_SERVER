@@ -1,4 +1,5 @@
 import fcntl
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -72,7 +73,7 @@ class EdgeRegistry:
         message: dict[str, Any],
         received_at: float | None = None,
     ) -> tuple[bool, bool, dict[str, Any]]:
-        received_at = received_at or time.time()
+        received_at = time.time() if received_at is None else received_at
 
         def update(
             data: dict[str, Any],
@@ -104,6 +105,83 @@ class EdgeRegistry:
 
         return self._with_lock(update)
 
+    def observe_cameras(
+        self,
+        edge_id: str,
+        cameras: list[dict[str, Any]],
+        *,
+        edge_sent_at: float | None = None,
+        received_at: float | None = None,
+    ) -> tuple[bool, bool, dict[str, Any]]:
+        """Store an authoritative, sanitized camera snapshot for one edge."""
+        received_at = time.time() if received_at is None else received_at
+
+        def update(
+            data: dict[str, Any],
+        ) -> tuple[tuple[bool, bool, dict[str, Any]], bool]:
+            edges = data["edges"]
+            created = edge_id not in edges
+            was_online = bool(edges.get(edge_id, {}).get("online"))
+            record = edges.setdefault(
+                edge_id,
+                {
+                    "edge_id": edge_id,
+                    "display_name": edge_id,
+                    "approved": False,
+                    "online": True,
+                    "first_seen_at": received_at,
+                },
+            )
+            previous_value = record.get("cameras") or {}
+            previous = previous_value if isinstance(previous_value, dict) else {}
+            current = {camera["camera_id"]: dict(camera) for camera in cameras}
+            for camera_id, camera in current.items():
+                old_camera = previous.get(camera_id)
+                if isinstance(old_camera, dict) and old_camera.get(
+                    "service_metadata"
+                ) is not None:
+                    camera["service_metadata"] = deepcopy(
+                        old_camera["service_metadata"]
+                    )
+            for camera_id, old_camera in previous.items():
+                if camera_id not in current:
+                    current[camera_id] = {
+                        "camera_id": camera_id,
+                        "exists": False,
+                        "ping": False,
+                        "calibration": old_camera.get("calibration")
+                        or {
+                            "intrinsic": None,
+                            "extrinsic": None,
+                            "distortion_coefficients": None,
+                        },
+                    }
+            record.update(
+                {
+                    "online": True,
+                    "last_seen_at": received_at,
+                    "cameras": current,
+                    "last_camera_update_at": received_at,
+                    "camera_sent_at": edge_sent_at,
+                }
+            )
+            return (created, not created and not was_online, dict(record)), True
+
+        return self._with_lock(update)
+
+    @staticmethod
+    def _clear_camera_pings(record: dict[str, Any]) -> bool:
+        changed = False
+        cameras = record.get("cameras") or {}
+        values = cameras.values() if isinstance(cameras, dict) else cameras
+        for camera in values:
+            if not isinstance(camera, dict):
+                continue
+            if camera.get("ping"):
+                camera["ping"] = False
+                changed = True
+        return changed
+
     def mark_all_offline(self) -> list[str]:
         """Reset ephemeral connection state when the manager starts."""
 
@@ -116,6 +194,8 @@ class EdgeRegistry:
                 if record.get("online"):
                     record["online"] = False
                     changed.append(edge_id)
+                if self._clear_camera_pings(record):
+                    migrated = True
             return changed, bool(changed) or migrated
 
         return self._with_lock(update)
@@ -150,6 +230,7 @@ class EdgeRegistry:
                 last_seen = float(record.get("last_seen_at", 0))
                 if record.get("online") and now - last_seen > offline_after:
                     record["online"] = False
+                    self._clear_camera_pings(record)
                     changed.append(edge_id)
             return changed, bool(changed)
 
@@ -161,6 +242,141 @@ class EdgeRegistry:
             if record is None:
                 return None, False
             record["last_ack"] = message
+            return None, True
+
+        self._with_lock(update)
+
+    def record_calibration_result(
+        self,
+        edge_id: str,
+        result: dict[str, Any],
+        *,
+        result_path: str,
+        completed_at: float | None = None,
+        edge_sync_status: str = "pending",
+    ) -> dict[str, Any]:
+        """Persist detailed camera calibration and an edge-level run summary."""
+        json.dumps(result, allow_nan=False)
+        completed_at = time.time() if completed_at is None else completed_at
+
+        def update(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+            try:
+                record = data["edges"][edge_id]
+            except KeyError as exc:
+                raise KeyError(f"unknown edge: {edge_id}") from exc
+            result_cameras = result.get("cameras")
+            if not isinstance(result_cameras, list) or not result_cameras:
+                raise ValueError("calibration result cameras must be a non-empty list")
+            cameras = record.setdefault("cameras", {})
+            if not isinstance(cameras, dict):
+                raise ValueError(f"edge {edge_id} cameras must be an object")
+
+            updated_ids: list[str] = []
+            for camera in result_cameras:
+                if not isinstance(camera, dict):
+                    raise ValueError("calibration result camera must be an object")
+                camera_id = str(camera.get("edge_camera_id") or "")
+                expected_key = f"{edge_id}/camera/{camera_id}"
+                if camera.get("camera_id") != expected_key:
+                    raise ValueError(
+                        f"calibration camera key does not match edge: {camera.get('camera_id')}"
+                    )
+                current = cameras.get(camera_id)
+                if not isinstance(current, dict) or not current.get("exists"):
+                    raise ValueError(f"unknown registered camera: camera/{camera_id}")
+                calibration = current.setdefault("calibration", {})
+                existing_intrinsic = calibration.get("intrinsic")
+                intrinsic = (
+                    deepcopy(existing_intrinsic)
+                    if isinstance(existing_intrinsic, dict)
+                    else {}
+                )
+                intrinsic.update(
+                    {
+                        "camera_matrix": deepcopy(camera.get("camera_matrix")),
+                        "undistorted_camera_matrix": deepcopy(
+                            camera.get("undistorted_camera_matrix")
+                        ),
+                        "image_size": deepcopy(camera.get("source_image_size")),
+                    }
+                )
+                calibration["intrinsic"] = intrinsic
+                calibration["distortion_coefficients"] = deepcopy(
+                    camera.get("distortion_coefficients")
+                )
+                calibration["extrinsic"] = {
+                    "schema_version": 1,
+                    "request_id": (result.get("input") or {}).get("request_id"),
+                    "calibrated_at": completed_at,
+                    "marker_tree": result.get("marker_tree"),
+                    "coordinate_convention": deepcopy(
+                        result.get("coordinate_convention")
+                    ),
+                    "world_to_camera": deepcopy(camera.get("world_to_camera")),
+                    "camera_to_world": deepcopy(camera.get("camera_to_world")),
+                    "position_m": deepcopy(camera.get("position_m")),
+                    "alignment": deepcopy(result.get("alignment")),
+                }
+                current["service_metadata"] = {
+                    "name": camera.get("name"),
+                    "location": camera.get("location"),
+                    "twin_id": camera.get("twin_id"),
+                }
+                updated_ids.append(camera_id)
+
+            record["last_calibration"] = {
+                "schema_version": 1,
+                "request_id": (result.get("input") or {}).get("request_id"),
+                "completed_at": completed_at,
+                "result_path": result_path,
+                "marker_tree": result.get("marker_tree"),
+                "checkpoint_sha256": (result.get("input") or {}).get(
+                    "checkpoint_sha256"
+                ),
+                "reference_video_frame_indices": deepcopy(
+                    (result.get("input") or {}).get(
+                        "reference_video_frame_indices"
+                    )
+                ),
+                "alignment": deepcopy(result.get("alignment")),
+                "camera_ids": sorted(updated_ids, key=int),
+                "edge_sync": {
+                    "status": edge_sync_status,
+                    "updated_at": completed_at,
+                    "error": None,
+                },
+            }
+            return dict(record), True
+
+        return self._with_lock(update)
+
+    def record_calibration_sync(
+        self,
+        edge_id: str,
+        request_id: str,
+        *,
+        success: bool,
+        error: str | None = None,
+        updated_at: float | None = None,
+    ) -> None:
+        updated_at = time.time() if updated_at is None else updated_at
+
+        def update(data: dict[str, Any]) -> tuple[None, bool]:
+            record = data["edges"].get(edge_id)
+            if record is None:
+                raise KeyError(f"unknown edge: {edge_id}")
+            calibration = record.get("last_calibration")
+            if not isinstance(calibration, dict) or calibration.get(
+                "request_id"
+            ) != request_id:
+                raise ValueError(
+                    f"calibration request is no longer current: {request_id}"
+                )
+            calibration["edge_sync"] = {
+                "status": "applied" if success else "failed",
+                "updated_at": updated_at,
+                "error": error,
+            }
             return None, True
 
         self._with_lock(update)

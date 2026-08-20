@@ -227,10 +227,11 @@ config.MULTI_PERSON = edict()
 config.MULTI_PERSON.SPACE_SIZE = np.array([4000.0, 5200.0, 2400.0])
 config.MULTI_PERSON.SPACE_CENTER = np.array([300.0, 300.0, 300.0])
 config.MULTI_PERSON.ESTIMATED_SPACE_CENTER = np.array([300.0, 300.0, 300.0])
+config.MULTI_PERSON.SPACE_CENTERS = []
 config.MULTI_PERSON.INITIAL_CUBE_SIZE = np.array([24, 32, 16])
 config.MULTI_PERSON.MAX_PEOPLE_NUM = 10
 config.MULTI_PERSON.THRESHOLD = 0.1
-
+config.MULTI_PERSON.ROOT_NMS_DISTANCE = 500.0
 
 def _update_dict(k, v):
     if k == 'DATASET':

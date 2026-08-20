@@ -6,6 +6,10 @@ from typing import Any, Iterator
 import cv2
 import numpy as np
 
+from dt_common.calibration.voxelpose import (
+    load_calibration_result,
+    select_voxelpose_cameras,
+)
 from apps.server_worker.src.utils.transforms import get_affine_transform, get_scale
 
 
@@ -26,30 +30,108 @@ class EdgeMetadataLoader:
     def __init__(
         self,
         cfg: Any,
-        edge_ids: list[str],
+        edge_ids: list[str] | None = None,
         path: str | Path = DEFAULT_METADATA_PATH,
     ) -> None:
-        with Path(path).open(encoding="utf-8") as file:
+        metadata_path = Path(path)
+        with metadata_path.open(encoding="utf-8") as file:
             data = json.load(file)
 
-        profiles = data["camera_profiles"]
-        translation_scale = 1000 if data["translation_unit"] == "meter" else 1
-        raw_edges = {edge["id"]: edge for edge in data["edges"]}
+        raw_edges = {
+            edge["id"]: edge
+            for edge in data["edges"]
+            if edge.get("enabled", True)
+        }
+        selected_edge_ids = list(edge_ids) if edge_ids is not None else list(raw_edges)
+        missing_edges = [edge_id for edge_id in selected_edge_ids if edge_id not in raw_edges]
+        if missing_edges:
+            raise ValueError(
+                "edge metadata is missing: " + ", ".join(missing_edges)
+            )
         self._edges = {}
 
+        if data.get("calibration_result"):
+            self._load_usd_edges(
+                cfg,
+                data,
+                raw_edges,
+                selected_edge_ids,
+                metadata_path,
+            )
+        else:
+            self._load_legacy_edges(cfg, data, raw_edges, selected_edge_ids)
+
+    def _load_legacy_edges(self, cfg, data, raw_edges, edge_ids):
+        profiles = data["camera_profiles"]
+        translation_scale = 1000 if data["translation_unit"] == "meter" else 1
         for edge_id in edge_ids:
             edge = raw_edges[edge_id]
             cams = [
                 self._make_camera(camera, profiles, translation_scale)
                 for camera in edge["cameras"]
             ]
-            resolution = cams[0]["resolution"]
-            self._edges[edge_id] = EdgeMetadata(
-                id=edge_id,
-                topic=edge["topic"],
-                cams=cams,
-                transform=self._make_transform(cfg, resolution),
+            self._store_edge(cfg, edge_id, edge, cams)
+
+    def _load_usd_edges(
+        self,
+        cfg,
+        data,
+        raw_edges,
+        edge_ids,
+        metadata_path,
+    ):
+        calibration_path = Path(data["calibration_result"])
+        if not calibration_path.is_absolute():
+            calibration_path = metadata_path.parent / calibration_path
+        calibration = load_calibration_result(calibration_path.resolve())
+        origin_m = data.get("world_origin_m", [0.0, 0.0, 0.0])
+        resolution_data = data.get("resolution") or {
+            "width": int(cfg.NETWORK.IMAGE_SIZE_ORIG[0]),
+            "height": int(cfg.NETWORK.IMAGE_SIZE_ORIG[1]),
+        }
+        resolution = (
+            int(resolution_data["width"]),
+            int(resolution_data["height"]),
+        )
+        fps = float(data.get("fps", 30.0))
+        topic_root = str(data.get("topic_root", "dt/edges")).strip("/")
+
+        for edge_id in edge_ids:
+            edge = raw_edges[edge_id]
+            camera_ids = edge.get("camera_ids") or edge.get("cameras")
+            cams = select_voxelpose_cameras(
+                calibration,
+                camera_ids,
+                world_origin_m=origin_m,
             )
+            for camera in cams:
+                camera_id = int(camera["id"])
+                camera.update(
+                    {
+                        "name": f"camera/{camera_id}",
+                        "key": f"{edge_id}/camera/{camera_id}",
+                        "resolution": resolution,
+                        "fps": fps,
+                    }
+                )
+            normalized_edge = dict(edge)
+            normalized_edge.setdefault(
+                "topic", f"{topic_root}/{edge_id}/inference"
+            )
+            self._store_edge(cfg, edge_id, normalized_edge, cams)
+
+    def _store_edge(self, cfg, edge_id, edge, cams):
+        if not cams:
+            raise ValueError(f"{edge_id} must contain at least one camera")
+        resolution = cams[0]["resolution"]
+        if any(camera["resolution"] != resolution for camera in cams):
+            raise ValueError(f"{edge_id} cameras must use one image resolution")
+        self._edges[edge_id] = EdgeMetadata(
+            id=edge_id,
+            topic=edge["topic"],
+            cams=cams,
+            transform=self._make_transform(cfg, resolution),
+        )
 
     @property
     def edge_ids(self) -> list[str]:

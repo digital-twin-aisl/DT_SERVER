@@ -13,9 +13,15 @@ apps/isaac_sim_client/aruco_boards/aruco_marker_tree.usd
 ```
 
 `Add marker to tree`를 누를 때마다 기존 트리에 마커가 자식으로 추가됩니다.
-개별 보드 USD와 PNG는 트리 옆 `assets/` 아래에 저장되는 내부 자산이며, 사용자는
-트리 USD 하나만 로드하고 배치하면 됩니다. 트리 경로를 다르게 지정하면 용도별로
-여러 마커 컬렉션을 만들 수 있습니다.
+개별 보드의 geometry, material, metadata는 모두 tree USD 내부의 marker Prim 아래에
+저장됩니다. 따라서 별도 marker USD는 생성되지 않으며, 삭제·수정은 tree 안의 해당
+marker Prim 하나를 관리하면 됩니다. ArUco 이미지는 USD의 texture asset 특성상 트리
+옆 `textures/`에 PNG로 저장됩니다. 트리 경로를 다르게 지정하면 용도별로 여러 마커
+컬렉션을 만들 수 있습니다.
+
+하나의 트리 안에서 `(dictionary, marker ID)` 조합은 영상에서 검출 가능한 GCP의
+고유 식별자입니다. 같은 조합을 다시 추가하면 모호한 대응을 방지하기 위해 오류로
+처리됩니다.
 
 ```text
 /ArUcoMarkerTree
@@ -27,21 +33,31 @@ apps/isaac_sim_client/aruco_boards/aruco_marker_tree.usd
 
 `Camera placement > In front`가 켜져 있으면 새 마커 하나의 카메라 앞 위치와
 회전이 해당 마커 자식 transform으로 tree USD 안에 저장됩니다. 옵션을 끄면
-마커는 추가 순서대로 10 mm 간격을 두고 좌우로 자동 배치됩니다. 같은 딕셔너리와
-ID를 다시 추가해도 `_2`, `_3` 접미사가 붙어 별도 자식으로 보존됩니다.
+마커는 추가 순서대로 10 mm 간격을 두고 좌우로 자동 배치됩니다.
 
-`Load/update tree in current Stage`가 켜져 있으면 현재 Stage에는 개별 마커가
-아니라 트리 USD 하나가 `/World/ArUcoMarkerTrees/<tree 이름>/Tree`에
-reference됩니다. 상위 `<tree 이름>` Prim은 Stage 단위 변환만 담당하는 wrapper이며
-위치와 회전은 적용하지 않습니다. 실제 저장·관리 대상은 그 아래 tree
-reference입니다. 이후 마커를 추가해도 같은 tree instance가 갱신됩니다. `Load
-tree` 버튼으로 저장된 컬렉션 전체를 한 번에 로드할 수도 있습니다.
+`Preview tree in current Stage session`이 켜져 있으면 현재 campus Stage의 익명
+session layer에만 tree reference를 만듭니다. campus USD root layer에는 Prim,
+reference, marker metadata 또는 transform override를 기록하지 않으며 Extension은
+campus USD를 저장하지 않습니다. 미리보기 경로는
+`/World/ArUcoMarkerTreeEditor/<tree 이름>/Tree`입니다.
+campus에 동일 tree를 가리키는 고정 reference가 이미 있으면 중복 미리보기를 만들지
+않고 기존 reference를 사용하며, gizmo 수정값만 session layer에 기록합니다.
+
+새 마커는 자동으로 선택됩니다. Move/Rotate gizmo로 배치한 뒤 `Save selected pose`를
+누르면 composed marker transform을 tree USD의 해당 marker Prim에 직접 저장하고
+session override를 제거합니다. `Apply fields + pose`는 현재 Dictionary, Marker ID,
+Marker length 입력값과 gizmo transform을 함께 tree USD에 반영합니다. Dictionary와
+ID를 바꾸면 marker Prim 이름과 texture도 새 식별자에 맞춰 갱신됩니다.
+
+`Delete selected`는 선택한 marker Prim을 tree USD에서 제거하고 해당 marker가
+사용하던 관리 대상 PNG도 삭제합니다. 따라서 추가, 배치, 속성 수정, 삭제의 영구
+저장 대상은 항상 tree USD 하나이며 campus USD는 고정 상태로 유지됩니다.
 
 기본으로 켜진 `Camera placement > In front`는 마커를 추가할 때 활성
 Viewport 카메라의 1 m 앞에 정면이 카메라를 향하도록 배치합니다. `Distance (m)`로
-거리를 바꿀 수 있습니다. 계산된 위치와 회전은 미리보기용 임시 값이 아니라 해당
-마커의 저장 transform입니다. `Load tree`는 tree USD에 저장된 모든 마커의 위치와
-회전을 그대로 복원합니다.
+거리를 바꿀 수 있습니다. 계산된 위치와 회전은 새 marker의 tree transform으로
+즉시 저장됩니다. 이후 gizmo로 조정한 값도 `Save selected pose`를 통해 같은 tree
+transform을 갱신합니다.
 
 보드는 Z-up, meters-per-unit 1.0으로 작성됩니다. 중심은 로컬 원점이며 윗면은
 `+Z`, 기본 두께는 1 mm입니다. 흰색 backing에는 static collision이 적용되고,
@@ -81,7 +97,10 @@ Isaac Sim Python의 OpenCV에 `cv2.aruco`가 없다면 Isaac Sim 설치 디렉�
 Extension이 활성화된 Isaac Sim Python 환경에서는 UI 없이도 호출할 수 있습니다.
 
 ```python
-from meta_sejong.aruco_board.generator import append_marker_to_tree_usd
+from meta_sejong.aruco_board.generator import (
+    append_marker_to_tree_usd,
+    read_marker_tree_usd,
+)
 
 append_marker_to_tree_usd(
     dictionary_name="DICT_6X6_250",
@@ -89,4 +108,12 @@ append_marker_to_tree_usd(
     marker_length_mm=120.0,
     tree_path="/tmp/aruco_marker_tree.usd",
 )
+
+for marker in read_marker_tree_usd("/tmp/aruco_marker_tree.usd"):
+    print(
+        marker.dictionary_name,
+        marker.marker_id,
+        marker.marker_length_mm,
+        marker.local_transform,
+    )
 ```

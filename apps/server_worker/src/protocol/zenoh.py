@@ -155,6 +155,9 @@ class ZenohDataLoader:
         edge_ids: list[str],
         device: torch.device,
         topics: dict[str, str] | None = None,
+        expected_camera_ids: dict[str, list[int]] | None = None,
+        expected_spatial_context: dict[str, str] | None = None,
+        expected_workspace_ids: dict[str, str] | None = None,
         endpoint: str | None = None,
         config_path: str | None = None,
         topic_template: str = "edge/{edge_id}",
@@ -173,6 +176,23 @@ class ZenohDataLoader:
         elif set(topics) != set(edge_ids):
             raise ValueError("topics must contain exactly one entry for every edge")
         self.edge_ids = tuple(edge_ids)
+        if (
+            expected_camera_ids is not None
+            and set(expected_camera_ids) != set(edge_ids)
+        ):
+            raise ValueError(
+                "expected_camera_ids must contain exactly one entry for every edge"
+            )
+        self.expected_camera_ids = expected_camera_ids
+        self.expected_spatial_context = expected_spatial_context
+        if (
+            expected_workspace_ids is not None
+            and set(expected_workspace_ids) != set(edge_ids)
+        ):
+            raise ValueError(
+                "expected_workspace_ids must contain every configured edge"
+            )
+        self.expected_workspace_ids = expected_workspace_ids
         self.device = device
         self.sync_tolerance = sync_tolerance
         self.buffers = {edge_id: deque(maxlen=buffer_size) for edge_id in edge_ids}
@@ -273,6 +293,47 @@ class ZenohDataLoader:
                 if heatmap.ndim != 3:
                     raise ValueError(f"Invalid heatmap shape from Edge {edge_id}")
                 views.append(heatmap)
+
+            if self.expected_camera_ids is not None:
+                received_camera_ids = [
+                    int(value) for value in frame.get("camera_ids") or []
+                ]
+                expected = self.expected_camera_ids[edge_id]
+                if received_camera_ids != expected:
+                    raise ValueError(
+                        f"Camera order mismatch from Edge {edge_id}: "
+                        f"expected {expected}, got {received_camera_ids}"
+                    )
+            expected_spatial_context = getattr(
+                self,
+                "expected_spatial_context",
+                None,
+            )
+            if expected_spatial_context is not None:
+                received_context = frame.get("spatial_context") or {}
+                mismatches = {
+                    key: (expected, received_context.get(key))
+                    for key, expected in expected_spatial_context.items()
+                    if received_context.get(key) != expected
+                }
+                if mismatches:
+                    raise ValueError(
+                        f"Spatial context mismatch from Edge {edge_id}: {mismatches}"
+                    )
+            expected_workspace_ids = getattr(self, "expected_workspace_ids", None)
+            if expected_workspace_ids is not None:
+                received_context = frame.get("spatial_context") or {}
+                received_edge_id = received_context.get("edge_id")
+                received_workspace_id = received_context.get("workspace_id")
+                if (
+                    received_edge_id != edge_id
+                    or received_workspace_id != expected_workspace_ids[edge_id]
+                ):
+                    raise ValueError(
+                        f"Workspace mismatch from Edge {edge_id}: expected "
+                        f"{expected_workspace_ids[edge_id]}, got "
+                        f"{received_workspace_id} for {received_edge_id}"
+                    )
 
             view_count = view_count or len(views)
             if len(views) != view_count:

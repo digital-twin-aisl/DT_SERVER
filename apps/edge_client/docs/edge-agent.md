@@ -17,8 +17,19 @@ Agent를 실행합니다.
 ```bash
 python -m apps.edge_client.agent run \
   --endpoint SERVER_IP:7447 \
-  --camera-count 4
+  --calibration-checkpoint /models/VGGT-Omega-1B-512/model.pt
 ```
+
+Zenoh 세션이 연결되면 등록 카메라 상태를 `dt/edges/{edge_id}/cameras`로 한 번
+발행합니다. 이후 manager의 `ping` heartbeat를 받을 때마다 카메라 RTSP 포트
+연결을 다시 확인하고 최신 상태를 발행합니다. 카메라별 연결 확인 제한시간은
+`--camera-ping-timeout`(기본 1초)으로 조정할 수 있습니다.
+
+`capture_calibration_features` 명령을 받으면 등록된 전체 카메라에서 한 프레임을
+캡처하고 로컬 intrinsic/distortion으로 왜곡을 제거한 뒤 DINO patch token만
+전송합니다. `apply_calibration_result` 명령은 서버가 구한 USD 좌표계 pose를
+`cameras.local.yaml`에 원자적으로 저장하고 ACK를 보냅니다. 두 명령 모두 승인된
+edge에서만 실행됩니다.
 
 ID는 기본적으로 `apps/edge_client/config/edge.local.json`에 저장되고 Git에서
 제외됩니다. `run` 전에 `init`하지 않아도 최초 실행 시 자동 생성됩니다.
@@ -37,7 +48,8 @@ ID는 기본적으로 `apps/edge_client/config/edge.local.json`에 저장되고 
     "inference": "dt/edges/edge-001/inference",
     "command": "dt/edges/edge-001/command",
     "config": "dt/edges/edge-001/config",
-    "ack": "dt/edges/edge-001/ack"
+    "ack": "dt/edges/edge-001/ack",
+    "cameras": "dt/edges/edge-001/cameras"
   }
 }
 ```

@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..utils import cameras
-from ..utils.transforms import get_affine_transform as get_transform
 from ..utils.transforms import affine_transform_pts_cuda as do_transform
 
 
@@ -53,6 +52,7 @@ class ProjectLayer(nn.Module):
             grid1Dx + boxCenter[0],
             grid1Dy + boxCenter[1],
             grid1Dz + boxCenter[2],
+            indexing="ij",
         )
         gridx = gridx.contiguous().view(-1, 1)
         gridy = gridy.contiguous().view(-1, 1)
@@ -90,6 +90,104 @@ class ProjectLayer(nn.Module):
             sample_grids.append(sample_grid)
 
         return sample_grids, bounding, grid
+
+    def project_local_cubes(
+        self,
+        heatmaps,
+        grid_centers,
+        batch_indices,
+    ):
+        """Project one Cartesian pose cube directly around each USD root."""
+        device = heatmaps[0].device
+        num_candidates = grid_centers.shape[0]
+        num_joints = heatmaps[0].shape[1]
+        num_views = len(heatmaps)
+        width, height = self.img_size_orig
+        heatmap_width, heatmap_height = self.heatmap_size
+        transform = torch.as_tensor(self.trans, dtype=torch.float, device=device)
+        cubes = torch.zeros(
+            num_candidates,
+            num_joints,
+            self.clamp_nbins,
+            device=device,
+        )
+        grids = torch.zeros(
+            num_candidates,
+            self.clamp_nbins,
+            3,
+            device=device,
+        )
+
+        for candidate_index in range(num_candidates):
+            grid = self.compute_grid(
+                self.clamp_grid_size,
+                grid_centers[candidate_index, :3],
+                self.clamp_cube_size,
+                device=device,
+            )
+            grids[candidate_index] = grid
+            accumulated = torch.zeros(
+                num_joints,
+                self.clamp_nbins,
+                device=device,
+            )
+            weights = torch.zeros(self.clamp_nbins, device=device)
+            batch_index = int(batch_indices[candidate_index])
+
+            for camera_index in range(num_views):
+                camera = self.cams[camera_index]
+                xy = cameras.project_pose(grid, camera)
+                depth = cameras.world_to_camera_frame(
+                    grid,
+                    camera["R"],
+                    camera["T"],
+                )[:, 2]
+                visible = (
+                    (depth > 0)
+                    & (xy[:, 0] >= 0)
+                    & (xy[:, 1] >= 0)
+                    & (xy[:, 0] < width)
+                    & (xy[:, 1] < height)
+                )
+                transformed = do_transform(
+                    torch.clamp(xy, -1.0, max(width, height)),
+                    transform,
+                )
+                transformed = transformed * torch.tensor(
+                    [heatmap_width, heatmap_height],
+                    dtype=torch.float,
+                    device=device,
+                ) / torch.tensor(self.img_size, dtype=torch.float, device=device)
+                sample_grid = transformed / torch.tensor(
+                    [heatmap_width - 1, heatmap_height - 1],
+                    dtype=torch.float,
+                    device=device,
+                ) * 2.0 - 1.0
+                sample_grid = torch.clamp(
+                    sample_grid.view(1, 1, self.clamp_nbins, 2),
+                    -1.1,
+                    1.1,
+                )
+                sampled = F.grid_sample(
+                    heatmaps[camera_index][batch_index : batch_index + 1],
+                    sample_grid,
+                    align_corners=True,
+                ).view(num_joints, self.clamp_nbins)
+                mask = visible.to(dtype=sampled.dtype)
+                accumulated += sampled * mask
+                weights += mask
+
+            cubes[candidate_index] = accumulated / (weights.unsqueeze(0) + 1e-6)
+
+        cubes = torch.nan_to_num(cubes).clamp(0.0, 1.0)
+        cubes = cubes.view(
+            num_candidates,
+            num_joints,
+            self.clamp_cube_size[0],
+            self.clamp_cube_size[1],
+            self.clamp_cube_size[2],
+        )
+        return cubes, grids
     
     def project(self, heatmaps, sample_grids, bounding):
         n = len(heatmaps)
@@ -193,6 +291,12 @@ class ProjectLayer(nn.Module):
         meta: List[Dict[str, Any]], len(meta) == number of cameras
         '''
         device = heatmaps[0].device
+        if self.mode == "posenet":
+            return self.project_local_cubes(
+                heatmaps,
+                grid_centers,
+                batch_indices,
+            )
         if self.first_inference or (isinstance(meta, list) and len(meta) > 0 and 'cameras' in meta[0]):
             # self.cams = [meta[i]['cameras'] for i in range(len(meta))]
             self.sample_grids, self.bounding, self.grid = self.get_voxel(self.grid_size, self.grid_center, self.cube_size, device=device)
@@ -200,7 +304,3 @@ class ProjectLayer(nn.Module):
         cubes = self.project(heatmaps, self.sample_grids, self.bounding)
         if self.mode == "rootnet":
             return cubes
-        if self.mode == "posenet":
-            cubes, grids = self.clamp_cubes(cubes, grid_centers, batch_indices)
-
-            return cubes, grids

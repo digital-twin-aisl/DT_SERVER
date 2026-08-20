@@ -20,6 +20,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from apps.edge_client.src.protocol.zenoh import ZenohSender
+from apps.edge_client.src.protocol.edge import (
+    DEFAULT_IDENTITY_PATH,
+    DEFAULT_TOPIC_ROOT,
+    EdgeTopics,
+    load_edge_metadata,
+    load_or_create_edge_id,
+)
 from apps.edge_client.src.reid.feature_extract import (
     build_trt_feature_extractor,
     extract_features_from_persons_trt,
@@ -36,17 +43,25 @@ from apps.edge_client.src.utils.pre_process import PREPROCESS
 from apps.edge_client.src.utils.tensorrt import load_tensorrt_model
 from apps.edge_client.config.config import config as focus_config
 from apps.edge_client.config.config import update_config as update_focus_config
+from dt_common.spatial.workspace import build_edge_workspace, load_spatial_context
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Edge inference with Zenoh")
     parser.add_argument("--cfg_focus", type=str)
+    parser.add_argument(
+        "--deployment",
+        help="Shared scene, calibration, edge assignment, and workspace manifest",
+    )
     parser.add_argument("--example_folder", type=str)
     parser.add_argument("--tensorrt", action="store_true")
     parser.add_argument("--dataset", action="store_true")
     parser.add_argument("--zenoh-endpoint", type=str)
     parser.add_argument("--zenoh-config", type=str)
-    parser.add_argument("--zenoh-topic", type=str)
+    parser.add_argument("--zenoh-topic", type=str, help=argparse.SUPPRESS)
+    parser.add_argument("--edge-id", type=str)
+    parser.add_argument("--edge-id-file", default=str(DEFAULT_IDENTITY_PATH))
+    parser.add_argument("--topic-root")
     parser.add_argument(
         "--no-zenoh",
         action="store_true",
@@ -64,6 +79,9 @@ def load_models(use_tensorrt):
     device = torch.device("cuda")
     torch.tensor([1], device=device)  # CUDA 메모리 할당 확인
 
+    # ProjectLayer copies cfg.TRANSFORM while the pose model is constructed.
+    # Build preprocessing first so that the affine transform is available.
+    pose_preprocess = PREPROCESS(sp3d_config)
     checkpoint = focus_config.POSENET.CKPT
     pose_model = get_multi_person_pose_net(sp3d_config, inference_mode="rootnet")
     pose_model.load_state_dict(torch.load(checkpoint, weights_only=False))
@@ -74,7 +92,7 @@ def load_models(use_tensorrt):
         )
 
     return (
-        PREPROCESS(sp3d_config),
+        pose_preprocess,
         pose_model,
         build_trt_feature_extractor(),
         YOLO(focus_config.YOLO.MODEL),
@@ -86,13 +104,23 @@ PAYLOAD_MAGIC = b"ZNH1"
 COMPRESSOR = zstd.ZstdCompressor(level=1)
 
 
-def serialize_output(timestamp, reid, roots, heatmaps):
+def serialize_output(
+    timestamp,
+    reid,
+    roots,
+    heatmaps,
+    camera_ids,
+    spatial_identity=None,
+):
     output = {
         "time": timestamp,
         "reid": reid,
         "roots": roots,
         "allheatmaps": heatmaps,
+        "camera_ids": list(camera_ids),
     }
+    if spatial_identity is not None:
+        output["spatial_context"] = dict(spatial_identity)
     compressed = COMPRESSOR.compress(
         pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL)
     )
@@ -131,26 +159,63 @@ def stop_process(process, timeout=3):
         process.join(timeout=timeout)
 
 
-def create_input_process(args, stop_event, child, input_flag):
+def create_input_process(
+    args,
+    stop_event,
+    child,
+    input_flag,
+    edge_id,
+    spatial_context,
+):
     if args.dataset:
         print("Starting synchronized dataset input")
-        CalibrationData(sp3d_config, example_path=args.example_folder)
-        return ExampleDataset(args.example_folder, stop_event, child, input_flag)
+        process = ExampleDataset(args.example_folder, stop_event, child, input_flag)
+        if spatial_context is None:
+            CalibrationData(sp3d_config, example_path=args.example_folder)
+        else:
+            expected_ids = list(spatial_context.edge_camera_ids[edge_id])
+            if process.camera_ids != expected_ids:
+                raise ValueError(
+                    f"dataset camera order mismatch for {edge_id}: "
+                    f"expected {expected_ids}, got {process.camera_ids}"
+                )
+            CalibrationData(
+                sp3d_config,
+                calibration_path=spatial_context.calibration_path,
+                camera_ids=expected_ids,
+                world_origin_m=spatial_context.world_origin_m,
+            )
+        return process
 
     print("Starting synchronized IP camera input")
-    CalibrationData(sp3d_config, cameras=focus_config.CAMERAS)
+    if spatial_context is None:
+        CalibrationData(sp3d_config, cameras=focus_config.CAMERAS)
+    else:
+        CalibrationData(
+            sp3d_config,
+            calibration_path=spatial_context.calibration_path,
+            camera_ids=spatial_context.edge_camera_ids[edge_id],
+            world_origin_m=spatial_context.world_origin_m,
+        )
     return IPCamera(focus_config.CAMERAS, stop_event, child, input_flag)
 
 
-def extract_reid(reid_engine, yolo_model, images, frame_num):
+def extract_reid(
+    reid_engine,
+    yolo_model,
+    images,
+    frame_num,
+    edge_id,
+    camera_ids,
+):
     features = []
     for index, image in enumerate(images):
         try:
             persons = extract_poses_from_frame(
                 yolo_model,
                 image,
-                edge_id=focus_config.OUTPUT_TOPIC,
-                cam_id=index + 1,
+                edge_id=edge_id,
+                cam_id=camera_ids[index],
                 frame_num=frame_num,
             )
             if persons:
@@ -168,20 +233,75 @@ def main():
     if args.cfg_focus:
         update_focus_config(args.cfg_focus)
     update_sp3d_config(focus_config.POSENET.CONFIG)
+    edge_id = load_or_create_edge_id(args.edge_id_file, args.edge_id)
+    spatial_context = (
+        load_spatial_context(args.deployment) if args.deployment else None
+    )
+    sp3d_config.SPATIAL_CONTEXT = spatial_context
+    edge_metadata = load_edge_metadata(args.edge_id_file)
+    topic_root = args.topic_root or edge_metadata.get("topic_root") or DEFAULT_TOPIC_ROOT
+    zenoh_endpoint = (
+        args.zenoh_endpoint
+        or edge_metadata.get("zenoh_endpoint")
+        or focus_config.SERVER
+    )
+    inference_topic = args.zenoh_topic or EdgeTopics(
+        edge_id,
+        topic_root,
+    ).inference
 
     stop_event = mp.Event()
-    input_flag = mp.Value("b", True)  # 입력 프로세스 API 호환용
+    input_flag = mp.Value("b", not args.dataset)
     parent, child = mp.Pipe(duplex=False)
     input_process = None
     sender = None
     buffers = []
 
     try:
-        input_process = create_input_process(args, stop_event, child, input_flag)
+        input_process = create_input_process(
+            args,
+            stop_event,
+            child,
+            input_flag,
+            edge_id,
+            spatial_context,
+        )
+        if spatial_context is not None:
+            expected_ids = list(spatial_context.edge_camera_ids[edge_id])
+            if input_process.camera_ids != expected_ids:
+                raise ValueError(
+                    f"input camera order mismatch for {edge_id}: "
+                    f"expected {expected_ids}, got {input_process.camera_ids}"
+                )
+            workspace = build_edge_workspace(
+                spatial_context,
+                edge_id,
+                sp3d_config.CAMS,
+                sp3d_config.NETWORK.IMAGE_SIZE_ORIG,
+                sp3d_config.MULTI_PERSON.SPACE_SIZE,
+                sp3d_config.MULTI_PERSON.INITIAL_CUBE_SIZE,
+            )
+            sp3d_config.EDGE_WORKSPACE = workspace
+            spatial_identity = {
+                **spatial_context.identity(),
+                "edge_id": edge_id,
+                "workspace_id": workspace.workspace_id,
+            }
+            print(
+                f"Workspace ready: source={workspace.source} "
+                f"size_m={(workspace.size_mm / 1000.0).round(3).tolist()} "
+                f"cube={workspace.cube_size.tolist()} "
+                f"valid={int(workspace.valid_mask.sum())}/"
+                f"{workspace.valid_mask.size}"
+            )
+        else:
+            sp3d_config.EDGE_WORKSPACE = None
+            spatial_identity = None
         input_process.start()
         child.close()
 
         buffers = attach_input_buffers(parent, input_process)
+        camera_ids = input_process.camera_ids
 
         pose_preprocess, pose_model, reid_engine, yolo_model = load_models(
             args.tensorrt
@@ -191,8 +311,8 @@ def main():
             print("Zenoh output disabled")
         else:
             sender = ZenohSender(
-                topic=args.zenoh_topic or focus_config.OUTPUT_TOPIC,
-                endpoint=args.zenoh_endpoint or focus_config.SERVER,
+                topic=inference_topic,
+                endpoint=zenoh_endpoint,
                 config_path=args.zenoh_config,
                 queue_size=2,
             )
@@ -201,12 +321,20 @@ def main():
         with torch.inference_mode():
             while not stop_event.is_set():
                 started_at = time.time()
+                frame_timestamp = (
+                    frame_num / input_process.fps if args.dataset else started_at
+                )
                 image_batches = [
                     np.ndarray(shape, dtype=dtype, buffer=shm.buf)
                     for shm, shape, dtype in buffers
                 ]
                 frame_outputs = extract_reid(
-                    reid_engine, yolo_model, image_batches, frame_num
+                    reid_engine,
+                    yolo_model,
+                    image_batches,
+                    frame_num,
+                    edge_id,
+                    camera_ids,
                 )
 
                 views = pose_preprocess(image_batches)
@@ -218,7 +346,12 @@ def main():
                 roots = roots.detach().cpu().numpy()
 
                 payload = serialize_output(
-                    started_at, frame_outputs, roots, all_heatmaps
+                    frame_timestamp,
+                    frame_outputs,
+                    roots,
+                    all_heatmaps,
+                    camera_ids,
+                    spatial_identity,
                 )
                 if sender is not None:
                     sender.send(payload)
@@ -230,6 +363,12 @@ def main():
                     f"dropped={sender.dropped if sender is not None else 0}"
                 )
                 frame_num += 1
+                if args.dataset:
+                    input_flag.value = True
+                    while input_flag.value and input_process.is_alive():
+                        time.sleep(0.001)
+                    if not input_process.is_alive():
+                        break
 
     except KeyboardInterrupt:
         print("Stopping inference...")
@@ -250,13 +389,4 @@ def main():
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
-    if len(sys.argv) == 1:
-        sys.argv.extend(
-            [
-                "--example_folder",
-                "data/data_0705",
-                "--tensorrt",
-                "--dataset",
-            ]
-        )
     main()

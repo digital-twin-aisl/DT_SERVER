@@ -109,6 +109,17 @@ class EdgeTopics:
     def ack(self) -> str:
         return f"{self.base}/ack"
 
+    @property
+    def cameras(self) -> str:
+        return f"{self.base}/cameras"
+
+    @property
+    def calibration(self) -> str:
+        return f"{self.base}/calibration"
+
+    def calibration_chunk(self, request_id: str, index: int | str = "*") -> str:
+        return f"{self.calibration}/{request_id}/chunks/{index}"
+
 
 def encode_json(message: dict[str, Any]) -> bytes:
     return json.dumps(

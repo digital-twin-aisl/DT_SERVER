@@ -13,24 +13,9 @@ import re
 from typing import Any
 
 
-DICTIONARY_NAMES = (
-    "DICT_4X4_50",
-    "DICT_4X4_100",
-    "DICT_4X4_250",
-    "DICT_4X4_1000",
-    "DICT_5X5_50",
-    "DICT_5X5_100",
-    "DICT_5X5_250",
-    "DICT_5X5_1000",
-    "DICT_6X6_50",
-    "DICT_6X6_100",
-    "DICT_6X6_250",
-    "DICT_6X6_1000",
-    "DICT_7X7_50",
-    "DICT_7X7_100",
-    "DICT_7X7_250",
-    "DICT_7X7_1000",
-    "DICT_ARUCO_ORIGINAL",
+DICTIONARY_LABELS = ("4x4", "5x5", "6x6", "7x7")
+DICTIONARY_NAMES = tuple(
+    f"DICT_{label.upper()}_250" for label in DICTIONARY_LABELS
 )
 
 
@@ -92,6 +77,12 @@ def _validate_marker_id(dictionary: Any, marker_id: int) -> None:
         raise ValueError(
             f"Marker ID must be between 0 and {marker_count - 1} for this dictionary."
         )
+
+
+def _marker_dictionary_token(dictionary_name: str) -> str:
+    """Return the marker-size portion used in generated tree Prim names."""
+    dictionary_size = dictionary_name.removeprefix("DICT_").removesuffix("_250")
+    return re.sub(r"[^A-Za-z0-9_]", "_", dictionary_size)
 
 
 def generate_marker_image(
@@ -431,9 +422,7 @@ def append_marker_to_tree_usd(
             f"{dictionary_name} ID {int(marker_id)}."
         )
 
-    safe_dictionary = re.sub(
-        r"[^A-Za-z0-9_]", "_", dictionary_name.removeprefix("DICT_")
-    )
+    safe_dictionary = _marker_dictionary_token(dictionary_name)
     base_name = f"Marker_{safe_dictionary}_{int(marker_id)}"
     marker_name = base_name
     suffix = 2
@@ -660,9 +649,7 @@ def update_marker_in_tree_usd(
                 f"{dictionary_name} ID {int(marker_id)}."
             )
 
-    safe_dictionary = re.sub(
-        r"[^A-Za-z0-9_]", "_", dictionary_name.removeprefix("DICT_")
-    )
+    safe_dictionary = _marker_dictionary_token(dictionary_name)
     base_name = f"Marker_{safe_dictionary}_{int(marker_id)}"
     marker_name = base_name
     suffix = 2

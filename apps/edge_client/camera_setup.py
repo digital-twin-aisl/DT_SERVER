@@ -11,11 +11,22 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import yaml
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from apps.edge_client.src.camera_status import (  # noqa: E402
+    DEFAULT_CAMERA_PING_TIMEOUT,
+    publish_camera_status_once,
+)
+from apps.edge_client.src.protocol.edge import DEFAULT_TOPIC_ROOT  # noqa: E402
 
 
 DEFAULT_CONFIG = Path(__file__).parent / "config" / "cameras.local.yaml"
@@ -104,16 +115,46 @@ def external_camera_key(edge_id, number):
     return f"{edge_id}/{camera_key(number)}"
 
 
-def load_edge_id(path):
+def load_edge_metadata(path):
     try:
-        edge_id = json.loads(path.read_text(encoding="utf-8")).get("edge_id")
+        metadata = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        edge_id = None
+        metadata = {}
+    edge_id = metadata.get("edge_id") if isinstance(metadata, dict) else None
     if not isinstance(edge_id, str) or not edge_id.strip():
         raise ValueError(
             "edge_id가 없습니다. 먼저 `python apps/edge_client/agent.py init`을 실행하세요."
         )
-    return edge_id
+    return metadata
+
+
+def load_edge_id(path):
+    return load_edge_metadata(path)["edge_id"]
+
+
+def publish_camera_change(args, edge_metadata):
+    endpoint = args.endpoint or edge_metadata.get("zenoh_endpoint")
+    topic_root = (
+        args.topic_root or edge_metadata.get("topic_root") or DEFAULT_TOPIC_ROOT
+    )
+    try:
+        message = publish_camera_status_once(
+            edge_metadata["edge_id"],
+            args.config,
+            endpoint=endpoint,
+            zenoh_config=args.zenoh_config,
+            topic_root=topic_root,
+            ping_timeout=args.camera_ping_timeout,
+        )
+        print(
+            f"서버 동기화 완료: {len(message['data']['cameras'])}대 "
+            f"({topic_root}/{edge_metadata['edge_id']}/cameras)"
+        )
+    except Exception as exc:
+        print(
+            f"경고: 카메라 정보 Zenoh 동기화 실패: {exc}",
+            file=sys.stderr,
+        )
 
 
 def next_camera_number(cameras):
@@ -213,18 +254,18 @@ def _float_values(prompt, count):
 
 
 def input_intrinsic():
-    fx, fy, cx, cy = _float_values(
-        "fx fy cx cy (예: 920.1 918.7 960 540): ", 4
-    )
+    fx, fy, cx, cy = _float_values("fx fy cx cy (예: 920.1 918.7 960 540): ", 4)
     coefficients = [
         float(value)
-        for value in input(
-            "왜곡계수 k1 k2 p1 p2 [k3 ...] (예: -0.12 0.03 0.001 0 0): "
-        ).replace(",", " ").split()
+        for value in input("왜곡계수 k1 k2 p1 p2 [k3 ...] (예: -0.12 0.03 0.001 0 0): ")
+        .replace(",", " ")
+        .split()
     ]
     if len(coefficients) not in {4, 5, 8, 12, 14}:
         raise ValueError("왜곡계수는 OpenCV 순서로 4, 5, 8, 12, 14개여야 합니다.")
-    width, height = (int(value) for value in _float_values("영상 크기 width height: ", 2))
+    width, height = (
+        int(value) for value in _float_values("영상 크기 width height: ", 2)
+    )
     if min(fx, fy, width, height) <= 0:
         raise ValueError("초점거리와 영상 크기는 양수여야 합니다.")
     return {
@@ -264,13 +305,21 @@ def measure_intrinsic(url, columns=9, rows=6, square_size_m=0.025, views=15):
             preview = frame.copy()
             if found:
                 corners = cv2.cornerSubPix(
-                    gray, corners, (11, 11), (-1, -1),
+                    gray,
+                    corners,
+                    (11, 11),
+                    (-1, -1),
                     (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001),
                 )
                 cv2.drawChessboardCorners(preview, pattern, corners, found)
             cv2.putText(
-                preview, f"views {len(image_points)}/{views}", (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2,
+                preview,
+                f"views {len(image_points)}/{views}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 0),
+                2,
             )
             cv2.imshow("intrinsic calibration", preview)
             key = cv2.waitKey(1) & 0xFF
@@ -286,7 +335,11 @@ def measure_intrinsic(url, columns=9, rows=6, square_size_m=0.025, views=15):
     rms, matrix, distortion, _, _ = cv2.calibrateCamera(
         object_points, image_points, image_size, None, None
     )
-    if not np.isfinite(rms) or not np.isfinite(matrix).all() or not np.isfinite(distortion).all():
+    if (
+        not np.isfinite(rms)
+        or not np.isfinite(matrix).all()
+        or not np.isfinite(distortion).all()
+    ):
         raise RuntimeError("유효한 intrinsic 결과를 계산하지 못했습니다.")
     return {
         "camera_matrix": matrix.tolist(),
@@ -303,13 +356,19 @@ def measure_intrinsic(url, columns=9, rows=6, square_size_m=0.025, views=15):
 
 
 def configure_intrinsic(camera):
-    method = input("Intrinsic 등록 [m: 직접입력, c: 체커보드 측정, Enter: 나중에]: ").strip().lower()
+    method = (
+        input("Intrinsic 등록 [m: 직접입력, c: 체커보드 측정, Enter: 나중에]: ")
+        .strip()
+        .lower()
+    )
     if not method:
         return None
     if method == "m":
         result = input_intrinsic()
     elif method == "c":
-        columns, rows = (int(value) for value in input("내부 코너 열 행 [9 6]: ").split() or (9, 6))
+        columns, rows = (
+            int(value) for value in input("내부 코너 열 행 [9 6]: ").split() or (9, 6)
+        )
         square = float(input("한 칸 크기(m) [0.025]: ").strip() or "0.025")
         views = int(input("촬영 장수 [15]: ").strip() or "15")
         result = measure_intrinsic(camera["url"], columns, rows, square, views)
@@ -384,6 +443,30 @@ def show_cameras(selected):
         cv2.destroyAllWindows()
 
 
+def write_capture_sidecar(path, camera, number, image_size):
+    """Store non-secret camera calibration beside an offline capture."""
+    intrinsic = camera.get("intrinsic")
+    if not isinstance(intrinsic, dict):
+        return None
+    required = ("camera_matrix", "distortion_coefficients", "image_size")
+    if any(intrinsic.get(key) is None for key in required):
+        return None
+
+    payload = {
+        "schema_version": 1,
+        "camera_id": camera_key(number),
+        "captured_image_size": list(image_size),
+        "intrinsic": intrinsic,
+    }
+    sidecar = path.with_suffix(".camera.json")
+    sidecar.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(sidecar, 0o600)
+    return sidecar
+
+
 def capture_images(selected, capture_dir):
     import cv2
 
@@ -406,6 +489,19 @@ def capture_images(selected, capture_dir):
         path = capture_dir / f"camera_{number}_{timestamp}.jpg"
         if cv2.imwrite(str(path), frame):
             print(f"저장 완료: {path}")
+            sidecar = write_capture_sidecar(
+                path,
+                camera,
+                number,
+                (frame.shape[1], frame.shape[0]),
+            )
+            if sidecar is not None:
+                print(f"Intrinsic sidecar 저장: {sidecar}")
+            else:
+                print(
+                    f"경고: {camera_key(number)} intrinsic 미등록 - "
+                    "offline 정밀 캘리브레이션용 sidecar를 만들지 않았습니다."
+                )
         else:
             print(f"{camera_key(number)}: 파일 저장 실패")
 
@@ -553,9 +649,7 @@ def _recording_mosaic(states, elapsed, tile_width, tile_height):
         dtype=np.uint8,
     )
     title = f"REC  {int(elapsed)} sec"
-    (title_width, _), _ = cv2.getTextSize(
-        title, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2
-    )
+    (title_width, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
     cv2.putText(
         canvas,
         title,
@@ -672,9 +766,7 @@ def record_cameras(
             elapsed = time.monotonic() - started_at
             cv2.imshow(
                 window_name,
-                _recording_mosaic(
-                    states, elapsed, preview_width, preview_height
-                ),
+                _recording_mosaic(states, elapsed, preview_width, preview_height),
             )
             if cv2.waitKey(20) & 0xFF in {27, ord("q")}:
                 break
@@ -714,12 +806,22 @@ def main():
     parser.add_argument("--preview-width", type=int, default=640)
     parser.add_argument("--preview-height", type=int, default=360)
     parser.add_argument("--preview-fps", type=int, default=5)
+    parser.add_argument("--endpoint", default=os.getenv("ZENOH_ENDPOINT"))
+    parser.add_argument("--zenoh-config")
+    parser.add_argument("--topic-root", default=os.getenv("EDGE_TOPIC_ROOT"))
+    parser.add_argument(
+        "--camera-ping-timeout",
+        type=float,
+        default=DEFAULT_CAMERA_PING_TIMEOUT,
+    )
     args = parser.parse_args()
 
     try:
-        load_edge_id(args.edge_id_file)
+        edge_metadata = load_edge_metadata(args.edge_id_file)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    if args.camera_ping_timeout <= 0:
+        raise SystemExit("--camera-ping-timeout은 0보다 커야 합니다.")
 
     print_cameras(args.config)
     if args.command == "list":
@@ -757,6 +859,7 @@ def main():
             except (RuntimeError, ValueError, OSError, yaml.YAMLError) as exc:
                 raise SystemExit(f"Intrinsic 등록 실패: {exc}") from exc
             print(f"Intrinsic 저장 완료: {camera_key(number)}")
+            publish_camera_change(args, edge_metadata)
         return
 
     print("\n엣지 카메라 등록")
@@ -790,12 +893,12 @@ def main():
                 raise SystemExit("등록을 취소했습니다.") from exc
 
         camera = {
-                "id": camera_id,
-                "name": name,
-                "url": url,
-                "location": location or None,
-                "twin_id": twin_id or None,
-            }
+            "id": camera_id,
+            "name": name,
+            "url": url,
+            "location": location or None,
+            "twin_id": twin_id or None,
+        }
         intrinsic = configure_intrinsic(camera)
         if intrinsic is not None:
             camera["intrinsic"] = intrinsic
@@ -805,6 +908,7 @@ def main():
 
     print(f"등록 완료: {name} ({camera_key(camera_id)})")
     print(f"로컬 설정: {args.config}")
+    publish_camera_change(args, edge_metadata)
 
 
 if __name__ == "__main__":

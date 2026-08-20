@@ -2,6 +2,7 @@ import argparse
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import socket
 import sys
@@ -27,6 +28,18 @@ from apps.edge_client.src.protocol.edge import (  # noqa: E402
     save_edge_metadata,
 )
 from apps.edge_client.src.protocol.zenoh import make_zenoh_config  # noqa: E402
+from apps.edge_client.src.camera_status import (  # noqa: E402
+    DEFAULT_CAMERA_PING_TIMEOUT,
+    build_camera_status_message,
+)
+from dt_common.calibration.protocol import (  # noqa: E402
+    payload_sha256,
+    split_payload,
+)
+from apps.edge_client.src.calibration_features import capture_and_encode  # noqa: E402
+from apps.edge_client.src.calibration_result import (  # noqa: E402
+    apply_calibration_result,
+)
 
 
 AGENT_VERSION = "0.1.0"
@@ -42,6 +55,11 @@ class EdgeAgent:
         heartbeat_interval: float,
         camera_count: int,
         identity_path: str | Path,
+        camera_config: str | Path,
+        calibration_checkpoint: str | Path | None,
+        calibration_device: str,
+        calibration_image_size: int,
+        camera_ping_timeout: float,
     ) -> None:
         self.edge_id = edge_id
         self.endpoint = endpoint
@@ -50,6 +68,17 @@ class EdgeAgent:
         self.heartbeat_interval = heartbeat_interval
         self.camera_count = camera_count
         self.identity_path = Path(identity_path)
+        self.camera_config = Path(camera_config)
+        self.calibration_checkpoint = (
+            Path(calibration_checkpoint).expanduser()
+            if calibration_checkpoint
+            else None
+        )
+        self.calibration_device = calibration_device
+        self.calibration_image_size = calibration_image_size
+        self._calibration_lock = threading.Lock()
+        self.camera_ping_timeout = camera_ping_timeout
+        self._camera_status_lock = threading.Lock()
         self.started_at = time.time()
         self.stop_event = threading.Event()
         self._session: Any = None
@@ -96,6 +125,45 @@ class EdgeAgent:
         message["config_id" if kind == "config_ack" else "command_id"] = command_id
         self._session.put(self.topics.ack, encode_json(message))
 
+    def _publish_camera_status(self, trigger: str) -> int:
+        with self._camera_status_lock:
+            message = build_camera_status_message(
+                self.edge_id,
+                self.camera_config,
+                ping_timeout=self.camera_ping_timeout,
+            )
+            cameras = message["data"]["cameras"]
+            self.camera_count = len(cameras)
+            if self._session is None:
+                raise RuntimeError("Zenoh session is not connected")
+            self._session.put(self.topics.cameras, encode_json(message))
+            print(
+                f"[cameras] published count={len(cameras)} trigger={trigger}",
+                flush=True,
+            )
+            return len(cameras)
+
+    def _handle_ping(self, command_id: str) -> None:
+        try:
+            camera_count = self._publish_camera_status("manager_heartbeat")
+            self._publish_ack(
+                command_id,
+                "ping",
+                True,
+                {
+                    "message": "pong",
+                    "received_at": time.time(),
+                    "camera_count": camera_count,
+                },
+            )
+        except Exception as exc:
+            self._publish_ack(command_id, "ping", False, error=str(exc))
+            print(
+                f"[cameras] heartbeat sync failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     def _on_command(self, sample: Any) -> None:
         try:
             message = decode_json(sample.payload)
@@ -109,17 +177,37 @@ class EdgeAgent:
             print(f"[command] id={command_id} command={command}", flush=True)
 
             if command == "ping":
-                self._publish_ack(
-                    command_id,
-                    command,
-                    True,
-                    {"message": "pong", "received_at": time.time()},
+                worker = threading.Thread(
+                    target=self._handle_ping,
+                    args=(command_id,),
+                    daemon=True,
                 )
+                worker.start()
             elif command == "info":
                 self._publish_ack(command_id, command, True, self._status()["data"])
             elif command == "shutdown":
                 self._publish_ack(command_id, command, True, {"message": "stopping"})
                 self.stop_event.set()
+            elif command == "capture_calibration_features":
+                parameters = message.get("parameters") or {}
+                if not isinstance(parameters, dict):
+                    raise ValueError("command parameters must be an object")
+                worker = threading.Thread(
+                    target=self._capture_calibration_features,
+                    args=(command_id, parameters),
+                    daemon=True,
+                )
+                worker.start()
+            elif command == "apply_calibration_result":
+                parameters = message.get("parameters") or {}
+                if not isinstance(parameters, dict):
+                    raise ValueError("command parameters must be an object")
+                worker = threading.Thread(
+                    target=self._apply_calibration_result,
+                    args=(command_id, parameters),
+                    daemon=True,
+                )
+                worker.start()
             else:
                 self._publish_ack(
                     command_id,
@@ -129,6 +217,123 @@ class EdgeAgent:
                 )
         except Exception as exc:
             print(f"[command] invalid message: {exc}", file=sys.stderr, flush=True)
+
+    def _capture_calibration_features(
+        self, command_id: str, parameters: dict[str, Any]
+    ) -> None:
+        if not self._calibration_lock.acquire(blocking=False):
+            self._publish_ack(
+                command_id,
+                "capture_calibration_features",
+                False,
+                error="another calibration capture is already running",
+            )
+            return
+        try:
+            if not load_edge_metadata(self.identity_path).get("approved"):
+                raise PermissionError("edge is not approved for calibration capture")
+            checkpoint = self.calibration_checkpoint
+            if checkpoint is None:
+                raise ValueError(
+                    "calibration checkpoint is not configured; pass "
+                    "--calibration-checkpoint when starting the agent"
+                )
+            request_id = str(parameters.get("request_id") or command_id)
+            if not re.fullmatch(r"[A-Fa-f0-9]{16,64}", request_id):
+                raise ValueError("invalid calibration request_id")
+            payload = capture_and_encode(
+                self.camera_config,
+                checkpoint,
+                self.edge_id,
+                request_id,
+                device=self.calibration_device,
+                image_size=self.calibration_image_size,
+            )
+            chunks = split_payload(payload)
+            manifest = {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "calibration_features",
+                "edge_id": self.edge_id,
+                "request_id": request_id,
+                "chunk_count": len(chunks),
+                "byte_count": len(payload),
+                "sha256": payload_sha256(payload),
+                "created_at": time.time(),
+            }
+            self._session.put(self.topics.calibration, encode_json(manifest))
+            for index, chunk in enumerate(chunks):
+                self._session.put(
+                    self.topics.calibration_chunk(request_id, index), chunk
+                )
+            self._publish_ack(
+                command_id,
+                "capture_calibration_features",
+                True,
+                {
+                    "request_id": request_id,
+                    "camera_config": str(self.camera_config),
+                    "chunk_count": len(chunks),
+                    "byte_count": len(payload),
+                },
+            )
+        except Exception as exc:
+            self._publish_ack(
+                command_id,
+                "capture_calibration_features",
+                False,
+                error=str(exc),
+            )
+            print(f"[calibration] failed: {exc}", file=sys.stderr, flush=True)
+        finally:
+            self._calibration_lock.release()
+
+    def _apply_calibration_result(
+        self, command_id: str, parameters: dict[str, Any]
+    ) -> None:
+        try:
+            if not load_edge_metadata(self.identity_path).get("approved"):
+                raise PermissionError("edge is not approved for calibration updates")
+            camera_ids = apply_calibration_result(
+                self.camera_config,
+                self.edge_id,
+                parameters,
+            )
+            self._publish_ack(
+                command_id,
+                "apply_calibration_result",
+                True,
+                {
+                    "request_id": parameters.get("request_id"),
+                    "saved_camera_ids": camera_ids,
+                    "camera_config": str(self.camera_config),
+                },
+            )
+        except Exception as exc:
+            self._publish_ack(
+                command_id,
+                "apply_calibration_result",
+                False,
+                error=str(exc),
+            )
+            print(
+                f"[calibration] result apply failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        try:
+            self._publish_camera_status("calibration_result")
+        except Exception as exc:
+            print(
+                f"[calibration] saved but camera status refresh failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        print(
+            f"[calibration] saved request={parameters.get('request_id')} "
+            f"cameras={','.join(camera_ids)}",
+            flush=True,
+        )
 
     def _on_config(self, sample: Any) -> None:
         config_id = "unknown"
@@ -203,6 +408,14 @@ class EdgeAgent:
                 flush=True,
             )
             try:
+                self._publish_camera_status("connected")
+            except Exception as exc:
+                print(
+                    f"[cameras] initial sync failed: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            try:
                 while not self.stop_event.is_set():
                     session.put(self.topics.status, encode_json(self._status()))
                     if once:
@@ -235,6 +448,21 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--topic-root", default=os.getenv("EDGE_TOPIC_ROOT"))
     run.add_argument("--heartbeat", type=float, default=5.0)
     run.add_argument("--camera-count", type=int, default=0)
+    run.add_argument(
+        "--camera-config",
+        default=str(Path(__file__).parent / "config" / "cameras.local.yaml"),
+    )
+    run.add_argument(
+        "--calibration-checkpoint",
+        default=os.getenv("VGGT_OMEGA_CHECKPOINT"),
+    )
+    run.add_argument("--calibration-device", default="cuda")
+    run.add_argument("--calibration-image-size", type=int, default=512)
+    run.add_argument(
+        "--camera-ping-timeout",
+        type=float,
+        default=DEFAULT_CAMERA_PING_TIMEOUT,
+    )
     run.add_argument("--once", action="store_true")
     return parser
 
@@ -256,6 +484,10 @@ def main() -> None:
         raise SystemExit("--heartbeat must be greater than zero")
     if args.camera_count < 0:
         raise SystemExit("--camera-count must not be negative")
+    if args.calibration_image_size <= 0 or args.calibration_image_size % 16:
+        raise SystemExit("--calibration-image-size must be a positive multiple of 16")
+    if args.camera_ping_timeout <= 0:
+        raise SystemExit("--camera-ping-timeout must be greater than zero")
 
     edge_id = load_or_create_edge_id(args.identity_file, args.edge_id)
     metadata = load_edge_metadata(args.identity_file)
@@ -269,6 +501,11 @@ def main() -> None:
         heartbeat_interval=args.heartbeat,
         camera_count=args.camera_count,
         identity_path=args.identity_file,
+        camera_config=args.camera_config,
+        calibration_checkpoint=args.calibration_checkpoint,
+        calibration_device=args.calibration_device,
+        calibration_image_size=args.calibration_image_size,
+        camera_ping_timeout=args.camera_ping_timeout,
     )
 
     def stop_agent(*_: Any) -> None:

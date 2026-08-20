@@ -29,6 +29,24 @@ python apps/edge_client/camera_setup.py show
 python apps/edge_client/camera_setup.py capture
 ```
 
+연결 가능한 카메라를 모두 녹화하려면 `record`를 사용합니다. 등록 목록을 출력한 뒤
+각 카메라의 연결을 확인하여 연결 가능한 목록만 다시 보여주며, 사용자 확인 후 녹화를
+시작합니다. 관제 창에는 카메라 화면이 행렬로 배치되고 카메라 번호와 녹화 시간이
+표시됩니다. `q`, `Esc` 또는 `Ctrl+C`로 종료합니다.
+
+```bash
+python apps/edge_client/camera_setup.py record
+```
+
+원본 RTSP 비디오 패킷은 재인코딩하지 않고 카메라별 MKV 파일로 저장되며, 기본 저장
+위치는 `apps/edge_client/data/recordings/<시작시각>/`입니다. 관제 화면만 기본 640x360,
+5 FPS로 디코딩하므로 Jetson 부하를 낮춥니다. 필요하면 더 낮출 수 있습니다.
+
+```bash
+python apps/edge_client/camera_setup.py record \
+  --preview-width 480 --preview-height 270 --preview-fps 3
+```
+
 `config/edge.local.json`에 유효한 `edge_id`가 있어야 합니다. 파일 또는 `edge_id`가
 없다면 먼저 다음을 실행해야 합니다.
 
@@ -46,5 +64,23 @@ python apps/edge_client/agent.py init
 ```text
 apps/edge_client/config/cameras.local.yaml
 ```
+
+Intrinsic을 나중에 입력하거나 체커보드로 측정하려면 다음 명령을 사용합니다.
+
+```bash
+python apps/edge_client/camera_setup.py intrinsic
+```
+
+직접 입력 시 `fx fy cx cy`, OpenCV 순서의 distortion coefficients, 보정 영상 크기를
+저장합니다. 체커보드 측정은 내부 코너 수, 한 칸 크기와 촬영 장수를 입력받습니다.
+분산 캘리브레이션이 완료되면 같은 카메라 항목의 `extrinsic`에 USD 좌표계 pose가
+저장됩니다.
+
+카메라를 새로 등록하거나 intrinsic을 변경하면 현재 등록 목록을
+`dt/edges/{edge_id}/cameras` 토픽으로 즉시 동기화합니다. 서버로 보내는 값은
+카메라 번호, 등록 존재 여부, 엣지에서 카메라 RTSP 포트까지의 ping 결과와
+intrinsic/extrinsic/distortion calibration뿐입니다. RTSP URL과 인증정보, 이름,
+위치, Twin ID는 로컬 설정을 벗어나지 않습니다. 서버 주소는 edge identity에
+저장된 값을 사용하며 필요하면 `--endpoint SERVER_IP:7447`로 덮어쓸 수 있습니다.
 
 이 파일은 Git에서 제외되고 `0600` 권한으로 생성되지만 암호화되지는 않습니다.
