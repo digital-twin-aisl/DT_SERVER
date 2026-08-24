@@ -100,6 +100,11 @@ class EdgeRegistry:
                     "edge_sent_at": message.get("sent_at"),
                 }
             )
+            display_name = str(
+                (message.get("data") or {}).get("display_name") or ""
+            ).strip()
+            if display_name:
+                record["display_name"] = display_name
             came_online = not created and not was_online
             return (created, came_online, dict(record)), True
 

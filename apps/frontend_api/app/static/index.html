@@ -54,6 +54,7 @@
                 <!-- Isaac Sim WebRTC Iframe -->
                 <iframe id="webrtc-frame" 
                         src="" 
+                        title="Isaac Sim WebRTC viewer"
                         class="w-full h-full border-none"
                         allow="autoplay; fullscreen; microphone; camera; xr-spatial-tracking">
                 </iframe>
@@ -62,15 +63,19 @@
                         <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                         <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                     </svg>
-                    <p class="text-lg">Isaac Sim WebRTC 연결 대기 중...</p>
-                    <p class="text-sm mt-2 font-mono">http://<span id="isaac-ip-display"></span>:8211</p>
+                    <p id="viewer-message" class="text-lg">Isaac Sim WebRTC 연결 확인 중...</p>
+                    <p id="viewer-address" class="text-sm mt-2 font-mono"></p>
+                    <a id="viewer-open-link" href="#" target="_blank" rel="noopener noreferrer"
+                       class="hidden inline-block mt-4 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded">
+                        새 창에서 열기
+                    </a>
                 </div>
             </div>
             <!-- Overlay Info -->
             <div class="absolute top-4 left-4 p-4 rounded-lg glass-panel pointer-events-none w-64">
                 <h2 class="text-sm font-bold text-gray-700 mb-2">제어 팁</h2>
                 <div class="text-xs text-gray-600 space-y-1">
-                    <p class="font-bold text-blue-600">Isaac Sim Headless 연결됨</p>
+                    <p id="viewer-status-badge" class="font-bold text-amber-600">Isaac Sim 연결 확인 중</p>
                     <p class="mt-2 text-gray-400">마우스 좌클릭: 회전<br>마우스 우클릭: 이동<br>마우스 휠: 줌 인/아웃</p>
                     <p class="mt-2 text-red-400">※ Isaac Sim에서 WebRTC 스트리밍을 켜야 화면이 보입니다.</p>
                 </div>
@@ -114,10 +119,60 @@
 
 <!-- WebRTC Initialization Scripts -->
 <script>
-    // Isaac Sim의 WebRTC 주소를 설정합니다 (사용자 환경의 도메인/IP 기준 기본 8211 포트).
-    const webrtcUrl = `http://${window.location.hostname}:8211`;
-    document.getElementById('webrtc-frame').src = `${webrtcUrl}/streaming/webrtc-demo/?server=${window.location.hostname}`;
-    document.getElementById('isaac-ip-display').textContent = window.location.hostname;
+    async function initializeIsaacViewer() {
+        const frame = document.getElementById('webrtc-frame');
+        const placeholder = document.getElementById('webrtc-placeholder');
+        const message = document.getElementById('viewer-message');
+        const address = document.getElementById('viewer-address');
+        const openLink = document.getElementById('viewer-open-link');
+        const statusBadge = document.getElementById('viewer-status-badge');
+
+        try {
+            const configResponse = await fetch('/api/v1/viewer/config');
+            if (!configResponse.ok) throw new Error(`config HTTP ${configResponse.status}`);
+            const config = await configResponse.json();
+            if (!config.enabled) {
+                message.textContent = 'Isaac Sim 뷰어가 비활성화되어 있습니다.';
+                statusBadge.textContent = 'Isaac Sim 뷰어 비활성화';
+                return;
+            }
+
+            // Isaac Sim 4.2의 내장 웹 서버는 기본적으로 HTTP만 제공합니다.
+            const baseUrl = config.public_url || `http://${window.location.hostname}:${config.web_port}`;
+            const viewerUrl = new URL(config.path, `${baseUrl}/`);
+            viewerUrl.searchParams.set('server', config.server || window.location.hostname);
+            address.textContent = viewerUrl.toString();
+            openLink.href = viewerUrl.toString();
+            openLink.classList.remove('hidden');
+
+            if (window.location.protocol === 'https:' && viewerUrl.protocol === 'http:') {
+                message.textContent = 'HTTPS 페이지에서는 HTTP WebRTC iframe이 차단됩니다. 새 창으로 여세요.';
+                statusBadge.textContent = 'Isaac Sim 새 창 연결 필요';
+                return;
+            }
+
+            frame.addEventListener('load', () => placeholder.classList.add('hidden'), {once: true});
+            frame.src = viewerUrl.toString();
+
+            const statusResponse = await fetch('/api/v1/viewer/status');
+            const status = await statusResponse.json();
+            if (status.status === 'offline') {
+                message.textContent = 'Isaac Sim이 아직 실행되지 않았거나 8211 포트에 연결할 수 없습니다.';
+                statusBadge.textContent = 'Isaac Sim 연결 안 됨';
+                statusBadge.className = 'font-bold text-red-600';
+            } else {
+                message.textContent = 'WebRTC 페이지를 불러오는 중...';
+                statusBadge.textContent = 'Isaac Sim WebRTC 페이지 응답';
+                statusBadge.className = 'font-bold text-green-600';
+            }
+        } catch (error) {
+            message.textContent = `뷰어 설정을 읽지 못했습니다: ${error.message}`;
+            statusBadge.textContent = 'Isaac Sim 상태 확인 실패';
+            statusBadge.className = 'font-bold text-red-600';
+        }
+    }
+
+    initializeIsaacViewer();
 </script>
 
 <!-- UI Layout Scripts -->

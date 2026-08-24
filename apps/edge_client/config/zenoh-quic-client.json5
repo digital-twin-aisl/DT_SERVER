@@ -1,0 +1,15 @@
+{
+  mode: "client",
+
+  connect: {
+    endpoints: [
+      "udp/203.250.148.120:10020?rel=1"
+    ]
+  },
+
+  transport: {
+    link: {
+      protocols: ["udp"]
+    }
+  }
+}

@@ -5,10 +5,19 @@
 
 ## 실행
 
-먼저 Zenoh router에 연결해 엣지를 감시합니다.
+인증서 없이 reliable QUIC을 사용하는 가장 단순한 구성은 저장소의 router 설정을
+사용합니다. 이 모드는 신뢰 네트워크 또는 VPN 안에서만 사용해야 합니다.
 
 ```bash
-python -m apps.edge_manager --endpoint localhost:7447 serve
+zenohd -c apps/edge_manager/config/zenoh-router-quic.json5
+```
+
+다른 터미널에서 manager를 같은 router에 연결해 엣지를 감시합니다.
+
+```bash
+python -m apps.edge_manager \
+  --endpoint 'udp/127.0.0.1:10020?rel=1' \
+  serve
 ```
 
 Manager는 기본 5초마다 online edge에 Zenoh `ping` heartbeat를 보내고, edge는
@@ -19,8 +28,9 @@ Manager는 기본 5초마다 online edge에 Zenoh `ping` heartbeat를 보내고,
 
 ```bash
 python -m apps.edge_manager list
-python -m apps.edge_manager --endpoint SERVER_IP:7447 \
-  approve EDGE_ID --name jetson-01
+python -m apps.edge_manager \
+  --endpoint 'udp/127.0.0.1:10020?rel=1' \
+  approve edge_1 --name dt_jetson_1
 python -m apps.edge_manager command EDGE_ID ping
 python -m apps.edge_manager revoke EDGE_ID
 python -m apps.edge_manager remove EDGE_ID
@@ -74,7 +84,16 @@ dt/edges/{edge_id}/calibration/{request_id}/chunks/{index}
 `approve`는 `dt/edges/{edge_id}/config`로 설정을 발행하고, 엣지가
 `edge.local.json` 저장을 완료했다는 ACK를 보낸 뒤에만 registry를 승인 상태로
 변경합니다. 엣지가 보고한 endpoint 대신 다른 외부 주소를 저장해야 한다면
-`approve EDGE_ID --edge-endpoint PUBLIC_IP:7447`을 사용합니다.
+`approve EDGE_ID --edge-endpoint 'udp/PUBLIC_IP:10020?rel=1'`을 사용합니다.
+
+권장 등록 순서는 다음과 같습니다.
+
+1. Edge에서 `agent.py init`으로 `edge_id=edge_1`, 표시 이름, QUIC endpoint와
+   카메라 파일을 한 번 저장합니다.
+2. Edge에서 `agent.py run`을 실행합니다.
+3. 서버에서 `list`로 `edge_1`을 확인하고 `approve edge_1`을 실행합니다.
+4. 필요하면 calibration worker를 실행해 YAML의 extrinsic을 완성합니다.
+5. Edge에서 인자 없이 `inference.py`를 실행합니다.
 
 현재 최소 구현에서는 registry와 `server_worker`의 승인 엣지 목록을 자동으로
 동기화하지 않습니다. 서버 추론을 붙일 때는 승인된 엣지의 ID와

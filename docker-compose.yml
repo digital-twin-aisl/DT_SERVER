@@ -71,6 +71,18 @@ services:
     environment:
       - MODULE_NAME=frontend_api
       - REDIS_URL=redis://redis:6379
+      # Browser-facing Isaac Sim 4.2 WebRTC settings. Leave PUBLIC_URL/SERVER
+      # empty when the dashboard and Isaac Sim are reached through the same IP.
+      - ISAAC_WEBRTC_PUBLIC_URL=${ISAAC_WEBRTC_PUBLIC_URL:-}
+      - ISAAC_WEBRTC_SERVER=${ISAAC_WEBRTC_SERVER:-}
+      - ISAAC_WEBRTC_ENABLED=${ISAAC_WEBRTC_ENABLED:-true}
+      - ISAAC_WEBRTC_PATH=${ISAAC_WEBRTC_PATH:-/streaming/webrtc-demo/}
+      - ISAAC_WEBRTC_WEB_PORT=${ISAAC_WEBRTC_WEB_PORT:-8211}
+      - ISAAC_WEBRTC_SIGNAL_PORT=${ISAAC_WEBRTC_SIGNAL_PORT:-49100}
+      - ISAAC_WEBRTC_STREAM_PORT=${ISAAC_WEBRTC_STREAM_PORT:-47998}
+      - ISAAC_WEBRTC_INTERNAL_URL=${ISAAC_WEBRTC_INTERNAL_URL:-http://host.docker.internal:8211}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - dt_network
     depends_on:

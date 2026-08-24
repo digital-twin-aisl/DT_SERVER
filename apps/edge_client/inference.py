@@ -60,7 +60,11 @@ def parse_args(argv=None):
         help="Shared scene, calibration, edge assignment, and workspace manifest",
     )
     parser.add_argument("--example-folder", "--example_folder", dest="example_folder")
-    parser.add_argument("--tensorrt", action="store_true")
+    parser.add_argument(
+        "--tensorrt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument(
         "--rebuild-tensorrt",
         action="store_true",
@@ -133,6 +137,17 @@ def resolve_edge_path(value, *, must_exist=True):
     if must_exist:
         raise FileNotFoundError(f"required path does not exist: {resolved}")
     return resolved
+
+
+def resolve_identity_setting(value, identity_path, *, must_exist=True):
+    """Resolve a path persisted relative to the edge identity file."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path(identity_path).resolve().parent / path
+    path = path.resolve()
+    if must_exist and not path.exists():
+        raise FileNotFoundError(f"required path does not exist: {path}")
+    return path
 
 
 def file_sha256(path):
@@ -402,15 +417,21 @@ def create_input_process(
     print("Starting live RTSP camera input")
     if not live_cameras:
         raise ValueError("live RTSP input requires configured camera sources")
-    if spatial_context is None:
-        CalibrationData(sp3d_config, cameras=live_cameras)
-    else:
-        CalibrationData(
-            sp3d_config,
-            calibration_path=spatial_context.calibration_path,
-            camera_ids=spatial_context.edge_camera_ids[edge_id],
-            world_origin_m=spatial_context.world_origin_m,
-        )
+    camera_ids = (
+        spatial_context.edge_camera_ids[edge_id]
+        if spatial_context is not None
+        else [camera["id"] for camera in live_cameras]
+    )
+    CalibrationData(
+        sp3d_config,
+        cameras=live_cameras,
+        camera_ids=camera_ids,
+        world_origin_m=(
+            spatial_context.world_origin_m
+            if spatial_context is not None
+            else (0.0, 0.0, 0.0)
+        ),
+    )
     return IPCamera(
         live_cameras,
         stop_event,
@@ -466,27 +487,46 @@ def extract_reid(
 
 def main():
     args = parse_args()
-    if args.cfg_focus:
-        update_focus_config(resolve_edge_path(args.cfg_focus))
-    update_sp3d_config(resolve_edge_path(focus_config.POSENET.CONFIG))
-    use_tensorrt = args.tensorrt or bool(focus_config.POSENET.TENSORRT)
-    if args.dataset:
-        args.example_folder = str(resolve_edge_path(args.example_folder))
-    if args.deployment:
-        args.deployment = str(resolve_edge_path(args.deployment))
     args.edge_id_file = str(
         resolve_edge_path(args.edge_id_file, must_exist=False)
     )
-    if args.zenoh_config:
-        args.zenoh_config = str(resolve_edge_path(args.zenoh_config))
     edge_id = load_or_create_edge_id(args.edge_id_file, args.edge_id)
+    edge_metadata = load_edge_metadata(args.edge_id_file)
+    inference_defaults = edge_metadata.get("inference") or {}
+    if not isinstance(inference_defaults, dict):
+        raise ValueError("edge identity inference settings must be an object")
+
+    cfg_focus = args.cfg_focus or inference_defaults.get("cfg_focus")
+    if cfg_focus:
+        update_focus_config(
+            resolve_identity_setting(cfg_focus, args.edge_id_file)
+        )
+    update_sp3d_config(resolve_edge_path(focus_config.POSENET.CONFIG))
+    use_tensorrt = (
+        bool(inference_defaults.get("tensorrt", focus_config.POSENET.TENSORRT))
+        if args.tensorrt is None
+        else args.tensorrt
+    )
+    if args.dataset:
+        args.example_folder = str(resolve_edge_path(args.example_folder))
+    deployment = args.deployment or inference_defaults.get("deployment")
+    args.deployment = (
+        str(resolve_identity_setting(deployment, args.edge_id_file))
+        if deployment
+        else None
+    )
+    zenoh_config = args.zenoh_config or edge_metadata.get("zenoh_config")
+    args.zenoh_config = (
+        str(resolve_identity_setting(zenoh_config, args.edge_id_file))
+        if zenoh_config
+        else None
+    )
     spatial_context = (
         load_spatial_context(args.deployment) if args.deployment else None
     )
     if args.dataset:
         validate_dataset_spatial_context(args.example_folder, spatial_context)
     sp3d_config.SPATIAL_CONTEXT = spatial_context
-    edge_metadata = load_edge_metadata(args.edge_id_file)
     live_cameras = (
         None
         if args.dataset

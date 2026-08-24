@@ -45,3 +45,6 @@ imageio>=2.31,<3
 matplotlib>=3.7,<4
 tqdm>=4.66,<5
 viser>=0.2.23,<1
+
+# Shared source package used by edge/server calibration and workspace code.
+-e ./packages/dt_common
