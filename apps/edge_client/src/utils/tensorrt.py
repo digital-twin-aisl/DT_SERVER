@@ -64,6 +64,7 @@ def build_engine_spec(model, checkpoint_path, cfg, mode="fp16"):
         },
         "precision": mode,
         "batch_size": int(cfg.BATCH_SIZE),
+        "backbone_batch_size": int(cfg.BATCH_SIZE) * int(cfg.NUM_VIEWS),
         "num_views": int(cfg.NUM_VIEWS),
         "image_size": [int(value) for value in cfg.NETWORK.IMAGE_SIZE],
         "num_joints": int(cfg.NETWORK.NUM_JOINTS),
@@ -113,7 +114,16 @@ def _cache_is_valid(engine_dir, spec):
         return False
 
 
-def _convert_component(name, module, example, mode):
+def _convert_component(
+    name,
+    module,
+    example,
+    mode,
+    *,
+    min_shapes=None,
+    opt_shapes=None,
+    max_shapes=None,
+):
     from torch2trt import torch2trt
 
     if mode != "fp16":
@@ -143,6 +153,9 @@ def _convert_component(name, module, example, mode):
                 fp16_mode=True,
                 use_onnx=True,
                 max_workspace_size=DEFAULT_WORKSPACE_SIZE,
+                min_shapes=min_shapes,
+                opt_shapes=opt_shapes,
+                max_shapes=max_shapes,
             )
         actual = converted(example)
         torch.cuda.synchronize()
@@ -170,12 +183,13 @@ def export_tensorrt(model, output_dir, cfg, spec, mode="fp16"):
     output.mkdir(parents=True, exist_ok=False)
     device = next(model.parameters()).device
     batch_size = int(cfg.BATCH_SIZE)
+    backbone_batch_size = batch_size * int(cfg.NUM_VIEWS)
     image_width, image_height = (int(value) for value in cfg.NETWORK.IMAGE_SIZE)
     root_cube_size = tuple(int(value) for value in model.root_net.cube_size)
 
     examples = {
         "backbone": torch.ones(
-            (batch_size, 3, image_height, image_width),
+            (backbone_batch_size, 3, image_height, image_width),
             device=device,
         ),
         "root_v2v_net": torch.ones(

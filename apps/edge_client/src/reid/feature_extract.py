@@ -42,8 +42,11 @@ from apps.edge_client.src.utils.tensorrt import (
 
 
 alpha = 1.0
-REID_ENGINE_CACHE_SCHEMA = 1
+REID_ENGINE_CACHE_SCHEMA = 2
 REID_ENGINE_FILE = "model.pth"
+REID_MIN_BATCH_SIZE = 1
+REID_OPT_BATCH_SIZE = 4
+REID_MAX_BATCH_SIZE = 16
 
 
 def _reid_config():
@@ -82,11 +85,10 @@ def extract_features_from_persons(model, transform, person_list):
     Procrustes distance 기반 가중치를 feature에 곱해 반환한다.
     """
     features = []
-    all_keypoints = [p["keypoints"] for p in person_list]
+    weights = _person_weights(person_list)
 
     for i, person in enumerate(person_list):
         crop_img = person["crop"]
-        ref_kp = person["keypoints"]
 
         crop_pil = Image.fromarray(cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB))
         img_tensor = transform(crop_pil).unsqueeze(0).to(next(model.parameters()).device)
@@ -94,14 +96,7 @@ def extract_features_from_persons(model, transform, person_list):
         output = model(img_tensor)
         feat = output.cpu().numpy().squeeze(0)
 
-        dists = [
-            procrustes_distance(ref_kp, other_kp)
-            for j, other_kp in enumerate(all_keypoints)
-            if j != i
-        ]
-        dists = [d for d in dists if not np.isnan(d)]
-
-        weight = 1 + alpha * np.mean(dists) if dists else 1.0
+        weight = weights[i]
         feat_weighted = feat * weight
 
         features.append(
@@ -140,6 +135,22 @@ def procrustes_distance(A, B):
         return np.nan
 
 
+def _person_weights(person_list):
+    """Keep Procrustes weighting local to each camera after GPU batching."""
+    weights = []
+    for index, person in enumerate(person_list):
+        distances = [
+            procrustes_distance(person["keypoints"], other["keypoints"])
+            for other_index, other in enumerate(person_list)
+            if other_index != index and other["cam"] == person["cam"]
+        ]
+        distances = [value for value in distances if not np.isnan(value)]
+        weights.append(
+            float(1 + alpha * np.mean(distances)) if distances else 1.0
+        )
+    return weights
+
+
 # ======================================================================
 # TensorRT-based feature extractor with target-specific atomic caching
 # ======================================================================
@@ -169,10 +180,15 @@ def build_reid_engine_spec(checkpoint, cfg, mode="fp16"):
         "config_sha256": config_sha256,
         "precision": mode,
         "input_shape": [
-            1,
+            REID_MIN_BATCH_SIZE,
             3,
             int(cfg.INPUT.SIZE_TEST[0]),
             int(cfg.INPUT.SIZE_TEST[1]),
+        ],
+        "batch_range": [
+            REID_MIN_BATCH_SIZE,
+            REID_OPT_BATCH_SIZE,
+            REID_MAX_BATCH_SIZE,
         ],
         "output_features": int(cfg.MODEL.BACKBONE.FEAT_DIM),
         "hardware": _hardware_identity(),
@@ -208,12 +224,25 @@ def _remove_stale_reid_builds(cache_root, engine_dir):
 def _build_reid_cache(cache_root, engine_dir, spec, mode):
     model, _ = build_feature_extractor()
     model = _ReIDInferenceModule(model).eval().cuda()
+    _, opt_batch_size, max_batch_size = spec["batch_range"]
+    example_shape = list(spec["input_shape"])
+    example_shape[0] = opt_batch_size
     example = torch.rand(
-        tuple(spec["input_shape"]),
+        tuple(example_shape),
         device="cuda",
         dtype=torch.float32,
     ) * 255.0
-    converted = _convert_component("fastreid", model, example, mode)
+    min_shape = tuple(spec["input_shape"])
+    max_shape = (max_batch_size, *min_shape[1:])
+    converted = _convert_component(
+        "fastreid",
+        model,
+        example,
+        mode,
+        min_shapes=[min_shape],
+        opt_shapes=[tuple(example_shape)],
+        max_shapes=[max_shape],
+    )
 
     temporary = Path(
         tempfile.mkdtemp(prefix=f".{engine_dir.name}.", dir=cache_root)
@@ -276,22 +305,28 @@ def build_trt_feature_extractor(force_rebuild=False, mode="fp16"):
 @torch.no_grad()
 def extract_features_from_persons_trt(model, transform, person_list):
     """Extract ReID features directly with the cached CUDA TRTModule."""
-    features = []
-    all_keypoints = [person["keypoints"] for person in person_list]
-
-    for index, person in enumerate(person_list):
+    if not person_list:
+        return []
+    weights = _person_weights(person_list)
+    tensors = []
+    for person in person_list:
         crop_pil = Image.fromarray(
             cv2.cvtColor(person["crop"], cv2.COLOR_BGR2RGB)
         )
-        image = transform(crop_pil).unsqueeze(0).contiguous().cuda()
-        feature = model(image).float().cpu().numpy().squeeze(0)
-        distances = [
-            procrustes_distance(person["keypoints"], other_keypoints)
-            for other_index, other_keypoints in enumerate(all_keypoints)
-            if other_index != index
-        ]
-        distances = [value for value in distances if not np.isnan(value)]
-        weight = 1 + alpha * np.mean(distances) if distances else 1.0
+        tensors.append(transform(crop_pil))
+
+    feature_batches = []
+    for start in range(0, len(tensors), REID_MAX_BATCH_SIZE):
+        image_batch = torch.stack(
+            tensors[start : start + REID_MAX_BATCH_SIZE]
+        ).contiguous().cuda(non_blocking=True)
+        feature_batches.append(model(image_batch).float().cpu())
+    feature_array = torch.cat(feature_batches).numpy()
+
+    features = []
+    for index, (person, feature, weight) in enumerate(
+        zip(person_list, feature_array, weights)
+    ):
         features.append(
             {
                 "edge_id": person["edge_id"],

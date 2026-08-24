@@ -251,19 +251,35 @@ class ProjectLayer(nn.Module):
         n = len(heatmaps)
         batch_size = heatmaps[0].shape[0]
         num_joints = heatmaps[0].shape[1]
-        device = heatmaps[0].device
+        if any(heatmap.shape[0] != batch_size for heatmap in heatmaps):
+            raise ValueError("all camera heatmaps must use the same batch size")
 
-        # 결과 텐서를 미리 할당
-        # final_cubes = torch.zeros(batch_size, num_joints, self.nbins, device=device)
-        # weight_sum = torch.zeros(batch_size, num_joints, self.nbins, device=device)
-        cubes = torch.zeros(batch_size, num_joints, 1, self.nbins, n, device=device)
-        for i in range(batch_size):
-            for c in range(n):
-                cubes[i : i + 1, :, :, :, c] += F.grid_sample(
-                    heatmaps[c][i : i + 1, :, :, :],
-                    sample_grids[c],
-                    align_corners=True,
-                )
+        # Treat camera as another batch dimension so CUDA launches one
+        # grid_sample kernel instead of one kernel per camera and sample.
+        heatmap_batch = torch.stack(heatmaps, dim=1).reshape(
+            batch_size * n,
+            num_joints,
+            heatmaps[0].shape[-2],
+            heatmaps[0].shape[-1],
+        )
+        grid_batch = torch.cat(sample_grids, dim=0)
+        grid_batch = (
+            grid_batch.unsqueeze(0)
+            .expand(batch_size, -1, -1, -1, -1)
+            .reshape(batch_size * n, 1, self.nbins, 2)
+        )
+        cubes = F.grid_sample(
+            heatmap_batch,
+            grid_batch,
+            align_corners=True,
+        )
+        cubes = cubes.reshape(
+            batch_size,
+            n,
+            num_joints,
+            1,
+            self.nbins,
+        ).permute(0, 2, 3, 4, 1)
         cubes = torch.sum(torch.mul(cubes, bounding), dim=-1) / (
             torch.sum(bounding, dim=-1) + 1e-6
         )

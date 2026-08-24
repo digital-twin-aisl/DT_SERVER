@@ -231,6 +231,41 @@ class CuboidProposalNetSoft(nn.Module):
                 & (clearance >= self.root_clearance_min_mm)
                 & (clearance <= self.root_clearance_max_mm)
             )
+        ordered = torch.argsort(candidates[:, :, 4], dim=1, descending=True)
+        ordered_candidates = candidates.gather(
+            1,
+            ordered.unsqueeze(-1).expand_as(candidates),
+        )
+        ordered_terrain_valid = terrain_valid.gather(1, ordered)
+        eligible = (ordered_candidates[:, :, 3] >= 0) & ordered_terrain_valid
+        distances = torch.cdist(
+            ordered_candidates[:, :, :3],
+            ordered_candidates[:, :, :3],
+        )
+        selected = torch.zeros_like(eligible)
+        remaining = eligible.clone()
+        later = torch.triu(
+            torch.ones(
+                self.max_num_people,
+                self.max_num_people,
+                dtype=torch.bool,
+                device=candidates.device,
+            ),
+            diagonal=1,
+        )
+        # K is fixed and small.  Keep greedy NMS entirely as queued CUDA
+        # tensor operations; converting indexes or booleans to Python here
+        # forces the whole pose stream to synchronize every frame.
+        for candidate_index in range(self.max_num_people):
+            active = remaining[:, candidate_index]
+            selected[:, candidate_index] = active
+            suppress = (
+                active[:, None]
+                & later[candidate_index][None]
+                & (distances[:, candidate_index] < self.root_nms_distance)
+            )
+            remaining = remaining & ~suppress
+
         merged = torch.zeros(
             batch_size,
             self.max_num_people,
@@ -239,30 +274,12 @@ class CuboidProposalNetSoft(nn.Module):
             device=candidates.device,
         )
         merged[:, :, 3] = -1.0
-
-        for batch_index in range(batch_size):
-            ordered = torch.argsort(
-                candidates[batch_index, :, 4],
-                descending=True,
-            )
-            selected = []
-            for candidate_index in ordered.tolist():
-                candidate = candidates[batch_index, candidate_index]
-                if candidate[3] < 0 or not terrain_valid[batch_index, candidate_index]:
-                    continue
-                if selected:
-                    positions = torch.stack([item[:3] for item in selected])
-                    if torch.any(
-                        torch.linalg.vector_norm(
-                            positions - candidate[:3],
-                            dim=1,
-                        )
-                        < self.root_nms_distance
-                    ):
-                        continue
-                selected.append(candidate)
-                if len(selected) == self.max_num_people:
-                    break
-            for output_index, candidate in enumerate(selected):
-                merged[batch_index, output_index] = candidate
+        batch_indexes, candidate_indexes = torch.where(selected)
+        output_indexes = (
+            selected.cumsum(dim=1)[batch_indexes, candidate_indexes] - 1
+        )
+        merged[batch_indexes, output_indexes] = ordered_candidates[
+            batch_indexes,
+            candidate_indexes,
+        ]
         return merged

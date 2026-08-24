@@ -33,6 +33,7 @@ config.SERVER = "localhost:7447"
 config.OUTPUT_TOPIC = "0_edge"
 config.YOLO = edict()
 config.YOLO.MODEL = "models/yolo11n-pose.pt"
+config.YOLO.IMAGE_SIZE = 640
 
 
 def _update_dict(k, v):

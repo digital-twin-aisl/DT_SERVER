@@ -28,7 +28,7 @@ from apps.edge_client.src.protocol.edge import (
     load_edge_metadata,
     load_or_create_edge_id,
 )
-from apps.edge_client.src.reid.yolopose import extract_poses_from_frame
+from apps.edge_client.src.reid.yolopose import extract_poses_from_frames
 from apps.edge_client.src.root.core.config import config as sp3d_config
 from apps.edge_client.src.root.core.config import update_config as update_sp3d_config
 from apps.edge_client.src.root.models.multi_person_posenet_ssv import (
@@ -250,7 +250,6 @@ def load_models(use_tensorrt, use_reid, rebuild_tensorrt=False):
     reid_engine = None
     yolo_model = None
     if use_reid:
-        from ultralytics import YOLO
         from apps.edge_client.src.reid.feature_extract import (
             build_feature_extractor,
             build_trt_feature_extractor,
@@ -265,7 +264,20 @@ def load_models(use_tensorrt, use_reid, rebuild_tensorrt=False):
             )
         else:
             reid_engine = ("pytorch", build_feature_extractor())
-        yolo_model = YOLO(str(resolve_edge_path(focus_config.YOLO.MODEL)))
+        yolo_checkpoint = resolve_edge_path(focus_config.YOLO.MODEL)
+        if use_tensorrt:
+            from apps.edge_client.src.reid.yolo_tensorrt import build_trt_yolo
+
+            yolo_model = build_trt_yolo(
+                yolo_checkpoint,
+                batch_size=sp3d_config.NUM_VIEWS,
+                image_size=int(focus_config.YOLO.IMAGE_SIZE),
+                force_rebuild=rebuild_tensorrt,
+            )
+        else:
+            from ultralytics import YOLO
+
+            yolo_model = YOLO(str(yolo_checkpoint))
 
     return pose_preprocess, pose_model, reid_engine, yolo_model
 
@@ -427,29 +439,29 @@ def extract_reid(
         extract_features_from_persons_trt,
     )
 
-    features = []
-    for index, image in enumerate(images):
-        try:
-            persons = extract_poses_from_frame(
-                yolo_model,
-                image,
-                edge_id=edge_id,
-                cam_id=camera_ids[index],
-                frame_num=frame_num,
-            )
-            if persons:
-                backend, extractor = reid_engine
-                if backend == "tensorrt":
-                    extracted = extract_features_from_persons_trt(
-                        *extractor, persons
-                    )
-                else:
-                    extracted = extract_features_from_persons(*extractor, persons)
-                features.extend(extracted)
-        except Exception:
-            print(f"ReID error: frame={frame_num}, camera={index + 1}")
-            traceback.print_exc()
-    return features
+    try:
+        persons_by_camera = extract_poses_from_frames(
+            yolo_model,
+            images,
+            edge_id=edge_id,
+            camera_ids=camera_ids,
+            frame_num=frame_num,
+        )
+        persons = [
+            person
+            for camera_persons in persons_by_camera
+            for person in camera_persons
+        ]
+        if not persons:
+            return []
+        backend, extractor = reid_engine
+        if backend == "tensorrt":
+            return extract_features_from_persons_trt(*extractor, persons)
+        return extract_features_from_persons(*extractor, persons)
+    except Exception:
+        print(f"ReID error: frame={frame_num}")
+        traceback.print_exc()
+        return []
 
 
 def main():
@@ -555,6 +567,14 @@ def main():
             not args.no_reid,
             args.rebuild_tensorrt,
         )
+        # TensorRT synchronizes around enqueueV3 when invoked on CUDA's
+        # default stream.  Keep the whole inference chain on one dedicated
+        # stream so dependencies remain ordered without those global syncs.
+        inference_stream = torch.cuda.Stream()
+        inference_stream.wait_stream(torch.cuda.current_stream())
+        torch.cuda.set_stream(inference_stream)
+        reid_stream = torch.cuda.Stream()
+        reid_stream.wait_stream(inference_stream)
         if args.no_reid:
             print("ReID output disabled")
 
@@ -599,20 +619,35 @@ def main():
                         last_input_warning = now
                     time.sleep(0.01)
                     continue
-                frame_outputs = extract_reid(
-                    reid_engine,
-                    yolo_model,
-                    image_batches,
-                    frame_num,
-                    edge_id,
-                    camera_ids,
-                )
+                if args.dataset:
+                    # The snapshot above owns copies, so decode the next
+                    # synchronized frame while this one is on the GPU.
+                    input_flag.value = True
 
                 views = pose_preprocess(image_batches)
                 _, all_heatmaps, roots = pose_model(views=views)
+                with torch.cuda.stream(reid_stream):
+                    frame_outputs = extract_reid(
+                        reid_engine,
+                        yolo_model,
+                        image_batches,
+                        frame_num,
+                        edge_id,
+                        camera_ids,
+                    )
+
+                heatmap_batch = (
+                    torch.cat(all_heatmaps, dim=0)
+                    .clamp(0, 1)
+                    .mul(255)
+                    .round()
+                    .to(torch.uint8)
+                    .cpu()
+                    .numpy()
+                )
                 all_heatmaps = [
-                    (heatmap.clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
-                    for heatmap in all_heatmaps
+                    heatmap_batch[index : index + 1]
+                    for index in range(len(camera_ids))
                 ]
                 roots = roots.detach().cpu().numpy()
 
@@ -637,7 +672,6 @@ def main():
                 if args.max_frames is not None and frame_num >= args.max_frames:
                     break
                 if args.dataset:
-                    input_flag.value = True
                     while input_flag.value and input_process.is_alive():
                         time.sleep(0.001)
                     if not input_process.is_alive():

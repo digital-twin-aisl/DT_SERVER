@@ -13,6 +13,7 @@ __pycache__/
 *.pth.tar
 apps/edge_client/models/*.pth.tar.tensorrt/
 apps/edge_client/models/*.pth.tensorrt/
+apps/edge_client/models/*.pt.tensorrt/
 
 # C extensions
 *.so
