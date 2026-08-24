@@ -1,0 +1,15 @@
+{
+  mode: "router",
+
+  listen: {
+    endpoints: [
+      "udp/0.0.0.0:10020?rel=1"
+    ]
+  },
+
+  transport: {
+    link: {
+      protocols: ["udp"]
+    }
+  }
+}
