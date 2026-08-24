@@ -41,6 +41,8 @@ class ZenohSender:
         self.queue = queue.Queue(maxsize=queue_size)
         self.closed = False
         self.dropped = 0
+        self.router_ids = ()
+        self.link_count = 0
         self._ready = threading.Event()
         self._error = None
         self.worker = threading.Thread(target=self._run, daemon=True)
@@ -73,6 +75,10 @@ class ZenohSender:
         try:
             with zenoh.open(self._config()) as session:
                 publisher = session.declare_publisher(self.topic)
+                self.router_ids = tuple(
+                    str(router_id) for router_id in session.info.routers_zid()
+                )
+                self.link_count = len(session.info.links())
                 print(f"[Zenoh] Publishing topic: {self.topic}", flush=True)
                 self._ready.set()
                 while True:
@@ -83,6 +89,11 @@ class ZenohSender:
         except Exception as exc:
             self._error = exc
             self._ready.set()
+
+    @property
+    def router_connected(self):
+        """Whether the opened Zenoh session currently has a network link."""
+        return self.link_count > 0
 
     def close(self):
         if self.closed:
