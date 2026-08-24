@@ -34,6 +34,6 @@ def viewer_config() -> dict:
         "server": os.getenv("ISAAC_WEBRTC_SERVER", "").strip() or None,
         "web_port": _env_int("ISAAC_WEBRTC_WEB_PORT", 8211),
         "signal_port": _env_int("ISAAC_WEBRTC_SIGNAL_PORT", 49100),
-        "stream_port": _env_int("ISAAC_WEBRTC_STREAM_PORT", 47998),
+        "stream_port": _env_int("ISAAC_WEBRTC_STREAM_PORT", 10021),
         "path": path,
     }

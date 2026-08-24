@@ -156,13 +156,21 @@
 
             const statusResponse = await fetch('/api/v1/viewer/status');
             const status = await statusResponse.json();
-            if (status.status === 'offline') {
-                message.textContent = 'Isaac Sim이 아직 실행되지 않았거나 8211 포트에 연결할 수 없습니다.';
+            if (status.status === 'disabled') {
+                message.textContent = 'Isaac Sim 내부 상태 확인 주소가 비활성화되어 있습니다.';
+                statusBadge.textContent = 'Isaac Sim 상태 확인 비활성화';
+                statusBadge.className = 'font-bold text-amber-600';
+            } else if (status.status === 'offline') {
+                message.textContent = 'Isaac Sim의 8211/49100 TCP 서비스에 연결할 수 없습니다.';
                 statusBadge.textContent = 'Isaac Sim 연결 안 됨';
                 statusBadge.className = 'font-bold text-red-600';
+            } else if (status.status === 'degraded') {
+                message.textContent = `부분 연결: web=${status.viewer.status}, signaling=${status.signaling.status}`;
+                statusBadge.textContent = 'Isaac Sim TCP 부분 연결';
+                statusBadge.className = 'font-bold text-amber-600';
             } else {
                 message.textContent = 'WebRTC 페이지를 불러오는 중...';
-                statusBadge.textContent = 'Isaac Sim WebRTC 페이지 응답';
+                statusBadge.textContent = `WebRTC TCP 준비됨 · UDP ${status.media.port} 확인 필요`;
                 statusBadge.className = 'font-bold text-green-600';
             }
         } catch (error) {

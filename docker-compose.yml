@@ -6,6 +6,8 @@ services:
       context: ./apps/edge_manager
     ports:
       - "8001:8001"
+      # Isaac WebRTC signaling stays on localhost:49100 and is carried by the
+      # existing outbound VS Code Remote Tunnel. It must not claim host 443.
       - "443:50051" # 50051 포트 대신 호스트의 443 포트를 사용
     environment:
       - MODULE_NAME=edge_manager
@@ -79,7 +81,8 @@ services:
       - ISAAC_WEBRTC_PATH=${ISAAC_WEBRTC_PATH:-/streaming/webrtc-demo/}
       - ISAAC_WEBRTC_WEB_PORT=${ISAAC_WEBRTC_WEB_PORT:-8211}
       - ISAAC_WEBRTC_SIGNAL_PORT=${ISAAC_WEBRTC_SIGNAL_PORT:-49100}
-      - ISAAC_WEBRTC_STREAM_PORT=${ISAAC_WEBRTC_STREAM_PORT:-47998}
+      - ISAAC_WEBRTC_SIGNAL_INTERNAL_HOST=${ISAAC_WEBRTC_SIGNAL_INTERNAL_HOST:-host.docker.internal}
+      - ISAAC_WEBRTC_STREAM_PORT=${ISAAC_WEBRTC_STREAM_PORT:-10021}
       - ISAAC_WEBRTC_INTERNAL_URL=${ISAAC_WEBRTC_INTERNAL_URL:-http://host.docker.internal:8211}
     extra_hosts:
       - "host.docker.internal:host-gateway"

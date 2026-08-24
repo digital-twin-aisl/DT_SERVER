@@ -5,12 +5,20 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DT_SERVER_DIR="${DT_SERVER_DIR:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}"
 ISAAC_SIM_DIR="${ISAAC_SIM_DIR:-}"
 ISAAC_PUBLIC_IP="${ISAAC_PUBLIC_IP:-}"
-ISAAC_SIGNAL_PORT="${ISAAC_SIGNAL_PORT:-49100}"
-ISAAC_STREAM_PORT="${ISAAC_STREAM_PORT:-47998}"
-ISAAC_WEB_PORT="${ISAAC_WEB_PORT:-8211}"
+# The shorter names are kept for compatibility. The WEBRTC_* names can be
+# shared with docker compose/frontend_api from the same environment file.
+ISAAC_SIGNAL_PORT="${ISAAC_SIGNAL_PORT:-${ISAAC_WEBRTC_SIGNAL_PORT:-49100}}"
+# This deployment only permits inbound UDP 10000-11000. Zenoh already uses
+# 10020, so 10021 is the repository default for Isaac Sim media.
+ISAAC_STREAM_PORT="${ISAAC_STREAM_PORT:-${ISAAC_WEBRTC_STREAM_PORT:-10021}}"
+ISAAC_WEB_PORT="${ISAAC_WEB_PORT:-${ISAAC_WEBRTC_WEB_PORT:-8211}}"
 
 if [[ -z "${ISAAC_SIM_DIR}" ]]; then
     echo "ISAAC_SIM_DIR must point to the Isaac Sim 4.2.0 installation." >&2
+    exit 2
+fi
+if [[ -z "${ISAAC_PUBLIC_IP}" ]]; then
+    echo "ISAAC_PUBLIC_IP must be the public IPv4 advertised to the remote WebRTC client." >&2
     exit 2
 fi
 

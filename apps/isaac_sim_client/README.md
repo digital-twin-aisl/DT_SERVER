@@ -147,10 +147,100 @@ Isaac Sim 4.2.0 WebRTC는 웹 페이지만 열어 주는 구조가 아닙니다.
 | `49100` | TCP | WebRTC 시그널링 |
 | `47998` | UDP | 영상/입력 미디어 |
 
+위 표는 기본값입니다. 포트 정책에 맞춰 UDP 미디어 포트는 바꿀 수 있습니다.
+현재처럼 `10000~11000/UDP`만 허용되고 `10020/UDP`를 Zenoh가 사용한다면,
+WebRTC에는 충돌하지 않는 `10021/UDP`를 사용하면 됩니다.
+
+### 현재 서버 권장 구성: GitHub/VS Code Remote Tunnel + 10021/UDP
+
+이 방식은 Isaac Sim의 인증 없는 HTTP/시그널링 포트를 인터넷에 공개하지 않습니다.
+서버에서 이미 동작 중인 Remote Tunnel의 outbound `443/TCP` 연결을 그대로 쓰므로,
+Compose에서 `edge_manager`가 사용하는 host `443/TCP`와도 충돌하지 않습니다.
+
+```text
+외부 Chrome ── VS Code Remote Tunnel(outbound 443) ──> 8005/TCP (Dashboard)
+                                                    ├─> 8211/TCP (Web client)
+                                                    └─> 49100/TCP (Signaling)
+외부 Chrome ─────────────── direct Internet ──────────> 10021/UDP (Media)
+Edge Zenoh  ─────────────── direct Internet ──────────> 10020/UDP
+```
+
+3090 서버에서 외부 클라이언트가 접속할 서버의 **공인 IPv4**를 지정하고 Isaac
+Sim을 실행합니다.
+
+```bash
+# 아래 TEST-NET 주소를 실제 3090 서버 공인 IPv4로 바꾸십시오.
+export ISAAC_PUBLIC_IP=203.0.113.10
+export ISAAC_WEBRTC_STREAM_PORT=10021
+export ISAAC_WEBRTC_SIGNAL_PORT=49100
+export ISAAC_WEBRTC_WEB_PORT=8211
+
+cd "$DT_SERVER_DIR"
+apps/isaac_sim_client/run_remote_webrtc.sh
+```
+
+같은 3090 서버에서 `frontend_api`도 실행합니다. VS Code Desktop이 원격 포트를
+로컬의 같은 번호로 전달할 것이므로 브라우저 기준 주소는 `127.0.0.1`로 설정합니다.
+
+```bash
+export ISAAC_WEBRTC_PUBLIC_URL=http://127.0.0.1:8211
+export ISAAC_WEBRTC_SERVER=127.0.0.1
+export ISAAC_WEBRTC_INTERNAL_URL=http://host.docker.internal:8211
+export ISAAC_WEBRTC_STREAM_PORT=10021
+
+docker compose up -d --build frontend_api
+```
+
+서버 방화벽에서는 `10021/UDP`만 외부 클라이언트 공인 IP로 제한하는 것이 가장
+안전합니다. UFW를 쓴다면 아래 TEST-NET 주소를 실제 접속 PC의 공인 IP로
+바꿉니다.
+
+```bash
+export ISAAC_VIEWER_PUBLIC_IP=198.51.100.25
+sudo ufw allow from "$ISAAC_VIEWER_PUBLIC_IP" to any port 10021 proto udp \
+  comment 'temporary Isaac WebRTC media'
+```
+
+외부 PC에서는 **VS Code Desktop**으로 현재 GitHub 인증 Remote Tunnel에 접속한
+후 `PORTS` 패널에서 다음 세 원격 포트를 추가합니다.
+
+| 원격 포트 | 로컬 주소 | 표시 이름 |
+| --- | --- | --- |
+| `8005` | `127.0.0.1:8005` | DT Dashboard |
+| `8211` | `127.0.0.1:8211` | Isaac Web Client |
+| `49100` | `127.0.0.1:49100` | Isaac Signaling |
+
+자동 배정된 로컬 포트가 다르면 포트를 우클릭하고 **Change Local Address Port**로
+원격 포트와 같은 번호로 맞춥니다. 특히 `49100`은 반드시 로컬에서도
+`49100`이어야 합니다. 브라우저용 `app.github.dev` HTTPS 주소가 아니라 VS Code
+Desktop이 표시하는 `127.0.0.1` 주소를 사용해야 mixed-content/TLS 문제를
+피할 수 있습니다.
+
+그 후 외부 PC의 Chrome/Chromium에서 다음 주소를 엽니다.
+
+```text
+대시보드: http://127.0.0.1:8005/
+Isaac 직접: http://127.0.0.1:8211/streaming/webrtc-demo/?server=127.0.0.1
+```
+
+두 주소 중 하나를 사용하면 됩니다.
+
+시청이 끝나면 Isaac Sim을 종료하고 VS Code의 전달 포트를 닫습니다. 임시 UFW
+규칙을 추가했다면 같이 제거합니다.
+
+```bash
+export ISAAC_VIEWER_PUBLIC_IP=198.51.100.25
+sudo ufw delete allow from "$ISAAC_VIEWER_PUBLIC_IP" to any port 10021 proto udp
+```
+
+`10000~11000/UDP` 범위가 이미 전체 인터넷에 항상 열려 있다면 규칙을 추가할
+필요는 없지만, Isaac Sim이 실행 중인 동안 `10021/UDP`에는 실제 미디어 서비스가
+열립니다. 가능하면 기존 범위 규칙도 소스 IP 제한 방식으로 좁히십시오.
+
 `frontend_api` 대시보드는 별도로 `8005/TCP`를 사용합니다. Isaac Sim 4.2의
-내장 스트리밍 엔드포인트에는 인증과 TLS가 없으므로, **권장 구성은 서버와
-외부 PC를 Tailscale/WireGuard 같은 mesh VPN에 넣는 것**입니다. 이 방식에서는
-공유기 포트포워딩 없이도 서버가 VPN 안의 LAN 서버처럼 보입니다.
+내장 스트리밍 엔드포인트에는 인증과 TLS가 없습니다. 일반적으로는 mesh VPN도
+가능하지만, 현재 서버에서는 위의 **Remote Tunnel + 제한된 `10021/UDP` 방식**을
+사용합니다.
 
 > Jetson/Orin 같은 `aarch64` 장비에서는 공식 Isaac Sim 4.2.0 데스크톱 앱을
 > 실행하는 구성을 전제로 하면 안 됩니다. 이 경우 `frontend_api`와 나머지
@@ -158,7 +248,7 @@ Isaac Sim 4.2.0 WebRTC는 웹 페이지만 열어 주는 구조가 아닙니다.
 > 별도 `x86_64 + RTX/NVENC` 호스트에서 실행합니다. 브라우저는 두 호스트 모두에
 > 도달해야 합니다.
 
-### 권장: mesh VPN 주소로 실행
+### 대안: mesh VPN 주소로 실행
 
 Isaac Sim 호스트의 VPN IPv4가 `100.80.10.20`, DT_SERVER 호스트의 VPN IPv4가
 `100.80.10.10`이라고 가정합니다. 두 역할이 같은 RTX 서버라면 같은 IP를
@@ -201,7 +291,7 @@ http://100.80.10.20:8211/streaming/webrtc-demo/?server=100.80.10.20
 ### 공인 IP/포트포워딩으로 직접 연결
 
 VPN을 사용할 수 없을 때만 공유기 또는 클라우드 보안 그룹에서 `8211/TCP`,
-`49100/TCP`, `47998/UDP`를 서버로 전달합니다. 대시보드까지 열려면
+`49100/TCP`, `10021/UDP`를 서버로 전달합니다. 대시보드까지 열려면
 `8005/TCP`도 추가합니다. 가능한 경우 소스 CIDR을 접속할 외부 PC의 공인
 IP(`/32`)로 제한하십시오.
 
@@ -239,14 +329,14 @@ Cloudflare Tunnel 같은 HTTP 터널 하나로 `frontend_api:8005`만 공개하�
 
 ```bash
 ss -lnt | grep -E ':(8005|8211|49100) '
-ss -lnu | grep ':47998 '
+ss -lnu | grep ':10021 '
 curl --fail http://127.0.0.1:8211/streaming/webrtc-demo/
 curl --fail http://127.0.0.1:8005/api/v1/viewer/status
 ```
 
 외부 PC에서 먼저 `http://<접속주소>:8211/...`를 직접 열어 영상이 나오는지
 확인한 뒤 대시보드 iframe을 확인합니다. 웹 페이지는 열리지만 영상이 검다면
-대부분 `49100/TCP`, `47998/UDP`, 또는 `ISAAC_PUBLIC_IP` 광고 주소 문제입니다.
+대부분 `49100/TCP`, `10021/UDP`, 또는 `ISAAC_PUBLIC_IP` 광고 주소 문제입니다.
 Firefox보다 Chrome/Chromium을 사용하십시오.
 
 ## Transport 선택

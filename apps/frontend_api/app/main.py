@@ -1,3 +1,4 @@
+import asyncio
 import os
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -5,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import pathlib
+from urllib.parse import urlparse
 
 from .viewer_config import viewer_config
 
@@ -69,17 +71,72 @@ async def get_viewer_status():
         "ISAAC_WEBRTC_INTERNAL_URL", "http://host.docker.internal:8211"
     ).strip().rstrip("/")
     if not internal_url.startswith(("http://", "https://")):
-        return {"status": "disabled", "detail": "invalid internal viewer URL"}
+        return {
+            "status": "disabled",
+            "viewer": {
+                "status": "disabled",
+                "http_status": None,
+                "detail": "invalid internal viewer URL",
+            },
+            "signaling": {"status": "disabled"},
+            "media": {"status": "disabled"},
+        }
 
+    viewer_status = "offline"
+    viewer_http_status = None
+    viewer_detail = None
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.get(internal_url, timeout=2.0)
-        return {
-            "status": "online" if response.status_code < 500 else "degraded",
-            "http_status": response.status_code,
-        }
+        viewer_http_status = response.status_code
+        viewer_status = "online" if response.status_code < 500 else "degraded"
     except httpx.RequestError as exc:
-        return {"status": "offline", "detail": str(exc)}
+        viewer_detail = str(exc)
+
+    config = viewer_config()
+    signal_host = os.getenv("ISAAC_WEBRTC_SIGNAL_INTERNAL_HOST", "").strip()
+    if not signal_host:
+        signal_host = urlparse(internal_url).hostname or "host.docker.internal"
+
+    signal_status = "offline"
+    signal_detail = None
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(signal_host, config["signal_port"]),
+            timeout=2.0,
+        )
+        signal_status = "online"
+        writer.close()
+        await writer.wait_closed()
+    except (OSError, asyncio.TimeoutError) as exc:
+        signal_detail = str(exc)
+
+    if viewer_status == "online" and signal_status == "online":
+        overall_status = "online"
+    elif viewer_status == "offline" and signal_status == "offline":
+        overall_status = "offline"
+    else:
+        overall_status = "degraded"
+
+    return {
+        "status": overall_status,
+        "viewer": {
+            "status": viewer_status,
+            "http_status": viewer_http_status,
+            "detail": viewer_detail,
+        },
+        "signaling": {
+            "status": signal_status,
+            "host": signal_host,
+            "port": config["signal_port"],
+            "detail": signal_detail,
+        },
+        "media": {
+            "status": "browser-check-required",
+            "protocol": "udp",
+            "port": config["stream_port"],
+        },
+    }
 
 @app.get("/api/v1/edges")
 async def get_edges_list():
