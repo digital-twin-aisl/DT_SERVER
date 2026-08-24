@@ -1,0 +1,14 @@
+{
+  // Zenoh 1.9 reliable QUIC without Zenoh-managed TLS certificates.
+  // Keep this on a trusted network or behind a VPN; public Internet
+  // deployments should use the secure `quic/` transport instead.
+  mode: "router",
+  listen: {
+    endpoints: ["udp/0.0.0.0:10020?rel=1"]
+  },
+  transport: {
+    link: {
+      protocols: ["udp"]
+    }
+  }
+}

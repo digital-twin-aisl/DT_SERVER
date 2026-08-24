@@ -6,6 +6,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import pathlib
 
+from .viewer_config import viewer_config
+
 app = FastAPI(title="Frontend API Gateway")
 
 # 프론트엔드(React, Vue 등) 브라우저에서 직접 API를 찌를 수 있도록 CORS 허용 세팅
@@ -25,6 +27,7 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 # 내부 Docker 컨테이너 주소 (docker-compose의 서비스명 기준, 기본 컨테이너 포트 80 사용)
 CAMERA_MANAGER_URL = os.getenv("CAMERA_MANAGER_URL", "http://camera_manager:80")
 EDGE_MANAGER_URL = os.getenv("EDGE_MANAGER_URL", "http://edge_manager:80")
+
 
 @app.get("/")
 def read_root():
@@ -47,6 +50,36 @@ async def get_system_status():
         "camera_manager": "online",
         "sim_backend": "online"
     }
+
+
+@app.get("/api/v1/viewer/config")
+async def get_viewer_config():
+    """Configuration used by the dashboard to build the WebRTC viewer URL."""
+    return viewer_config()
+
+
+@app.get("/api/v1/viewer/status")
+async def get_viewer_status():
+    """Probe Isaac Sim's HTTP viewer from the server side.
+
+    This only proves that the web client on port 8211 is ready. The browser must
+    still be able to reach the signaling TCP and media UDP ports.
+    """
+    internal_url = os.getenv(
+        "ISAAC_WEBRTC_INTERNAL_URL", "http://host.docker.internal:8211"
+    ).strip().rstrip("/")
+    if not internal_url.startswith(("http://", "https://")):
+        return {"status": "disabled", "detail": "invalid internal viewer URL"}
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.get(internal_url, timeout=2.0)
+        return {
+            "status": "online" if response.status_code < 500 else "degraded",
+            "http_status": response.status_code,
+        }
+    except httpx.RequestError as exc:
+        return {"status": "offline", "detail": str(exc)}
 
 @app.get("/api/v1/edges")
 async def get_edges_list():
@@ -78,4 +111,3 @@ async def request_calibration_trigger(edge_id: str, camera_id: int):
             return response.json()
         except httpx.RequestError as e:
             raise HTTPException(status_code=503, detail=f"Camera Manager 제어 에러: {e}")
-

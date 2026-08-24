@@ -71,6 +71,7 @@ python -m pip install -r requirements.txt
 ```
 
 `requirements.txt`는 ArUco가 포함된 headless OpenCV 하나만 설치합니다.
+또한 source checkout의 `packages/dt_common`을 editable package로 설치합니다.
 `opencv-python`, `opencv-python-headless`, `opencv-contrib-python`을 추가로 함께
 설치하면 같은 `cv2` 경로를 덮어쓸 수 있으므로 혼용하지 않습니다.
 
@@ -141,11 +142,15 @@ python -c "from vggt_omega.models import VGGTOmega; print('VGGT-Omega: OK')"
 
 ### Edge Manager
 
-Zenoh router가 `127.0.0.1:7447`에서 동작한다고 가정한 예입니다.
+인증서 없는 reliable QUIC router를 사용하는 예입니다.
 
 ```bash
+zenohd -c apps/edge_manager/config/zenoh-router-quic.json5
+
 source .venv-server/bin/activate
-python -m apps.edge_manager --endpoint 127.0.0.1:7447 serve
+python -m apps.edge_manager \
+  --endpoint 'udp/127.0.0.1:10020?rel=1' \
+  serve
 ```
 
 Registry 기본 파일은 `apps/edge_manager/data/edges.json`입니다. 다른 터미널에서
@@ -161,9 +166,12 @@ Registry 기본 파일은 `apps/edge_manager/data/edges.json`입니다. 다른 �
 ```bash
 source .venv-server/bin/activate
 python apps/server_worker/inference.py \
-  --zenoh-endpoint 127.0.0.1:7447 \
-  --scene-zenoh-topic meta-sejong/scene/v1
+  --deployment apps/deployments/scene_0812_2.json \
+  --zenoh-endpoint 'udp/127.0.0.1:10020?rel=1'
 ```
+
+Scene publisher는 별도 지정이 없으면 같은 endpoint와 기본 topic
+`meta-sejong/scene/v1`을 사용합니다.
 
 CPU fallback은 없으며 CUDA가 없으면 즉시 종료됩니다. 기본 설정은 TensorRT를
 사용하지 않습니다.

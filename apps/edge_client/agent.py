@@ -26,11 +26,13 @@ from apps.edge_client.src.protocol.edge import (  # noqa: E402
     load_edge_metadata,
     load_or_create_edge_id,
     save_edge_metadata,
+    validate_edge_id,
 )
 from apps.edge_client.src.protocol.zenoh import make_zenoh_config  # noqa: E402
 from apps.edge_client.src.camera_status import (  # noqa: E402
     DEFAULT_CAMERA_PING_TIMEOUT,
     build_camera_status_message,
+    load_registered_cameras,
 )
 from dt_common.calibration.protocol import (  # noqa: E402
     payload_sha256,
@@ -39,16 +41,148 @@ from dt_common.calibration.protocol import (  # noqa: E402
 from apps.edge_client.src.calibration_features import capture_and_encode  # noqa: E402
 from apps.edge_client.src.calibration_result import (  # noqa: E402
     apply_calibration_result,
+    import_external_calibration_result,
 )
 
 
 AGENT_VERSION = "0.1.0"
+DEFAULT_CAMERA_CONFIG = Path(__file__).parent / "config" / "cameras.local.yaml"
+
+
+def _resolve_identity_path(
+    value: str | Path,
+    identity_path: str | Path,
+    *,
+    must_exist: bool = True,
+) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        cwd_candidate = Path.cwd() / path
+        identity_candidate = Path(identity_path).expanduser().resolve().parent / path
+        path = cwd_candidate if cwd_candidate.exists() else identity_candidate
+    path = path.resolve()
+    if must_exist and not path.exists():
+        raise FileNotFoundError(f"required path does not exist: {path}")
+    return path
+
+
+def _portable_identity_path(path: Path, identity_path: str | Path) -> str:
+    identity_dir = Path(identity_path).expanduser().resolve().parent
+    return os.path.relpath(path, identity_dir)
+
+
+def configure_edge_identity(args: argparse.Namespace) -> dict[str, Any]:
+    """Persist the one-time settings consumed by agent and inference."""
+    identity_path = Path(args.identity_file).expanduser().resolve()
+    current = load_edge_metadata(identity_path) if identity_path.exists() else {}
+    current_edge_id = current.get("edge_id")
+    if args.edge_id or current_edge_id:
+        requested_edge_id = validate_edge_id(str(args.edge_id or current_edge_id))
+    else:
+        requested_edge_id = load_or_create_edge_id(identity_path)
+
+    if current_edge_id and requested_edge_id != current_edge_id:
+        if not args.replace_edge_id:
+            raise ValueError(
+                f"stored edge_id is {current_edge_id!r}; pass --replace-edge-id "
+                f"to replace it with {requested_edge_id!r}"
+            )
+        current = {"edge_id": requested_edge_id, "approved": False}
+    else:
+        current["edge_id"] = requested_edge_id
+
+    camera_config = _resolve_identity_path(args.camera_config, identity_path)
+    if args.calibration_result:
+        calibration_result = _resolve_identity_path(
+            args.calibration_result,
+            identity_path,
+        )
+        imported_ids = import_external_calibration_result(
+            camera_config,
+            calibration_result,
+        )
+        current["calibration_source"] = _portable_identity_path(
+            calibration_result,
+            identity_path,
+        )
+        print(
+            "Imported external calibration into cameras.local.yaml: "
+            + ", ".join(f"camera/{camera_id}" for camera_id in imported_ids),
+            flush=True,
+        )
+    cameras = load_registered_cameras(camera_config)
+    camera_ids: list[int] = []
+    for camera in cameras:
+        try:
+            camera_id = int(camera["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("every configured camera must have a numeric ID") from exc
+        if camera_id <= 0 or camera_id in camera_ids:
+            raise ValueError("camera IDs must be unique positive integers")
+        camera_ids.append(camera_id)
+    if not camera_ids:
+        raise ValueError(f"camera config has no cameras: {camera_config}")
+
+    endpoint = args.endpoint or current.get("zenoh_endpoint")
+    zenoh_config = args.zenoh_config or current.get("zenoh_config")
+    topic_root = (
+        args.topic_root or current.get("topic_root") or DEFAULT_TOPIC_ROOT
+    ).strip("/")
+    topics = EdgeTopics(requested_edge_id, topic_root)
+    current.update(
+        {
+            "display_name": str(
+                args.display_name
+                or current.get("display_name")
+                or requested_edge_id
+            ),
+            "camera_config": _portable_identity_path(camera_config, identity_path),
+            "camera_ids": camera_ids,
+            "topic_root": topics.root,
+            "topics": {
+                "status": topics.status,
+                "inference": topics.inference,
+                "command": topics.command,
+                "config": topics.config,
+                "ack": topics.ack,
+                "cameras": topics.cameras,
+                "calibration": topics.calibration,
+            },
+            "configured_at": time.time(),
+        }
+    )
+    if endpoint:
+        current["zenoh_endpoint"] = str(endpoint)
+    if zenoh_config:
+        config_path = _resolve_identity_path(zenoh_config, identity_path)
+        current["zenoh_config"] = _portable_identity_path(
+            config_path,
+            identity_path,
+        )
+
+    inference = current.get("inference") or {}
+    if not isinstance(inference, dict):
+        inference = {}
+    if args.tensorrt is not None:
+        inference["tensorrt"] = args.tensorrt
+    if args.deployment:
+        deployment = _resolve_identity_path(args.deployment, identity_path)
+        inference["deployment"] = _portable_identity_path(deployment, identity_path)
+    if args.cfg_focus:
+        cfg_focus = _resolve_identity_path(args.cfg_focus, identity_path)
+        inference["cfg_focus"] = _portable_identity_path(cfg_focus, identity_path)
+    if inference:
+        current["inference"] = inference
+
+    save_edge_metadata(identity_path, current)
+    return current
 
 
 class EdgeAgent:
     def __init__(
         self,
         edge_id: str,
+        display_name: str,
         endpoint: str | None,
         config_path: str | None,
         topic_root: str,
@@ -62,6 +196,7 @@ class EdgeAgent:
         camera_ping_timeout: float,
     ) -> None:
         self.edge_id = edge_id
+        self.display_name = display_name
         self.endpoint = endpoint
         self.config_path = config_path
         self.topics = EdgeTopics(edge_id, topic_root)
@@ -91,6 +226,7 @@ class EdgeAgent:
             "sent_at": time.time(),
             "data": {
                 "hostname": socket.gethostname(),
+                "display_name": self.display_name,
                 "platform": platform.platform(),
                 "python": platform.python_version(),
                 "agent_version": AGENT_VERSION,
@@ -367,6 +503,7 @@ class EdgeAgent:
                 }
             )
             save_edge_metadata(self.identity_path, current)
+            self.display_name = current["display_name"]
             self._publish_ack(
                 config_id,
                 "apply_config",
@@ -439,6 +576,29 @@ def build_parser() -> argparse.ArgumentParser:
         )
         if name == "init":
             command.add_argument("--edge-id")
+            command.add_argument("--display-name")
+            command.add_argument("--replace-edge-id", action="store_true")
+            command.add_argument("--endpoint", default=os.getenv("ZENOH_ENDPOINT"))
+            command.add_argument("--zenoh-config")
+            command.add_argument(
+                "--topic-root",
+                default=os.getenv("EDGE_TOPIC_ROOT"),
+            )
+            command.add_argument(
+                "--camera-config",
+                default=str(DEFAULT_CAMERA_CONFIG),
+            )
+            command.add_argument("--deployment")
+            command.add_argument(
+                "--calibration-result",
+                help="Existing calibration_result JSON to import into camera YAML",
+            )
+            command.add_argument("--cfg-focus")
+            command.add_argument(
+                "--tensorrt",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+            )
 
     run = subparsers.add_parser("run")
     run.add_argument("--edge-id")
@@ -448,10 +608,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--topic-root", default=os.getenv("EDGE_TOPIC_ROOT"))
     run.add_argument("--heartbeat", type=float, default=5.0)
     run.add_argument("--camera-count", type=int, default=0)
-    run.add_argument(
-        "--camera-config",
-        default=str(Path(__file__).parent / "config" / "cameras.local.yaml"),
-    )
+    run.add_argument("--camera-config")
     run.add_argument(
         "--calibration-checkpoint",
         default=os.getenv("VGGT_OMEGA_CHECKPOINT"),
@@ -470,8 +627,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     if args.subcommand == "init":
-        edge_id = load_or_create_edge_id(args.identity_file, args.edge_id)
-        print(edge_id)
+        try:
+            metadata = configure_edge_identity(args)
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        print(
+            f"Configured edge: edge_id={metadata['edge_id']} "
+            f"name={metadata['display_name']} "
+            f"cameras={metadata['camera_ids']}"
+        )
         return
     if args.subcommand == "show-id":
         path = Path(args.identity_file)
@@ -492,16 +656,27 @@ def main() -> None:
     edge_id = load_or_create_edge_id(args.identity_file, args.edge_id)
     metadata = load_edge_metadata(args.identity_file)
     endpoint = args.endpoint or metadata.get("zenoh_endpoint")
+    config_path = args.zenoh_config or metadata.get("zenoh_config")
+    if config_path:
+        config_path = str(_resolve_identity_path(config_path, args.identity_file))
     topic_root = args.topic_root or metadata.get("topic_root") or DEFAULT_TOPIC_ROOT
+    camera_config = args.camera_config or metadata.get("camera_config")
+    camera_config = str(
+        _resolve_identity_path(
+            camera_config or DEFAULT_CAMERA_CONFIG,
+            args.identity_file,
+        )
+    )
     agent = EdgeAgent(
         edge_id=edge_id,
+        display_name=str(metadata.get("display_name") or edge_id),
         endpoint=endpoint,
-        config_path=args.zenoh_config,
+        config_path=config_path,
         topic_root=topic_root,
         heartbeat_interval=args.heartbeat,
         camera_count=args.camera_count,
         identity_path=args.identity_file,
-        camera_config=args.camera_config,
+        camera_config=camera_config,
         calibration_checkpoint=args.calibration_checkpoint,
         calibration_device=args.calibration_device,
         calibration_image_size=args.calibration_image_size,

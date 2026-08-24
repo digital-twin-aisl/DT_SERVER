@@ -130,3 +130,78 @@ def select_voxelpose_cameras(
         voxelpose_camera(records[number], world_origin_m=world_origin_m)
         for number in requested
     ]
+
+
+def select_edge_config_voxelpose_cameras(
+    cameras: Iterable[dict[str, Any]],
+    camera_ids: Iterable[int | str],
+    *,
+    world_origin_m: Iterable[float] = (0.0, 0.0, 0.0),
+) -> list[dict[str, Any]]:
+    """Convert edge-local camera YAML records to VoxelPose cameras.
+
+    The edge camera file keeps intrinsics and extrinsics nested because it also
+    owns private RTSP connection information.  This adapter deliberately reads
+    calibration only from those nested fields; live inference must not fall
+    back to the retired ``camera_calibration_results.json`` file.
+    """
+    records: dict[int, dict[str, Any]] = {}
+    for camera in cameras:
+        if not isinstance(camera, dict):
+            raise ValueError("each edge camera must be an object")
+        number = camera_number(camera.get("id"))
+        if number in records:
+            raise ValueError(f"duplicate edge camera/{number}")
+
+        intrinsic = camera.get("intrinsic")
+        if not isinstance(intrinsic, dict):
+            raise ValueError(f"camera/{number} is missing intrinsic calibration")
+        extrinsic = camera.get("extrinsic")
+        if not isinstance(extrinsic, dict):
+            raise ValueError(f"camera/{number} is missing extrinsic calibration")
+
+        world_to_camera = _finite_array(
+            extrinsic.get("world_to_camera"),
+            (4, 4),
+            f"camera/{number}.extrinsic.world_to_camera",
+        )
+        camera_to_world_value = extrinsic.get("camera_to_world")
+        camera_to_world = (
+            np.linalg.inv(world_to_camera)
+            if camera_to_world_value is None
+            else _finite_array(
+                camera_to_world_value,
+                (4, 4),
+                f"camera/{number}.extrinsic.camera_to_world",
+            )
+        )
+        position = extrinsic.get("position_m")
+        if position is None:
+            position = camera_to_world[:3, 3]
+
+        distortion = intrinsic.get("distortion_coefficients")
+        if distortion is None:
+            distortion = camera.get("distortion_coefficients")
+
+        records[number] = {
+            "camera_id": f"camera/{number}",
+            "camera_matrix": intrinsic.get("camera_matrix"),
+            "distortion_coefficients": distortion,
+            "world_to_camera": world_to_camera,
+            "camera_to_world": camera_to_world,
+            "position_m": position,
+        }
+
+    requested = [camera_number(value) for value in camera_ids]
+    if len(requested) != len(set(requested)):
+        raise ValueError("requested camera IDs must be unique")
+    missing = [number for number in requested if number not in records]
+    if missing:
+        raise ValueError(
+            "edge camera config is missing "
+            + ", ".join(f"camera/{number}" for number in missing)
+        )
+    return [
+        voxelpose_camera(records[number], world_origin_m=world_origin_m)
+        for number in requested
+    ]

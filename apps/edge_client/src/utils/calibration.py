@@ -1,18 +1,22 @@
-import json
-import threading
-import os.path as osp
 import glob
 import cv2
+import os.path as osp
 import pickle
+import threading
+
 import numpy as np
 
 from dt_common.calibration.voxelpose import (
     load_calibration_result,
+    select_edge_config_voxelpose_cameras,
     select_voxelpose_cameras,
 )
 from apps.edge_client.src.utils.transforms import get_scale
-from apps.edge_client.src.utils.input import discover_dataset_videos
-from apps.edge_client.src.utils.input import find_dataset_calibration
+from apps.edge_client.src.utils.input import (
+    discover_dataset_videos,
+    find_dataset_calibration,
+)
+
 
 class CalibrationData:
     '''
@@ -43,10 +47,13 @@ class CalibrationData:
         self.cams = []
         self.example_path = example_path
         self.camera_ids = None if camera_ids is None else list(camera_ids)
+        self.world_origin_m = tuple(world_origin_m)
 
-        self.orig_image_size= np.array(cfg.NETWORK.IMAGE_SIZE_ORIG)
-        self.image_size=np.array(cfg.NETWORK.IMAGE_SIZE)
-        self.c = np.array([self.orig_image_size[0] / 2.0, self.orig_image_size[1] / 2.0])
+        self.orig_image_size = np.array(cfg.NETWORK.IMAGE_SIZE_ORIG)
+        self.image_size = np.array(cfg.NETWORK.IMAGE_SIZE)
+        self.c = np.array(
+            [self.orig_image_size[0] / 2.0, self.orig_image_size[1] / 2.0]
+        )
         self.s = get_scale(self.orig_image_size, self.image_size)
         self.r = 0
 
@@ -59,54 +66,23 @@ class CalibrationData:
             )
         elif self.example_path:
             self.update_from_dataset()
-        elif self.rtsp_cam: 
+        elif self.rtsp_cam:
             self.update()
 
         cfg.CAMS = self.cams
 
-
-        
-        
     def get(self):
         with self._lock:
             return self.cams
-        
-    def update(self):
-        self.camera_calibration_paths = osp.join(osp.dirname(osp.abspath(__file__)), "..", "..", "camera_calibration_results.json")
-        with open(self.camera_calibration_paths, "r") as f:
-            all_results = json.load(f)
-        for camera_source in self.rtsp_cam:
-            # New edge-local registrations use a stable logical camera ID so
-            # calibration keys never contain a physical endpoint or password.
-            cam_id_str = str(camera_source['id'])
-            legacy_id = "".join(
-                c for c in str(camera_source['url']) if c.isalnum() or c in '_-'
-            )
-            result_key = cam_id_str if cam_id_str in all_results else legacy_id
-            if result_key not in all_results:
-                raise KeyError(f"카메라 ID '{cam_id_str}'에 대한 캘리브레이션 결과를 찾을 수 없습니다.")
-            
-            result = all_results[result_key]
-            R, _ = cv2.Rodrigues(np.array(result["rvec"]))
-            T = (
-                -np.dot(R.T, np.array(result["tvec"])) * 1000  # mm 단위 변환
-            )
-            cam = {
-                'id': camera_source['id'],
-                'R': R,
-                'T': T,
-                'fx': result["camera_matrix"][0][0],
-                'fy': result["camera_matrix"][1][1],
-                'cx': result["camera_matrix"][0][2],
-                'cy': result["camera_matrix"][1][2],
-                'k': np.array(result["dist_coeffs"])[[0, 1, 4]].reshape(3, 1),  # 왜곡 계수 k1, k2, k3
-                'p': np.array(result["dist_coeffs"])[[2, 3]].reshape(2, 1)  # 왜곡 계수 p1, p2
-            }
-            self.cams.append(cam)
-            print(f"카메라 ID '{cam_id_str}'에 대한 캘리브레이션 데이터 업데이트 완료.")
 
-            
-            
+    def update(self):
+        camera_ids = self.camera_ids or [camera["id"] for camera in self.rtsp_cam]
+        self.cams = select_edge_config_voxelpose_cameras(
+            self.rtsp_cam,
+            camera_ids,
+            world_origin_m=self.world_origin_m,
+        )
+
     def update_from_dataset(self):
         result_path = find_dataset_calibration(self.example_path)
         if result_path is not None:
@@ -119,7 +95,9 @@ class CalibrationData:
             return
 
         cams = []
-        calibration_paths = sorted(glob.glob(osp.join(self.example_path, 'calibration', '*.pkl')))
+        calibration_paths = sorted(
+            glob.glob(osp.join(self.example_path, "calibration", "*.pkl"))
+        )
         for path in calibration_paths:
             with open(path, "rb") as f:
                 calib = pickle.load(f)

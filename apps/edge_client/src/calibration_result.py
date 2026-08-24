@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 from typing import Any
 
 import yaml
@@ -144,3 +145,97 @@ def apply_calibration_result(
                 intrinsic["undistorted_camera_matrix"] = processed_matrix
     _atomic_write_yaml(path, document)
     return sorted(seen, key=int)
+
+
+def import_external_calibration_result(
+    config_path: str | Path,
+    result_path: str | Path,
+) -> list[str]:
+    """Import matching cameras from an existing calibration result into YAML."""
+    source_path = Path(result_path).expanduser().resolve()
+    result = json.loads(source_path.read_text(encoding="utf-8"))
+    if not isinstance(result, dict) or not isinstance(result.get("cameras"), list):
+        raise ValueError("calibration result must contain a cameras list")
+
+    result_by_id: dict[str, dict[str, Any]] = {}
+    for item in result["cameras"]:
+        if not isinstance(item, dict):
+            raise ValueError("calibration result camera must be an object")
+        raw_id = item.get("edge_camera_id") or item.get("camera_id")
+        camera_id = str(raw_id or "").rsplit("/", 1)[-1]
+        if not camera_id.isdigit() or int(camera_id) <= 0:
+            raise ValueError(f"invalid calibration camera_id: {raw_id}")
+        camera_id = str(int(camera_id))
+        if camera_id in result_by_id:
+            raise ValueError(f"duplicate calibration camera_id: {camera_id}")
+        result_by_id[camera_id] = item
+
+    path = Path(config_path).expanduser().resolve()
+    document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    cameras = document.get("CAMERAS")
+    if not isinstance(cameras, list) or not cameras:
+        raise ValueError("camera config CAMERAS must be a non-empty list")
+
+    imported: list[str] = []
+    calibrated_at = time.time()
+    input_data = result.get("input")
+    if not isinstance(input_data, dict):
+        input_data = {}
+    request_id = str(input_data.get("request_id") or f"import:{source_path.name}")
+    for camera in cameras:
+        if not isinstance(camera, dict):
+            raise ValueError("camera config entry must be an object")
+        camera_id = str(camera.get("id") or "")
+        if not camera_id.isdigit() or int(camera_id) <= 0:
+            raise ValueError(f"invalid local camera ID: {camera_id}")
+        camera_id = str(int(camera_id))
+        item = result_by_id.get(camera_id)
+        if item is None:
+            raise ValueError(f"calibration result is missing camera/{camera_id}")
+
+        intrinsic = camera.get("intrinsic")
+        if not isinstance(intrinsic, dict):
+            intrinsic = {}
+            camera["intrinsic"] = intrinsic
+        intrinsic["camera_matrix"] = _finite_matrix(
+            item.get("camera_matrix"), (3, 3), "camera_matrix"
+        )
+        distortion = item.get("distortion_coefficients")
+        if not isinstance(distortion, list) or len(distortion) not in {
+            4,
+            5,
+            8,
+            12,
+            14,
+        }:
+            raise ValueError("distortion_coefficients has an invalid length")
+        converted_distortion = [float(value) for value in distortion]
+        if not all(math.isfinite(value) for value in converted_distortion):
+            raise ValueError("distortion_coefficients must contain finite values")
+        intrinsic["distortion_coefficients"] = converted_distortion
+        if item.get("undistorted_camera_matrix") is not None:
+            intrinsic["undistorted_camera_matrix"] = _finite_matrix(
+                item["undistorted_camera_matrix"],
+                (3, 3),
+                "undistorted_camera_matrix",
+            )
+
+        camera["extrinsic"] = {
+            "schema_version": 1,
+            "request_id": request_id,
+            "calibrated_at": calibrated_at,
+            "marker_tree": str(result.get("marker_tree") or ""),
+            "coordinate_convention": result.get("coordinate_convention") or {},
+            "world_to_camera": _finite_matrix(
+                item.get("world_to_camera"), (4, 4), "world_to_camera"
+            ),
+            "camera_to_world": _finite_matrix(
+                item.get("camera_to_world"), (4, 4), "camera_to_world"
+            ),
+            "position_m": _finite_vector(item.get("position_m"), 3, "position_m"),
+            "alignment": result.get("alignment") or {},
+        }
+        imported.append(camera_id)
+
+    _atomic_write_yaml(path, document)
+    return sorted(imported, key=int)

@@ -136,6 +136,119 @@ The frontend interface is available at http://localhost:8211/streaming/webrtc-de
 6. "3D 트윈 뷰어" 탭 내부에 **Isaac Sim의 화면이 iframe(포트 8211)으로 스트리밍**되어 나타납니다.
 7. 웹 상에서 클릭 및 마우스 드래그를 하면 그 제어값이 백그라운드의 Isaac Sim 뷰포트에 전달됩니다.
 
+## 외부 인터넷에서 보기
+
+Isaac Sim 4.2.0 WebRTC는 웹 페이지만 열어 주는 구조가 아닙니다. 브라우저가
+아래 세 경로 모두에 도달해야 실제 영상이 나옵니다.
+
+| 포트 | 프로토콜 | 용도 |
+| --- | --- | --- |
+| `8211` | TCP | 내장 WebRTC 웹 클라이언트 |
+| `49100` | TCP | WebRTC 시그널링 |
+| `47998` | UDP | 영상/입력 미디어 |
+
+`frontend_api` 대시보드는 별도로 `8005/TCP`를 사용합니다. Isaac Sim 4.2의
+내장 스트리밍 엔드포인트에는 인증과 TLS가 없으므로, **권장 구성은 서버와
+외부 PC를 Tailscale/WireGuard 같은 mesh VPN에 넣는 것**입니다. 이 방식에서는
+공유기 포트포워딩 없이도 서버가 VPN 안의 LAN 서버처럼 보입니다.
+
+> Jetson/Orin 같은 `aarch64` 장비에서는 공식 Isaac Sim 4.2.0 데스크톱 앱을
+> 실행하는 구성을 전제로 하면 안 됩니다. 이 경우 `frontend_api`와 나머지
+> DT_SERVER 서비스는 현재 장비에 두고, Isaac Sim과 이 디렉터리의 실행 스크립트는
+> 별도 `x86_64 + RTX/NVENC` 호스트에서 실행합니다. 브라우저는 두 호스트 모두에
+> 도달해야 합니다.
+
+### 권장: mesh VPN 주소로 실행
+
+Isaac Sim 호스트의 VPN IPv4가 `100.80.10.20`, DT_SERVER 호스트의 VPN IPv4가
+`100.80.10.10`이라고 가정합니다. 두 역할이 같은 RTX 서버라면 같은 IP를
+사용하면 됩니다.
+
+Isaac Sim 호스트에서 저장소와 Isaac Sim 4.2.0을 준비한 후 실행합니다.
+
+```bash
+export ISAAC_SIM_DIR=/path/to/isaac-sim-standalone-4.2.0
+export ISAAC_PUBLIC_IP=100.80.10.20
+
+cd "$DT_SERVER_DIR"
+apps/isaac_sim_client/run_remote_webrtc.sh
+```
+
+DT_SERVER/Frontend API 호스트에서는 브라우저가 접속할 Isaac 주소와 상태 확인용
+내부 주소를 설정합니다.
+
+```bash
+export ISAAC_WEBRTC_PUBLIC_URL=http://100.80.10.20:8211
+export ISAAC_WEBRTC_SERVER=100.80.10.20
+export ISAAC_WEBRTC_INTERNAL_URL=http://100.80.10.20:8211
+
+cd "$DT_SERVER_DIR"
+docker compose up -d --build frontend_api
+```
+
+같은 VPN에 로그인한 외부 PC의 Chrome/Chromium에서 다음 주소를 엽니다.
+
+```text
+http://100.80.10.10:8005/
+```
+
+대시보드가 아니라 Isaac Sim 화면만 바로 보려면 다음 주소를 엽니다.
+
+```text
+http://100.80.10.20:8211/streaming/webrtc-demo/?server=100.80.10.20
+```
+
+### 공인 IP/포트포워딩으로 직접 연결
+
+VPN을 사용할 수 없을 때만 공유기 또는 클라우드 보안 그룹에서 `8211/TCP`,
+`49100/TCP`, `47998/UDP`를 서버로 전달합니다. 대시보드까지 열려면
+`8005/TCP`도 추가합니다. 가능한 경우 소스 CIDR을 접속할 외부 PC의 공인
+IP(`/32`)로 제한하십시오.
+
+```bash
+# 예시는 문서용 TEST-NET 주소입니다. 실제 서버 공인 IPv4로 바꾸십시오.
+export ISAAC_PUBLIC_IP=203.0.113.10
+export ISAAC_WEBRTC_PUBLIC_URL=http://203.0.113.10:8211
+export ISAAC_WEBRTC_SERVER=203.0.113.10
+
+docker compose up -d --build frontend_api
+apps/isaac_sim_client/run_remote_webrtc.sh
+```
+
+`run_remote_webrtc.sh`는 4.2.0의 legacy Kit 설정에 공인/VPN 주소, 고정 시그널링
+포트, 고정 UDP 미디어 포트를 넘긴 뒤 기존 `meta_sejong_script.py`를 실행합니다.
+추가 Isaac Sim 인자는 명령 마지막에 그대로 붙일 수 있습니다.
+
+```bash
+apps/isaac_sim_client/run_remote_webrtc.sh --/app/window/width=1920 --/app/window/height=1080
+```
+
+### HTTPS와 터널 사용 시 주의
+
+Cloudflare Tunnel 같은 HTTP 터널 하나로 `frontend_api:8005`만 공개하면
+대시보드 자체는 보이지만 Isaac Sim 영상은 나오지 않습니다. 4.2.0 WebRTC는
+별도의 TCP 시그널링과 UDP 미디어 연결이 필요하기 때문입니다. 또한 HTTPS
+대시보드 안의 HTTP iframe은 브라우저의 mixed-content 정책으로 차단됩니다.
+이 경우 대시보드의 **새 창에서 열기**를 사용하더라도 위 WebRTC 포트의 직접
+도달성은 필요합니다. 한 개의 HTTPS/TCP 터널만 허용되는 환경에서는 WebRTC
+대신 noVNC 또는 HLS 같은 별도 TCP 기반 화면 중계 계층을 구성해야 합니다.
+
+### 확인 순서
+
+서버에서:
+
+```bash
+ss -lnt | grep -E ':(8005|8211|49100) '
+ss -lnu | grep ':47998 '
+curl --fail http://127.0.0.1:8211/streaming/webrtc-demo/
+curl --fail http://127.0.0.1:8005/api/v1/viewer/status
+```
+
+외부 PC에서 먼저 `http://<접속주소>:8211/...`를 직접 열어 영상이 나오는지
+확인한 뒤 대시보드 iframe을 확인합니다. 웹 페이지는 열리지만 영상이 검다면
+대부분 `49100/TCP`, `47998/UDP`, 또는 `ISAAC_PUBLIC_IP` 광고 주소 문제입니다.
+Firefox보다 Chrome/Chromium을 사용하십시오.
+
 ## Transport 선택
 
 ```bash

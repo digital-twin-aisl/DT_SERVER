@@ -262,6 +262,8 @@ def get_parser():
     )
     parser.add_argument(
         "--scene-zenoh-endpoint",
+        "--scene-zenoh",
+        dest="scene_zenoh_endpoint",
         default=None,
         help="Scene publisher endpoint; defaults to --zenoh-endpoint",
     )
