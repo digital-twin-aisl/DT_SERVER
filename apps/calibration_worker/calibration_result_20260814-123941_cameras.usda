@@ -1,0 +1,351 @@
+#usda 1.0
+(
+    defaultPrim = "CalibrationVisualization"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "CalibrationVisualization" (
+    customData = {
+        dictionary calibration = {
+            double frustumDepthM = 2
+            string sourceResult = "/home/dojan/DT_SERVER/apps/calibration_worker/calibration_result_20260814-123941.json"
+        }
+    }
+)
+{
+    def Xform "MarkerTree" (
+        prepend references = @../isaac_sim_client/aruco_boards/aruco_marker_tree.usd@
+    )
+    {
+    }
+
+    def Xform "Cameras"
+    {
+        def Xform "camera_1" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/1"
+                    int[] imageSize = [1920, 1080]
+                    double[] positionM = [95.1463620791792, 11.902003414315796, 17.93938459641992]
+                }
+            }
+        )
+        {
+            def BasisCurves "Frustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(95.14636, 11.902003, 17.939384), (93.75365, 9.343175, 17.80192), (95.14636, 11.902003, 17.939384), (92.43825, 12.629226, 17.687727), (95.14636, 11.902003, 17.939384), (93.44928, 12.975565, 16.007874), (95.14636, 11.902003, 17.939384), (94.76469, 9.689514, 16.122066), (93.75365, 9.343175, 17.80192), (92.43825, 12.629226, 17.687727), (93.44928, 12.975565, 16.007874), (94.76469, 9.689514, 16.122066), (93.75365, 9.343175, 17.80192), (95.14636, 11.902003, 17.939384), (93.35861, 11.143542, 16.707037)]
+                color3f[] primvars:displayColor = [(0.16, 0.62, 1)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(0.16, 0.62, 1)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.07875000000000001
+                double3 xformOp:translate = (95.1463620791792, 11.902003414315796, 17.93938459641992)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_2" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/2"
+                    int[] imageSize = [1920, 1080]
+                    double[] positionM = [87.96380999510313, 4.572397051814354, 18.331585308263065]
+                }
+            }
+        )
+        {
+            def BasisCurves "Frustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(87.96381, 4.572397, 18.331585), (85.577934, 2.9496531, 17.922436), (87.96381, 4.572397, 18.331585), (85.91569, 6.545139, 18.074581), (87.96381, 4.572397, 18.331585), (87.1018, 6.5035458, 16.4244), (87.96381, 4.572397, 18.331585), (86.76404, 2.9080603, 16.272253), (85.577934, 2.9496531, 17.922436), (85.91569, 6.545139, 18.074581), (87.1018, 6.5035458, 16.4244), (86.76404, 2.9080603, 16.272253), (85.577934, 2.9496531, 17.922436), (87.96381, 4.572397, 18.331585), (86.1084, 4.803372, 16.992142)]
+                color3f[] primvars:displayColor = [(1, 0.46, 0.22)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(1, 0.46, 0.22)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.07875000000000001
+                double3 xformOp:translate = (87.96380999510313, 4.572397051814354, 18.331585308263065)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_3" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/3"
+                    int[] imageSize = [1920, 1080]
+                    double[] positionM = [85.04657439657854, 0.8953949518379465, 18.654805588769435]
+                }
+            }
+        )
+        {
+            def BasisCurves "Frustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(85.04658, 0.895395, 18.654806), (83.26121, 2.9700155, 17.71981), (85.04658, 0.895395, 18.654806), (86.87366, 3.094852, 18.089258), (85.04658, 0.895395, 18.654806), (87.066246, 1.5923123, 16.713808), (85.04658, 0.895395, 18.654806), (83.453804, 1.4674758, 16.344358), (83.26121, 2.9700155, 17.71981), (86.87366, 3.094852, 18.089258), (87.066246, 1.5923123, 16.713808), (83.453804, 1.4674758, 16.344358), (83.26121, 2.9700155, 17.71981), (85.04658, 0.895395, 18.654806), (85.16519, 2.454597, 16.968145)]
+                color3f[] primvars:displayColor = [(0.35, 0.8, 0.42)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(0.35, 0.8, 0.42)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.07875000000000001
+                double3 xformOp:translate = (85.04657439657854, 0.8953949518379465, 18.654805588769435)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_4" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/4"
+                    int[] imageSize = [1920, 1080]
+                    double[] positionM = [76.69943890692215, -7.423195771438736, 18.72447133657255]
+                }
+            }
+        )
+        {
+            def BasisCurves "Frustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(76.69944, -7.423196, 18.724472), (75.63546, -4.8472342, 18.209024), (76.69944, -7.423196, 18.724472), (79.024826, -5.841279, 18.424046), (76.69944, -7.423196, 18.724472), (78.79082, -6.9874644, 16.81385), (76.69944, -7.423196, 18.724472), (75.40146, -5.9934196, 16.59883), (75.63546, -4.8472342, 18.209024), (79.024826, -5.841279, 18.424046), (78.79082, -6.9874644, 16.81385), (75.40146, -5.9934196, 16.59883), (75.63546, -4.8472342, 18.209024), (76.69944, -7.423196, 18.724472), (77.30263, -5.657371, 17.379843)]
+                color3f[] primvars:displayColor = [(0.75, 0.42, 1)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(0.75, 0.42, 1)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.07875000000000001
+                double3 xformOp:translate = (76.69943890692215, -7.423195771438736, 18.72447133657255)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_5" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/5"
+                    int[] imageSize = [1920, 1080]
+                    double[] positionM = [90.32172238242572, 15.938798427371779, 17.80443462412862]
+                }
+            }
+        )
+        {
+            def BasisCurves "Frustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(90.321724, 15.938798, 17.804434), (91.7509, 13.519613, 17.367899), (90.321724, 15.938798, 17.804434), (88.287224, 14.057747, 17.442616), (90.321724, 15.938798, 17.804434), (88.428734, 15.191305, 15.8381405), (90.321724, 15.938798, 17.804434), (91.89241, 14.653172, 15.763424), (91.7509, 13.519613, 17.367899), (88.287224, 14.057747, 17.442616), (88.428734, 15.191305, 15.8381405), (91.89241, 14.653172, 15.763424), (91.7509, 13.519613, 17.367899), (90.321724, 15.938798, 17.804434), (90.005936, 14.091325, 16.471348)]
+                color3f[] primvars:displayColor = [(1, 0.78, 0.2)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(1, 0.78, 0.2)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.07875000000000001
+                double3 xformOp:translate = (90.32172238242572, 15.938798427371779, 17.80443462412862)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_6" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/6"
+                    int[] imageSize = [1672, 941]
+                    double[] positionM = [82.65864132105217, 7.999023415358104, 18.619125319485114]
+                }
+            }
+        )
+        {
+            def BasisCurves "Frustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(82.65864, 7.9990234, 18.619125), (83.82077, 5.4314337, 18.125074), (82.65864, 7.9990234, 18.619125), (80.41651, 6.3150973, 18.333858), (82.65864, 7.9990234, 18.619125), (80.61851, 7.4707413, 16.736223), (82.65864, 7.9990234, 18.619125), (84.022766, 6.5870776, 16.52744), (83.82077, 5.4314337, 18.125074), (80.41651, 6.3150973, 18.333858), (80.61851, 7.4707413, 16.736223), (84.022766, 6.5870776, 16.52744), (83.82077, 5.4314337, 18.125074), (82.65864, 7.9990234, 18.619125), (82.11421, 6.2216687, 17.264648)]
+                color3f[] primvars:displayColor = [(0.12, 0.82, 0.78)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(0.12, 0.82, 0.78)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.07875000000000001
+                double3 xformOp:translate = (82.65864132105217, 7.999023415358104, 18.619125319485114)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_7" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/7"
+                    int[] imageSize = [1920, 1080]
+                    double[] positionM = [80.15553943366142, 5.214113088055539, 18.294534321259345]
+                }
+            }
+        )
+        {
+            def BasisCurves "Frustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(80.15554, 5.214113, 18.294535), (81.985596, 7.44794, 17.893932), (80.15554, 5.214113, 18.294535), (82.6461, 3.9437177, 17.750088), (80.15554, 5.214113, 18.294535), (81.36763, 3.7657638, 16.21477), (80.15554, 5.214113, 18.294535), (80.70712, 7.269986, 16.358616), (81.985596, 7.44794, 17.893932), (82.6461, 3.9437177, 17.750088), (81.36763, 3.7657638, 16.21477), (80.70712, 7.269986, 16.358616), (81.985596, 7.44794, 17.893932), (80.15554, 5.214113, 18.294535), (81.87592, 5.599024, 16.817337)]
+                color3f[] primvars:displayColor = [(1, 0.38, 0.62)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(1, 0.38, 0.62)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.07875000000000001
+                double3 xformOp:translate = (80.15553943366142, 5.214113088055539, 18.294534321259345)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_8" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/8"
+                    int[] imageSize = [1920, 1080]
+                    double[] positionM = [72.0069480262324, -2.781099359561564, 18.414605928306088]
+                }
+            }
+        )
+        {
+            def BasisCurves "Frustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(72.00695, -2.7810993, 18.414606), (74.243546, -1.1008728, 17.801407), (72.00695, -2.7810993, 18.414606), (74.129875, -4.6793494, 18.00484), (72.00695, -2.7810993, 18.414606), (72.83007, -4.7256083, 16.464838), (72.00695, -2.7810993, 18.414606), (72.94374, -1.1471316, 16.261404), (74.243546, -1.1008728, 17.801407), (74.129875, -4.6793494, 18.00484), (72.83007, -4.7256083, 16.464838), (72.94374, -1.1471316, 16.261404), (74.243546, -1.1008728, 17.801407), (72.00695, -2.7810993, 18.414606), (73.7634, -2.9209325, 16.936317)]
+                color3f[] primvars:displayColor = [(0.62, 0.72, 0.18)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(0.62, 0.72, 0.18)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.07875000000000001
+                double3 xformOp:translate = (72.0069480262324, -2.781099359561564, 18.414605928306088)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+    }
+
+    def "WorldAxes"
+    {
+        def BasisCurves "X"
+        {
+            int[] curveVertexCounts = [2]
+            point3f[] points = [(0, 0, 0), (2, 0, 0)]
+            color3f[] primvars:displayColor = [(1, 0.1, 0.1)] (
+                interpolation = "constant"
+            )
+            uniform token type = "linear"
+            float[] widths = [0.035] (
+                interpolation = "constant"
+            )
+            uniform token wrap = "nonperiodic"
+        }
+
+        def BasisCurves "Y"
+        {
+            int[] curveVertexCounts = [2]
+            point3f[] points = [(0, 0, 0), (0, 2, 0)]
+            color3f[] primvars:displayColor = [(0.1, 1, 0.1)] (
+                interpolation = "constant"
+            )
+            uniform token type = "linear"
+            float[] widths = [0.035] (
+                interpolation = "constant"
+            )
+            uniform token wrap = "nonperiodic"
+        }
+
+        def BasisCurves "Z"
+        {
+            int[] curveVertexCounts = [2]
+            point3f[] points = [(0, 0, 0), (0, 0, 2)]
+            color3f[] primvars:displayColor = [(0.1, 0.3, 1)] (
+                interpolation = "constant"
+            )
+            uniform token type = "linear"
+            float[] widths = [0.035] (
+                interpolation = "constant"
+            )
+            uniform token wrap = "nonperiodic"
+        }
+    }
+}
+

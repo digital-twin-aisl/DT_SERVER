@@ -1,3 +1,6 @@
 [submodule "apps/calibration_worker/vggt-omega"]
 	path = apps/calibration_worker/vggt-omega
 	url = https://github.com/facebookresearch/vggt-omega.git
+[submodule "apps/edge_client/src/reid/fast-reid"]
+	path = apps/edge_client/src/reid/fast-reid
+	url = https://github.com/JDAI-CV/fast-reid.git

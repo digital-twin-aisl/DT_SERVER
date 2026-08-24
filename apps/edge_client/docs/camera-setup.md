@@ -29,6 +29,24 @@ python apps/edge_client/camera_setup.py show
 python apps/edge_client/camera_setup.py capture
 ```
 
+연결 가능한 카메라를 모두 녹화하려면 `record`를 사용합니다. 등록 목록을 출력한 뒤
+각 카메라의 연결을 확인하여 연결 가능한 목록만 다시 보여주며, 사용자 확인 후 녹화를
+시작합니다. 관제 창에는 카메라 화면이 행렬로 배치되고 카메라 번호와 녹화 시간이
+표시됩니다. `q`, `Esc` 또는 `Ctrl+C`로 종료합니다.
+
+```bash
+python apps/edge_client/camera_setup.py record
+```
+
+원본 RTSP 비디오 패킷은 재인코딩하지 않고 카메라별 MKV 파일로 저장되며, 기본 저장
+위치는 `apps/edge_client/data/recordings/<시작시각>/`입니다. 관제 화면만 기본 640x360,
+5 FPS로 디코딩하므로 Jetson 부하를 낮춥니다. 필요하면 더 낮출 수 있습니다.
+
+```bash
+python apps/edge_client/camera_setup.py record \
+  --preview-width 480 --preview-height 270 --preview-fps 3
+```
+
 `config/edge.local.json`에 유효한 `edge_id`가 있어야 합니다. 파일 또는 `edge_id`가
 없다면 먼저 다음을 실행해야 합니다.
 
@@ -46,5 +64,42 @@ python apps/edge_client/agent.py init
 ```text
 apps/edge_client/config/cameras.local.yaml
 ```
+
+실시간 추론에서는 identity의 `camera_config`와 `camera_ids`를 사용합니다. 상대
+`camera_config` 경로는 identity 파일 위치를 기준으로 해석하며, `camera_ids`는
+deployment에 지정된 순서와 정확히 일치해야 합니다. 예를 들어 `edge_1`은 다음과
+같이 실행합니다.
+
+```bash
+python apps/edge_client/inference.py \
+  --edge-id-file apps/edge_client/config/edge_1.dataset.json \
+  --deployment apps/deployments/scene_0812_2.json \
+  --tensorrt
+```
+
+기본 RTSP 전송은 TCP입니다. 시작할 때 모든 카메라의 첫 프레임과 보정 해상도를
+검증하고, 실행 중 연결이 끊기면 자동으로 다시 연결합니다. 끊어진 카메라의 마지막
+프레임을 계속 추론에 넣지는 않습니다. 필요할 때만 `--rtsp-transport udp`,
+`--rtsp-open-timeout-ms`, `--rtsp-read-timeout-ms`, `--rtsp-max-frame-age`,
+`--rtsp-max-skew`로 동작을 조정할 수 있습니다. 다른 로컬 설정을 쓰려면
+`--camera-config`가 identity 값보다 우선합니다.
+
+Intrinsic을 나중에 입력하거나 체커보드로 측정하려면 다음 명령을 사용합니다.
+
+```bash
+python apps/edge_client/camera_setup.py intrinsic
+```
+
+직접 입력 시 `fx fy cx cy`, OpenCV 순서의 distortion coefficients, 보정 영상 크기를
+저장합니다. 체커보드 측정은 내부 코너 수, 한 칸 크기와 촬영 장수를 입력받습니다.
+분산 캘리브레이션이 완료되면 같은 카메라 항목의 `extrinsic`에 USD 좌표계 pose가
+저장됩니다.
+
+카메라를 새로 등록하거나 intrinsic을 변경하면 현재 등록 목록을
+`dt/edges/{edge_id}/cameras` 토픽으로 즉시 동기화합니다. 서버로 보내는 값은
+카메라 번호, 등록 존재 여부, 엣지에서 카메라 RTSP 포트까지의 ping 결과와
+intrinsic/extrinsic/distortion calibration뿐입니다. RTSP URL과 인증정보, 이름,
+위치, Twin ID는 로컬 설정을 벗어나지 않습니다. 서버 주소는 edge identity에
+저장된 값을 사용하며 필요하면 `--endpoint SERVER_IP:7447`로 덮어쓸 수 있습니다.
 
 이 파일은 Git에서 제외되고 `0600` 권한으로 생성되지만 암호화되지는 않습니다.

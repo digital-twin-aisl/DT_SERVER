@@ -14,11 +14,12 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 import torch
 
-
 SERVER_WORKER_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SERVER_WORKER_DIR.parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import apps  # noqa: E402,F401
+from dt_common.spatial.workspace import build_edge_workspace, load_spatial_context
 from apps.server_worker.config.config import config as focus_config
 from apps.server_worker.config.config import update_config as update_focus_config
 from apps.server_worker.priority_engine import PriorityConfig, PriorityEngine
@@ -38,6 +39,7 @@ from apps.server_worker.src.protocol.zenoh import ZenohDataLoader
 from apps.server_worker.src.protocol.zmq import Protocol
 from apps.server_worker.src.reid.sliding_clustering import ClusteringSliding
 from apps.server_worker.src.utils.edgemetadata import EdgeMetadataLoader
+from apps.server_worker.src.utils.edgemetadata import DEFAULT_METADATA_PATH
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,11 @@ LodLevel = Literal[0, 1, 2]
 LodAssignments = dict[int, LodLevel]
 LodAssignCallback = Callable[[list[int]], LodAssignments]
 OUTPUT_SCHEMA_VERSION = 1
+OUTPUT_COORDINATE_SYSTEM = {
+    "frame": "USD world",
+    "up_axis": "Z",
+    "unit": "millimetre",
+}
 DEFAULT_MAX_OUTPUT_PEOPLE = 10
 DEFAULT_LOD2_PEOPLE = 1
 MAX_ROOT_REPROJECTION_ERROR_PX = 250.0
@@ -90,7 +97,7 @@ class RootCandidate:
 
 @dataclass(frozen=True, slots=True)
 class RootOutput:
-    """선택된 Edge 좌표계에서 표현한 사람 root."""
+    """USD world 좌표계의 millimetre 단위 사람 root."""
 
     edge_id: str
     candidate_index: int
@@ -110,7 +117,7 @@ class RootOutput:
 
 @dataclass(frozen=True, slots=True)
 class PoseOutput:
-    """선택된 root와 동일한 Edge 좌표계의 3D joint 좌표."""
+    """root와 동일한 USD world millimetre 단위 3D joint 좌표."""
 
     joint_format: str
     joints: list[list[float]]
@@ -151,6 +158,7 @@ class SceneOutput:
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": OUTPUT_SCHEMA_VERSION,
+            "coordinate_system": OUTPUT_COORDINATE_SYSTEM,
             "timestamp": self.timestamp,
             "sync_spread_seconds": self.sync_spread_seconds,
             "people": [person.to_dict() for person in self.people],
@@ -204,6 +212,19 @@ def get_parser():
         type=str,
         default=None,
         help="Path to the Zenoh configuration file",
+    )
+    parser.add_argument(
+        "--deployment",
+        "--edge-metadata",
+        dest="deployment",
+        default=str(DEFAULT_METADATA_PATH),
+        help="Shared scene, calibration, edge assignment, and workspace manifest",
+    )
+    parser.add_argument(
+        "--edge-id",
+        dest="edge_ids",
+        action="append",
+        help="Edge ID to consume; repeat it to override the enabled metadata edges",
     )
     parser.add_argument("--buffer-size", type=int, default=10)
     parser.add_argument("--sync-tolerance", type=float, default=0.03)
@@ -828,6 +849,9 @@ def main() -> None:
         else resolve_server_worker_path(focus_config.POSENET.CONFIG)
     )
     update_sp3d_config(str(pose_config_path))
+    edge_metadata_path = Path(args.deployment).expanduser().resolve()
+    spatial_context = load_spatial_context(edge_metadata_path)
+    sp3d_config.SPATIAL_CONTEXT = spatial_context
     logger.info("Pose config is ready: %s", pose_config_path)
 
     device = setup_cuda()
@@ -847,19 +871,38 @@ def main() -> None:
         zmq_port,
     )
 
-    # EDGE 설정 부분
-    """
-    현재 서버의 Zenohd와 연결된 EDGE가 몇 개인지 봐야하는데, 아마 inference는 그냥 돌아가면서 들어오고 나가는거 자연스럽게 처리할 수 있게 하는게 좋을듯
-    1. 연결된 EDGE가 무엇인지
-    2. 연결된 EDGE에서 오는 카메라들의 캘리브레이션 정보가 어떻게 되는지
-    일단 하드코딩
-    """
-
-    edge_ids_list = ["0_edge"]
-    logger.info("[2/8] Loading Edge metadata: edge_ids=%s", edge_ids_list)
-    edge_metadata = EdgeMetadataLoader(sp3d_config, edge_ids_list)
+    logger.info(
+        "[2/8] Loading Edge metadata: path=%s edge_ids=%s",
+        edge_metadata_path,
+        args.edge_ids or "all enabled",
+    )
+    edge_metadata = EdgeMetadataLoader(
+        sp3d_config,
+        args.edge_ids,
+        edge_metadata_path,
+    )
     edge_ids = edge_metadata.edge_ids
     logger.info("Edge metadata is ready: topics=%s", edge_metadata.topics)
+    expected_workspace_ids = None
+    if spatial_context is not None:
+        expected_workspace_ids = {}
+        for edge_id in edge_ids:
+            workspace = build_edge_workspace(
+                spatial_context,
+                edge_id,
+                edge_metadata[edge_id].cams,
+                sp3d_config.NETWORK.IMAGE_SIZE_ORIG,
+                sp3d_config.MULTI_PERSON.SPACE_SIZE,
+                sp3d_config.MULTI_PERSON.INITIAL_CUBE_SIZE,
+            )
+            expected_workspace_ids[edge_id] = workspace.workspace_id
+            logger.info(
+                "Workspace contract is ready: edge=%s source=%s cube=%s id=%s",
+                edge_id,
+                workspace.source,
+                workspace.cube_size.tolist(),
+                workspace.workspace_id[:12],
+            )
     # Re-ID model
     """
     먼저 Re-ID를 수행해서 global-id를 구하고
@@ -904,6 +947,14 @@ def main() -> None:
         edge_ids=edge_ids,
         device=device,
         topics=edge_metadata.topics,
+        expected_camera_ids={
+            edge_id: [int(camera["id"]) for camera in edge_metadata[edge_id].cams]
+            for edge_id in edge_ids
+        },
+        expected_spatial_context=(
+            spatial_context.identity() if spatial_context is not None else None
+        ),
+        expected_workspace_ids=expected_workspace_ids,
         endpoint=args.zenoh_endpoint,
         config_path=args.zenoh_config,
         buffer_size=args.buffer_size,

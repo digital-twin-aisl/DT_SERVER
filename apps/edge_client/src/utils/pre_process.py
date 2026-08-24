@@ -89,7 +89,7 @@ class PREPROCESS:
 
     @property
     def transform(self):
-        return None
+        return self.aff_transform
 
     @property
     def aff_transform_matrix(self):

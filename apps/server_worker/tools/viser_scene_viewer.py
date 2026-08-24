@@ -20,12 +20,7 @@ VISER_PORT = 8080
 PLAYBACK_FPS = 10.0
 LOOP_PLAYBACK = True
 
-# Each edge uses its own coordinate system. These offsets only separate them
-# visually; they do not transform inference results into a global frame.
-EDGE_OFFSETS_METERS = {
-    "0_edge": np.array([0.0, 0.0, 0.0], dtype=np.float32),
-    "1_edge": np.array([5.0, 0.0, 0.0], dtype=np.float32),
-}
+USD_WORLD_OFFSET_METERS = np.zeros(3, dtype=np.float32)
 
 LIMBS_15 = np.array(
     [
@@ -61,13 +56,9 @@ ID_COLORS = (
 )
 
 
-def edge_offset(edge_id: str) -> np.ndarray:
-    if edge_id not in EDGE_OFFSETS_METERS:
-        EDGE_OFFSETS_METERS[edge_id] = np.array(
-            [5.0 * len(EDGE_OFFSETS_METERS), 0.0, 0.0],
-            dtype=np.float32,
-        )
-    return EDGE_OFFSETS_METERS[edge_id]
+def edge_offset(_edge_id: str) -> np.ndarray:
+    """Both distributed edges already publish one shared USD world frame."""
+    return USD_WORLD_OFFSET_METERS
 
 
 def draw_scene(server, scene: dict, old_handles: list) -> list:

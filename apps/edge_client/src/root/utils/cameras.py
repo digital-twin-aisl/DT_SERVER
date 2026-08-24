@@ -7,7 +7,6 @@ Copyright (c) University of Strasbourg, All Rights Reserved.
 
 from __future__ import division
 import torch
-import numpy as np
 
 
 def unfold_camera_param(camera, device=None):
@@ -129,8 +128,8 @@ def world_to_camera_frame(x, R, T):
         xcam: Nx3 3d points in camera coordinates
     """
 
-    R = torch.as_tensor(R, device=x.device)
-    T = torch.as_tensor(T, device=x.device)
+    R = torch.as_tensor(R, device=x.device, dtype=x.dtype)
+    T = torch.as_tensor(T, device=x.device, dtype=x.dtype)
     xcam = torch.mm(R, torch.t(x) - T)
     return torch.t(xcam)
 

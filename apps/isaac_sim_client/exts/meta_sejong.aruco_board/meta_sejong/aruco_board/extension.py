@@ -9,6 +9,7 @@ import omni.usd
 from pxr import Gf, Sdf, Usd, UsdGeom
 
 from .generator import (
+    DICTIONARY_LABELS,
     DICTIONARY_NAMES,
     append_marker_to_tree_usd,
     delete_marker_from_tree_usd,
@@ -46,7 +47,7 @@ class ArucoBoardExtension(omni.ext.IExt):
                 ui.Label("Add ArUco marker boards to one reusable USD tree", height=24)
                 with ui.HStack(height=28):
                     ui.Label("Dictionary", width=150)
-                    self._dictionary_combo = ui.ComboBox(0, *DICTIONARY_NAMES)
+                    self._dictionary_combo = ui.ComboBox(0, *DICTIONARY_LABELS)
                 with ui.HStack(height=28):
                     ui.Label("Marker ID", width=150)
                     ui.IntField(model=self._marker_id_model)

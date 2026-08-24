@@ -17,25 +17,20 @@ from . import pose_resnet
 from .cuboid_proposal_net_soft import CuboidProposalNetSoft
 from .pose_regression_net import PoseRegressionNet
 
-from torch.utils.flop_counter import FlopCounterMode
-
-def get_flops(model, inp):
-    flop_counter = FlopCounterMode(mods=model, display=False, depth=None)
-    with flop_counter:
-        model(inp)
-    return flop_counter.get_total_flops()
-
 class MultiPersonPoseNetSSV(nn.Module):
-    def __init__(self, backbone, cfg, inference_mode="posenet"):
+    def __init__(self, backbone, cfg, inference_mode="rootnet"):
         super(MultiPersonPoseNetSSV, self).__init__()
+        self.inference_mode = inference_mode
         self.backbone = backbone
         self.root_net = CuboidProposalNetSoft(cfg)
-        self.pose_net = PoseRegressionNet(cfg)
+        # Edge inference stops at root proposals.  Keep the pose regression
+        # network entirely off the edge GPU; the server owns that stage.
+        self.pose_net = (
+            None if inference_mode == "rootnet" else PoseRegressionNet(cfg)
+        )
         self.num_joints = cfg.NETWORK.NUM_JOINTS
         self.num_cand = cfg.MULTI_PERSON.MAX_PEOPLE_NUM
         self.num_views = cfg.NUM_VIEWS
-
-        self.inference_mode = inference_mode
 
     def _cal_root_distance(self, root, distance):
         if distance is None or distance == 0:
@@ -49,10 +44,15 @@ class MultiPersonPoseNetSSV(nn.Module):
         grid_centers=None,
     ):
         if views is not None:
-            all_heatmaps = []
-            for view in views:
-                heatmaps = self.backbone(view)
-                all_heatmaps.append(heatmaps)
+            # Every edge frame contains one tensor per camera.  Running the
+            # backbone once per view leaves the GPU idle between four small
+            # TensorRT enqueues.  Concatenate the camera dimension, execute a
+            # single larger batch, then restore the model's view-list API.
+            view_batch_sizes = [view.shape[0] for view in views]
+            batched_heatmaps = self.backbone(torch.cat(views, dim=0))
+            all_heatmaps = list(
+                batched_heatmaps.split(view_batch_sizes, dim=0)
+            )
         else:
             all_heatmaps = input_heatmaps
 

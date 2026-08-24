@@ -15,6 +15,7 @@ from .protocol import (
     DEFAULT_TOPIC_ROOT,
     SCHEMA_VERSION,
     EdgeTopics,
+    camera_records_from_message,
     decode_json,
     encode_json,
     make_zenoh_config,
@@ -37,6 +38,18 @@ def _print_record(record: dict[str, Any]) -> None:
         f"{record['edge_id']:<24} {state:<7} approved={approved:<3} "
         f"host={status.get('hostname', '-')}",
     )
+
+
+def _heartbeat_command(edge_id: str) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "command",
+        "edge_id": edge_id,
+        "command_id": uuid4().hex,
+        "command": "ping",
+        "sent_at": time.time(),
+        "parameters": {"reason": "manager_heartbeat", "request_cameras": True},
+    }
 
 
 def serve(args: argparse.Namespace, registry: EdgeRegistry) -> None:
@@ -83,22 +96,61 @@ def serve(args: argparse.Namespace, registry: EdgeRegistry) -> None:
         except Exception as exc:
             print(f"Invalid ACK message: {exc}", file=sys.stderr, flush=True)
 
+    def on_cameras(sample: Any) -> None:
+        try:
+            message = decode_json(sample.payload)
+            edge_id = validate_edge_id(str(message["edge_id"]))
+            expected_topic = EdgeTopics(edge_id, args.topic_root).cameras
+            if str(sample.key_expr) != expected_topic:
+                raise ValueError("camera topic and edge_id do not match")
+            cameras = camera_records_from_message(message)
+            created, came_online, _ = registry.observe_cameras(
+                edge_id,
+                cameras,
+                edge_sent_at=message.get("sent_at"),
+            )
+            if created:
+                print(
+                    f"Discovered pending edge from camera status: {edge_id}", flush=True
+                )
+            elif came_online:
+                print(f"Edge is online from camera status: {edge_id}", flush=True)
+            print(
+                f"Cameras updated: edge={edge_id} count={len(cameras)}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"Invalid camera status: {exc}", file=sys.stderr, flush=True)
+
     registry.mark_all_offline()
     config = make_zenoh_config(args.endpoint, args.zenoh_config)
     status_selector = f"{args.topic_root.strip('/')}/*/status"
     ack_selector = f"{args.topic_root.strip('/')}/*/ack"
+    camera_selector = f"{args.topic_root.strip('/')}/*/cameras"
     with zenoh.open(config) as session:
         status_subscriber = session.declare_subscriber(status_selector, on_status)
         ack_subscriber = session.declare_subscriber(ack_selector, on_ack)
+        camera_subscriber = session.declare_subscriber(camera_selector, on_cameras)
         print(
             f"Edge manager started: status={status_selector} "
             f"registry={registry.path}",
             flush=True,
         )
+        last_heartbeat = 0.0
         while not stop_event.wait(1.0):
+            now = time.monotonic()
+            if now - last_heartbeat >= args.heartbeat_interval:
+                for edge_id, record in registry.snapshot()["edges"].items():
+                    if not record.get("online"):
+                        continue
+                    session.put(
+                        EdgeTopics(edge_id, args.topic_root).command,
+                        encode_json(_heartbeat_command(edge_id)),
+                    )
+                last_heartbeat = now
             for edge_id in registry.mark_offline(args.offline_after):
                 print(f"Edge is offline: {edge_id}", flush=True)
-        _ = status_subscriber, ack_subscriber
+        _ = status_subscriber, ack_subscriber, camera_subscriber
 
 
 def list_edges(args: argparse.Namespace, registry: EdgeRegistry) -> None:
@@ -132,11 +184,7 @@ def approve_edge(args: argparse.Namespace, registry: EdgeRegistry) -> None:
         raise SystemExit(f"unknown edge: {edge_id}")
 
     status = record.get("last_status") or {}
-    edge_endpoint = (
-        args.edge_endpoint
-        or status.get("zenoh_endpoint")
-        or args.endpoint
-    )
+    edge_endpoint = args.edge_endpoint or status.get("zenoh_endpoint") or args.endpoint
     if not edge_endpoint:
         raise SystemExit(
             "edge endpoint is unknown; pass --edge-endpoint or start the edge "
@@ -163,6 +211,8 @@ def approve_edge(args: argparse.Namespace, registry: EdgeRegistry) -> None:
                 "command": topics.command,
                 "config": topics.config,
                 "ack": topics.ack,
+                "cameras": topics.cameras,
+                "calibration": topics.calibration,
             },
         },
     }
@@ -269,6 +319,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve_parser = subparsers.add_parser("serve")
     serve_parser.add_argument("--offline-after", type=float, default=15.0)
+    serve_parser.add_argument("--heartbeat-interval", type=float, default=5.0)
 
     list_parser = subparsers.add_parser("list")
     list_parser.add_argument("--json", action="store_true")
@@ -288,6 +339,7 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("command", choices=("ping", "info", "shutdown"))
     command.add_argument("--parameters", default="{}")
     command.add_argument("--timeout", type=float, default=5.0)
+
     return parser
 
 
@@ -298,6 +350,8 @@ def main() -> None:
         if args.subcommand == "serve":
             if args.offline_after <= 0:
                 raise SystemExit("--offline-after must be greater than zero")
+            if args.heartbeat_interval <= 0:
+                raise SystemExit("--heartbeat-interval must be greater than zero")
             serve(args, registry)
         elif args.subcommand == "list":
             list_edges(args, registry)

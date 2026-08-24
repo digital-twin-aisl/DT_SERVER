@@ -6,7 +6,13 @@ import cv2
 import pickle
 import numpy as np
 
+from dt_common.calibration.voxelpose import (
+    load_calibration_result,
+    select_voxelpose_cameras,
+)
 from apps.edge_client.src.utils.transforms import get_scale
+from apps.edge_client.src.utils.input import discover_dataset_videos
+from apps.edge_client.src.utils.input import find_dataset_calibration
 
 class CalibrationData:
     '''
@@ -23,11 +29,20 @@ class CalibrationData:
         -np.dot(R.T, calib['tvec']) * 1000 # mm단위 변환
     )
     '''
-    def __init__(self, cfg, example_path=None, cameras=None):
+    def __init__(
+        self,
+        cfg,
+        example_path=None,
+        cameras=None,
+        calibration_path=None,
+        camera_ids=None,
+        world_origin_m=(0.0, 0.0, 0.0),
+    ):
         self._lock = threading.Lock()
         self.rtsp_cam = cameras
         self.cams = []
         self.example_path = example_path
+        self.camera_ids = None if camera_ids is None else list(camera_ids)
 
         self.orig_image_size= np.array(cfg.NETWORK.IMAGE_SIZE_ORIG)
         self.image_size=np.array(cfg.NETWORK.IMAGE_SIZE)
@@ -35,7 +50,14 @@ class CalibrationData:
         self.s = get_scale(self.orig_image_size, self.image_size)
         self.r = 0
 
-        if self.example_path:
+        if calibration_path is not None:
+            result = load_calibration_result(calibration_path)
+            self.cams = select_voxelpose_cameras(
+                result,
+                camera_ids,
+                world_origin_m=world_origin_m,
+            )
+        elif self.example_path:
             self.update_from_dataset()
         elif self.rtsp_cam: 
             self.update()
@@ -86,6 +108,16 @@ class CalibrationData:
             
             
     def update_from_dataset(self):
+        result_path = find_dataset_calibration(self.example_path)
+        if result_path is not None:
+            camera_ids = self.camera_ids or [
+                camera_id
+                for camera_id, _ in discover_dataset_videos(self.example_path)
+            ]
+            result = load_calibration_result(result_path)
+            self.cams = select_voxelpose_cameras(result, camera_ids)
+            return
+
         cams = []
         calibration_paths = sorted(glob.glob(osp.join(self.example_path, 'calibration', '*.pkl')))
         for path in calibration_paths:
