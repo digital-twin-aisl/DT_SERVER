@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 import json
 import logging
@@ -34,12 +35,19 @@ from apps.server_worker.src.pose.utils import cameras
 from apps.server_worker.src.protocol.scene_zenoh import (
     DEFAULT_SCENE_TOPIC,
     ZenohScenePublisher,
+    encode_scene,
 )
 from apps.server_worker.src.protocol.zenoh import ZenohDataLoader
 from apps.server_worker.src.protocol.zmq import Protocol
 from apps.server_worker.src.reid.sliding_clustering import ClusteringSliding
 from apps.server_worker.src.utils.edgemetadata import EdgeMetadataLoader
 from apps.server_worker.src.utils.edgemetadata import DEFAULT_METADATA_PATH
+from apps.server_worker.src.utils.telemetry import (
+    ResourceSampler,
+    TelemetryRecorder,
+    collect_runtime_metadata,
+    tensor_nbytes,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +70,7 @@ ROOT_POSITION_TO_METERS = 0.001
 ENABLE_ZMQ_OUTPUT = False
 ENABLE_VISER_DEBUG_OUTPUT = True
 VISER_DEBUG_OUTPUT_PATH = SERVER_WORKER_DIR / "data" / "viser_scenes.jsonl"
+DEFAULT_METRICS_DIR = SERVER_WORKER_DIR / "data" / "metrics"
 
 
 def save_scene_for_viser(
@@ -230,6 +239,33 @@ def get_parser():
     parser.add_argument("--sync-tolerance", type=float, default=0.03)
     parser.add_argument("--receive-timeout", type=float, default=1.0)
     parser.add_argument(
+        "--metrics-dir",
+        default=str(DEFAULT_METRICS_DIR),
+        help="Root directory for per-run JSONL telemetry",
+    )
+    parser.add_argument(
+        "--metrics-run-label",
+        help="Human-readable experiment label stored with the run",
+    )
+    parser.add_argument(
+        "--metrics-tag",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Experiment tag; repeat for load level, dataset, scenario, etc.",
+    )
+    parser.add_argument(
+        "--metrics-resource-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between CPU/RAM/GPU/network samples; 0 samples every batch",
+    )
+    parser.add_argument(
+        "--no-metrics",
+        action="store_true",
+        help="Disable structured inference telemetry",
+    )
+    parser.add_argument(
         "--max-output-people",
         type=int,
         default=DEFAULT_MAX_OUTPUT_PEOPLE,
@@ -284,6 +320,289 @@ def get_parser():
         help="Disable SceneOutput publishing over Zenoh",
     )
     return parser
+
+
+def parse_metrics_tags(values: list[str]) -> dict[str, str]:
+    """Parse repeatable KEY=VALUE experiment labels."""
+    tags = {}
+    for value in values:
+        key, separator, tag_value = value.partition("=")
+        key = key.strip()
+        if not separator or not key:
+            raise ValueError(f"Invalid --metrics-tag {value!r}; expected KEY=VALUE")
+        tags[key] = tag_value.strip()
+    return tags
+
+
+def count_reid_items(
+    items: list[dict[str, Any]],
+    edge_ids: list[str],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Count Re-ID observations without persisting feature vectors or bboxes."""
+    by_edge = Counter(str(item.get("edge_id", "unknown")) for item in items)
+    by_camera = Counter(
+        f"{item.get('edge_id', 'unknown')}:{item.get('cam', 'unknown')}"
+        for item in items
+    )
+    return (
+        {edge_id: int(by_edge.get(edge_id, 0)) for edge_id in edge_ids},
+        dict(sorted(by_camera.items())),
+    )
+
+
+def estimate_reid_feature_bytes(items: list[dict[str, Any]]) -> int:
+    total = 0
+    for item in items:
+        feature = item.get("feature")
+        if feature is None:
+            continue
+        if isinstance(feature, np.ndarray):
+            total += int(feature.nbytes)
+        elif isinstance(feature, torch.Tensor):
+            total += tensor_nbytes(feature)
+        else:
+            total += int(np.asarray(feature, dtype=np.float32).nbytes)
+    return total
+
+
+def reid_observation_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    bbox = tuple(float(value) for value in item.get("bbox") or [])
+    return (
+        str(item.get("edge_id", "unknown")),
+        item.get("cam"),
+        item.get("frame"),
+        item.get("person_idx"),
+        bbox,
+    )
+
+
+def reid_observation_metadata(
+    reid_items: list[dict[str, Any]],
+    reid_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep evaluation identifiers and boxes while excluding embeddings."""
+    assigned_ids = {
+        reid_observation_key(item): int(item["global_id"])
+        for item in reid_results
+    }
+    observations = []
+    for item in reid_items:
+        observation = {
+            "edge_id": str(item.get("edge_id", "unknown")),
+            "camera_id": (
+                None if item.get("cam") is None else int(item["cam"])
+            ),
+            "frame": (
+                None if item.get("frame") is None else int(item["frame"])
+            ),
+            "person_index": (
+                None
+                if item.get("person_idx") is None
+                else int(item["person_idx"])
+            ),
+            "bbox_xyxy": [
+                float(value) for value in item.get("bbox") or []
+            ],
+            "global_id": assigned_ids.get(reid_observation_key(item)),
+        }
+        observations.append(observation)
+    return observations
+
+
+def build_reid_metrics(
+    reid_items: list[dict[str, Any]],
+    reid_results: list[dict[str, Any]],
+    mapped_ids: set[int],
+    previous_mapped_ids: set[int],
+    seen_global_ids: set[int],
+    tracker: ClusteringSliding,
+) -> dict[str, Any]:
+    """Build online identity-continuity indicators (not ground-truth accuracy)."""
+    result_ids = {int(item["global_id"]) for item in reid_results}
+    entered_ids = mapped_ids - previous_mapped_ids
+    exited_ids = previous_mapped_ids - mapped_ids
+    union_ids = mapped_ids | previous_mapped_ids
+    edges_by_global_id: dict[int, set[str]] = {}
+    for item in reid_results:
+        edges_by_global_id.setdefault(int(item["global_id"]), set()).add(
+            str(item["edge_id"])
+        )
+
+    return {
+        "input_observations": len(reid_items),
+        "confirmed_observations": len(reid_results),
+        "confirmed_global_ids": sorted(result_ids),
+        "mapped_global_ids": sorted(mapped_ids),
+        "new_global_ids_this_run": sorted(result_ids - seen_global_ids),
+        "entered_since_previous_batch": sorted(entered_ids),
+        "exited_since_previous_batch": sorted(exited_ids),
+        "retained_from_previous_batch": sorted(
+            mapped_ids & previous_mapped_ids
+        ),
+        "identity_churn_ratio": (
+            (len(entered_ids) + len(exited_ids)) / len(union_ids)
+            if union_ids
+            else 0.0
+        ),
+        "observation_confirmation_ratio": (
+            len(reid_results) / len(reid_items) if reid_items else None
+        ),
+        "root_association_ratio": (
+            len(mapped_ids) / len(result_ids) if result_ids else None
+        ),
+        "global_ids_seen_on_multiple_edges": sorted(
+            global_id
+            for global_id, observed_edges in edges_by_global_id.items()
+            if len(observed_edges) > 1
+        ),
+        "observations": reid_observation_metadata(reid_items, reid_results),
+        "tracker": tracker.metrics_snapshot(),
+    }
+
+
+def unix_input_age_ms(timestamps: list[float], now: float) -> float | None:
+    """Return source-to-output age only when timestamps look like Unix time."""
+    if not timestamps:
+        return None
+    earliest = min(float(timestamp) for timestamp in timestamps)
+    if earliest < 946684800 or earliest > now + 60:
+        return None
+    # Keep small negative values visible: they reveal Edge/server clock skew.
+    return (now - earliest) * 1000.0
+
+
+def counter_deltas(
+    current: dict[str, int],
+    previous: dict[str, int],
+) -> dict[str, int]:
+    return {
+        key: max(0, int(value) - int(previous.get(key, 0)))
+        for key, value in current.items()
+    }
+
+
+def queue_metrics(
+    loader: ZenohDataLoader,
+    scene_publisher: ZenohScenePublisher | None,
+    telemetry: TelemetryRecorder | None,
+) -> dict[str, Any]:
+    return {
+        "input_subscriber_depth_by_edge": {
+            edge_id: input_queue.qsize()
+            for edge_id, input_queue in loader.subscriber.queues.items()
+        },
+        "synchronization_buffer_depth_by_edge": {
+            edge_id: len(buffer) for edge_id, buffer in loader.buffers.items()
+        },
+        "scene_output_depth": (
+            None if scene_publisher is None else scene_publisher.queue.qsize()
+        ),
+        "telemetry_writer_depth": (
+            None if telemetry is None else telemetry.queue_depth
+        ),
+    }
+
+
+def transport_counter_metrics(
+    loader: ZenohDataLoader,
+    scene_publisher: ZenohScenePublisher | None,
+    previous: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Snapshot application-level Zenoh traffic and calculate record deltas."""
+    subscriber = loader.subscriber
+    input_messages = {
+        edge_id: int(value)
+        for edge_id, value in subscriber.received_messages.items()
+    }
+    input_bytes = {
+        edge_id: int(value) for edge_id, value in subscriber.received_bytes.items()
+    }
+    invalid_messages = {
+        edge_id: int(value)
+        for edge_id, value in subscriber.invalid_messages.items()
+    }
+    output_messages = (
+        0 if scene_publisher is None else int(scene_publisher.sent_messages)
+    )
+    output_bytes = 0 if scene_publisher is None else int(scene_publisher.sent_bytes)
+    synchronization_discarded = {
+        edge_id: int(value)
+        for edge_id, value in loader.synchronization_discarded.items()
+    }
+    current = {
+        "input_messages": input_messages,
+        "input_bytes": input_bytes,
+        "invalid_messages": invalid_messages,
+        "output_messages": output_messages,
+        "output_bytes": output_bytes,
+        "synchronization_discarded": synchronization_discarded,
+        "decode_failures": int(loader.decode_failures),
+        "prepare_failures": int(loader.prepare_failures),
+    }
+    metrics = {
+        "input_received_messages_total_by_edge": input_messages,
+        "input_received_messages_delta_by_edge": counter_deltas(
+            input_messages,
+            previous.get("input_messages", {}),
+        ),
+        "input_received_bytes_total_by_edge": input_bytes,
+        "input_received_bytes_delta_by_edge": counter_deltas(
+            input_bytes,
+            previous.get("input_bytes", {}),
+        ),
+        "input_invalid_messages_total_by_edge": invalid_messages,
+        "input_invalid_messages_delta_by_edge": counter_deltas(
+            invalid_messages,
+            previous.get("invalid_messages", {}),
+        ),
+        "synchronization_discarded_total_by_edge": synchronization_discarded,
+        "synchronization_discarded_delta_by_edge": counter_deltas(
+            synchronization_discarded,
+            previous.get("synchronization_discarded", {}),
+        ),
+        "decode_failures_total": int(loader.decode_failures),
+        "decode_failures_delta": max(
+            0,
+            int(loader.decode_failures) - int(previous.get("decode_failures", 0)),
+        ),
+        "prepare_failures_total": int(loader.prepare_failures),
+        "prepare_failures_delta": max(
+            0,
+            int(loader.prepare_failures)
+            - int(previous.get("prepare_failures", 0)),
+        ),
+        "scene_sent_messages_total": output_messages,
+        "scene_sent_messages_delta": max(
+            0,
+            output_messages - int(previous.get("output_messages", 0)),
+        ),
+        "scene_sent_bytes_total": output_bytes,
+        "scene_sent_bytes_delta": max(
+            0,
+            output_bytes - int(previous.get("output_bytes", 0)),
+        ),
+        "scene_router_ids": (
+            [] if scene_publisher is None else list(scene_publisher.router_ids)
+        ),
+        "scene_link_count": (
+            None if scene_publisher is None else scene_publisher.link_count
+        ),
+    }
+    return metrics, current
+
+
+def sample_resources(
+    sampler: ResourceSampler | None,
+    *,
+    force: bool = False,
+) -> dict[str, Any] | None:
+    if sampler is None:
+        return None
+    try:
+        return sampler.sample(force=force)
+    except Exception as exc:
+        logger.warning("Resource telemetry sample failed: %s", exc)
+        return {"sampling_error": f"{type(exc).__name__}: {exc}"}
 
 
 def resolve_server_worker_path(path: str | Path) -> Path:
@@ -837,6 +1156,7 @@ def validate_pose_model_inputs(
 
 
 def main() -> None:
+    main_started_at = time.perf_counter()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -847,6 +1167,9 @@ def main() -> None:
         raise ValueError("--max-output-people must be at least 1")
     if args.lod2_count < 0:
         raise ValueError("--lod2-count must not be negative")
+    if args.metrics_resource_interval < 0:
+        raise ValueError("--metrics-resource-interval must not be negative")
+    metrics_tags = parse_metrics_tags(args.metrics_tag)
 
     if args.cfg_focus:
         logger.info("Loading focus config: %s", args.cfg_focus)
@@ -952,14 +1275,15 @@ def main() -> None:
 
     # 제노 로더
     logger.info("[5/8] Connecting to Zenoh: endpoint=%s", args.zenoh_endpoint)
+    camera_ids_by_edge = {
+        edge_id: [int(camera["id"]) for camera in edge_metadata[edge_id].cams]
+        for edge_id in edge_ids
+    }
     loader = ZenohDataLoader(
         edge_ids=edge_ids,
         device=device,
         topics=edge_metadata.topics,
-        expected_camera_ids={
-            edge_id: [int(camera["id"]) for camera in edge_metadata[edge_id].cams]
-            for edge_id in edge_ids
-        },
+        expected_camera_ids=camera_ids_by_edge,
         expected_spatial_context=(
             spatial_context.identity() if spatial_context is not None else None
         ),
@@ -972,6 +1296,8 @@ def main() -> None:
     logger.info("Zenoh data loader is ready; waiting for synchronized batches")
     zmq_output = None
     scene_publisher = None
+    telemetry = None
+    resource_sampler = None
     try:
         zmq_output = (
             Protocol(zmq_host, zmq_port)
@@ -995,6 +1321,61 @@ def main() -> None:
             )
         else:
             logger.info("[6/8] Zenoh scene output is disabled")
+
+        if not args.no_metrics:
+            run_metadata = {
+                "experiment": {
+                    "label": args.metrics_run_label,
+                    "tags": metrics_tags,
+                },
+                "configuration": {
+                    "arguments": vars(args),
+                    "pose_config_path": str(pose_config_path),
+                    "checkpoint_path": str(checkpoint_path),
+                    "deployment_path": str(edge_metadata_path),
+                    "tensorrt": use_tensorrt,
+                    "lod_policy": "all_lod2" if args.all_lod2 else "priority",
+                    "priority_hazards_metres": priority_hazards,
+                },
+                "topology": {
+                    "edge_ids": edge_ids,
+                    "camera_ids_by_edge": camera_ids_by_edge,
+                    "input_topics": edge_metadata.topics,
+                    "workspace_ids": expected_workspace_ids,
+                    "scene_output_topic": (
+                        None if args.no_scene_zenoh else args.scene_zenoh_topic
+                    ),
+                },
+                "runtime": collect_runtime_metadata(device, PROJECT_ROOT),
+            }
+            try:
+                telemetry = TelemetryRecorder(args.metrics_dir, run_metadata)
+                resource_sampler = ResourceSampler(
+                    device,
+                    interval_seconds=args.metrics_resource_interval,
+                )
+                telemetry.record_event(
+                    {
+                        "event": "startup_complete",
+                        "startup_ms": (
+                            time.perf_counter() - main_started_at
+                        )
+                        * 1000.0,
+                        "resource": sample_resources(
+                            resource_sampler,
+                            force=True,
+                        ),
+                    }
+                )
+                logger.info("Inference telemetry is ready: %s", telemetry.run_dir)
+            except Exception as exc:
+                if telemetry is not None:
+                    telemetry.close({"initialization_error": repr(exc)})
+                telemetry = None
+                resource_sampler = None
+                logger.exception("Failed to initialize inference telemetry")
+        else:
+            logger.info("Inference telemetry is disabled")
     except Exception:
         loader.close()
         if zmq_output is not None:
@@ -1007,15 +1388,82 @@ def main() -> None:
         logger.info("[7/8] Entering inference loop")
         batch_count = 0
         last_wait_log = time.monotonic()
+        last_batch_received_at = None
+        previous_mapped_ids: set[int] = set()
+        seen_global_ids: set[int] = set()
+        previous_input_dropped = {edge_id: 0 for edge_id in edge_ids}
+        previous_output_dropped = 0
+        previous_transport_counters: dict[str, Any] = {}
+        pose_cuda_start = torch.cuda.Event(enable_timing=True)
+        pose_cuda_end = torch.cuda.Event(enable_timing=True)
         with torch.inference_mode():
             while True:
+                receive_started_at = time.perf_counter()
                 prepared = loader.get(timeout=args.receive_timeout)
+                batch_received_at = time.perf_counter()
                 if prepared is None:
                     now = time.monotonic()
                     if now - last_wait_log >= 10:
+                        input_dropped = {
+                            edge_id: int(value)
+                            for edge_id, value in loader.subscriber.dropped.items()
+                        }
+                        output_dropped = (
+                            0
+                            if scene_publisher is None
+                            else int(scene_publisher.dropped)
+                        )
+                        transport_metrics, current_transport_counters = (
+                            transport_counter_metrics(
+                                loader,
+                                scene_publisher,
+                                previous_transport_counters,
+                            )
+                        )
                         logger.info(
                             "Waiting for synchronized Zenoh input: dropped=%s",
-                            loader.subscriber.dropped,
+                            input_dropped,
+                        )
+                        if telemetry is not None:
+                            telemetry.record_event(
+                                {
+                                    "event": "waiting_for_input",
+                                    "status": "waiting",
+                                    "wait_timeout_ms": (
+                                        batch_received_at - receive_started_at
+                                    )
+                                    * 1000.0,
+                                    "drops": {
+                                        "input_total_by_edge": input_dropped,
+                                        "input_delta_by_edge": counter_deltas(
+                                            input_dropped,
+                                            previous_input_dropped,
+                                        ),
+                                        "scene_output_total": output_dropped,
+                                        "scene_output_delta": max(
+                                            0,
+                                            output_dropped
+                                            - previous_output_dropped,
+                                        ),
+                                        "telemetry_total": (
+                                            telemetry.dropped_records
+                                        ),
+                                    },
+                                    "queues": queue_metrics(
+                                        loader,
+                                        scene_publisher,
+                                        telemetry,
+                                    ),
+                                    "transport": transport_metrics,
+                                    "resource": sample_resources(
+                                        resource_sampler
+                                    ),
+                                }
+                            )
+                        previous_input_dropped = input_dropped
+                        previous_output_dropped = output_dropped
+                        previous_transport_counters = (
+                            current_transport_counters
                         )
                         last_wait_log = now
                     continue
@@ -1024,16 +1472,91 @@ def main() -> None:
                 if batch_count == 1:
                     logger.info("First synchronized batch received")
                 started_at = time.perf_counter()
+                timings_ms: dict[str, float] = {
+                    "receive_wait_and_prepare": (
+                        batch_received_at - receive_started_at
+                    )
+                    * 1000.0,
+                }
+                if last_batch_received_at is not None:
+                    timings_ms["batch_arrival_interval"] = (
+                        batch_received_at - last_batch_received_at
+                    ) * 1000.0
+                last_batch_received_at = batch_received_at
+                batch_event: dict[str, Any] = {
+                    "batch_index": batch_count,
+                    "status": "error",
+                    "timings_ms": timings_ms,
+                }
+                batch_failed = False
                 try:
                     heatmaps, roots, reid_items, timestamps, sync_spread = prepared
+
+                    input_by_edge, input_by_camera = count_reid_items(
+                        reid_items,
+                        edge_ids,
+                    )
+                    batch_event["source"] = {
+                        "edge_timestamps": {
+                            edge_id: float(timestamp)
+                            for edge_id, timestamp in zip(edge_ids, timestamps)
+                        },
+                        "sync_spread_ms": float(sync_spread) * 1000.0,
+                        "timestamp_kind": (
+                            "unix"
+                            if timestamps and min(timestamps) >= 946684800
+                            else "relative_or_unknown"
+                        ),
+                    }
+                    batch_event["data_volume_bytes"] = {
+                        "heatmaps": sum(
+                            tensor_nbytes(heatmap) for heatmap in heatmaps
+                        ),
+                        "roots": tensor_nbytes(roots),
+                        "reid_features": estimate_reid_feature_bytes(reid_items),
+                    }
+                    batch_event["tensor_shapes"] = {
+                        "heatmaps": [list(heatmap.shape) for heatmap in heatmaps],
+                        "roots": list(roots.shape),
+                    }
+
+                    stage_started_at = time.perf_counter()
                     reid_results = reid.process_realtime(reid_items) or []
+                    timings_ms["reid_clustering"] = (
+                        time.perf_counter() - stage_started_at
+                    ) * 1000.0
+
+                    stage_started_at = time.perf_counter()
                     ids = assign_global_ids(
                         reid_results,
                         roots,
                         edge_ids,
                         edge_metadata,
                     )
+                    timings_ms["root_association"] = (
+                        time.perf_counter() - stage_started_at
+                    ) * 1000.0
 
+                    mapped_ids = {
+                        int(global_id)
+                        for edge_root_ids in ids
+                        for global_id in edge_root_ids
+                        if global_id is not None
+                    }
+                    batch_event["reid"] = build_reid_metrics(
+                        reid_items,
+                        reid_results,
+                        mapped_ids,
+                        previous_mapped_ids,
+                        seen_global_ids,
+                        reid,
+                    )
+                    previous_mapped_ids = mapped_ids
+                    seen_global_ids.update(
+                        int(item["global_id"]) for item in reid_results
+                    )
+
+                    stage_started_at = time.perf_counter()
                     if args.all_lod2:
                         lod_by_id = lod_assign(ids, assign_all_lod2)
                     else:
@@ -1044,8 +1567,13 @@ def main() -> None:
                             priority_engine,
                             args.lod2_count,
                         )
+                    timings_ms["lod_assignment"] = (
+                        time.perf_counter() - stage_started_at
+                    ) * 1000.0
                     logger.debug("LOD assignments: %s", lod_by_id)
 
+                    stage_started_at = time.perf_counter()
+                    pose_cuda_start.record()
                     pose_result = run_pose_models(
                         pose_models,
                         heatmaps,
@@ -1054,6 +1582,16 @@ def main() -> None:
                         ids,
                         lod_by_id,
                     )
+                    pose_cuda_end.record()
+                    pose_cuda_end.synchronize()
+                    timings_ms["pose_inference"] = (
+                        time.perf_counter() - stage_started_at
+                    ) * 1000.0
+                    timings_ms["pose_gpu"] = float(
+                        pose_cuda_start.elapsed_time(pose_cuda_end)
+                    )
+
+                    stage_started_at = time.perf_counter()
                     scene_output = build_scene_output(
                         pose_result,
                         roots,
@@ -1064,36 +1602,182 @@ def main() -> None:
                         sync_spread,
                         max_people=args.max_output_people,
                     )
+                    timings_ms["scene_build"] = (
+                        time.perf_counter() - stage_started_at
+                    ) * 1000.0
                     logger.info(
                         "Scene output is ready: people=%d",
                         len(scene_output.people),
                     )
                     # ===== TEMP VISER DEBUG: delete with the block near constants =====
+                    stage_started_at = time.perf_counter()
                     if ENABLE_VISER_DEBUG_OUTPUT:
                         save_scene_for_viser(scene_output)
+                    timings_ms["viser_debug_output"] = (
+                        time.perf_counter() - stage_started_at
+                    ) * 1000.0
                     # ===== END TEMP VISER DEBUG =====
 
+                    stage_started_at = time.perf_counter()
                     scene_payload = scene_output.to_dict()
+                    encoded_scene = encode_scene(scene_payload)
+                    timings_ms["scene_serialization"] = (
+                        time.perf_counter() - stage_started_at
+                    ) * 1000.0
+
+                    stage_started_at = time.perf_counter()
+                    zmq_enqueued = None
                     if zmq_output is not None and not zmq_output.send_scene(
                         scene_payload
                     ):
+                        zmq_enqueued = False
                         logger.error("Failed to send scene output over ZMQ")
+                    elif zmq_output is not None:
+                        zmq_enqueued = True
+                    zenoh_enqueued = None
                     if (
                         scene_publisher is not None
-                        and not scene_publisher.send_scene(scene_payload)
+                        and not scene_publisher.send_payload(encoded_scene)
                     ):
+                        zenoh_enqueued = False
                         logger.error("Failed to send scene output over Zenoh")
-                except Exception:
-                    logger.exception("Failed to process synchronized batch")
-                    continue
+                    elif scene_publisher is not None:
+                        zenoh_enqueued = True
+                    timings_ms["transport_enqueue"] = (
+                        time.perf_counter() - stage_started_at
+                    ) * 1000.0
 
-                elapsed = (time.perf_counter() - started_at) * 1000
+                    roots_cpu = roots.detach().cpu()
+                    lod_counts = Counter(int(lod) for lod in lod_by_id.values())
+                    batch_event["workload"] = {
+                        "edges": len(edge_ids),
+                        "camera_views_per_edge": len(heatmaps),
+                        "reid_input_by_edge": input_by_edge,
+                        "reid_input_by_edge_camera": input_by_camera,
+                        "valid_root_candidates_by_edge": {
+                            edge_id: int((roots_cpu[index, :, 3] >= 0).sum())
+                            for index, edge_id in enumerate(edge_ids)
+                        },
+                        "mapped_people_by_edge": {
+                            edge_id: sum(
+                                global_id is not None for global_id in edge_root_ids
+                            )
+                            for edge_id, edge_root_ids in zip(edge_ids, ids)
+                        },
+                        "mapped_people": len(mapped_ids),
+                        "lod_counts": {
+                            str(lod): int(lod_counts.get(lod, 0))
+                            for lod in (0, 1, 2)
+                        },
+                        "pose_targets": int(lod_counts.get(2, 0)),
+                        "output_people": len(scene_output.people),
+                        "output_poses": sum(
+                            person.pose is not None for person in scene_output.people
+                        ),
+                    }
+                    batch_event["data_volume_bytes"]["scene_json"] = len(
+                        encoded_scene
+                    )
+                    batch_event["transport"] = {
+                        "zmq_enqueued": zmq_enqueued,
+                        "zenoh_enqueued": zenoh_enqueued,
+                    }
+                    output_wall_time = time.time()
+                    batch_event["source"]["source_to_output_age_ms"] = (
+                        unix_input_age_ms(timestamps, output_wall_time)
+                    )
+                    batch_event["status"] = "ok"
+                except Exception as exc:
+                    batch_failed = True
+                    batch_event["error"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc)[:2000],
+                    }
+                    logger.exception("Failed to process synchronized batch")
+                finally:
+                    elapsed = (time.perf_counter() - started_at) * 1000.0
+                    timings_ms["processing_total"] = elapsed
+                    pipeline_stage_names = (
+                        "reid_clustering",
+                        "root_association",
+                        "lod_assignment",
+                        "pose_inference",
+                        "scene_build",
+                        "viser_debug_output",
+                        "scene_serialization",
+                        "transport_enqueue",
+                    )
+                    pipeline_stages_total = sum(
+                        timings_ms.get(name, 0.0) for name in pipeline_stage_names
+                    )
+                    timings_ms["pipeline_stages_total"] = pipeline_stages_total
+                    timings_ms["instrumentation_and_unattributed"] = max(
+                        0.0,
+                        elapsed - pipeline_stages_total,
+                    )
+                    batch_event["rates"] = {
+                        "processing_capacity_fps": (
+                            1000.0 / elapsed if elapsed > 0 else None
+                        )
+                    }
+                    input_dropped = {
+                        edge_id: int(value)
+                        for edge_id, value in loader.subscriber.dropped.items()
+                    }
+                    output_dropped = (
+                        0
+                        if scene_publisher is None
+                        else int(scene_publisher.dropped)
+                    )
+                    batch_event["drops"] = {
+                        "input_total_by_edge": input_dropped,
+                        "input_delta_by_edge": counter_deltas(
+                            input_dropped,
+                            previous_input_dropped,
+                        ),
+                        "scene_output_total": output_dropped,
+                        "scene_output_delta": max(
+                            0,
+                            output_dropped - previous_output_dropped,
+                        ),
+                        "telemetry_total": (
+                            0
+                            if telemetry is None
+                            else telemetry.dropped_records
+                        ),
+                    }
+                    batch_event["queues"] = queue_metrics(
+                        loader,
+                        scene_publisher,
+                        telemetry,
+                    )
+                    transport_metrics, current_transport_counters = (
+                        transport_counter_metrics(
+                            loader,
+                            scene_publisher,
+                            previous_transport_counters,
+                        )
+                    )
+                    batch_event.setdefault("transport", {}).update(
+                        transport_metrics
+                    )
+                    batch_event["resource"] = sample_resources(resource_sampler)
+                    if telemetry is not None:
+                        telemetry.record_batch(batch_event)
+                    previous_input_dropped = input_dropped
+                    previous_output_dropped = output_dropped
+                    previous_transport_counters = current_transport_counters
+
+                if batch_failed:
+                    continue
                 logger.info(
-                    "Batch %d complete: inference=%.1fms sync_spread=%.1fms dropped=%s",
+                    "Batch %d complete: inference=%.1fms sync_spread=%.1fms "
+                    "people=%d dropped=%s",
                     batch_count,
                     elapsed,
                     sync_spread * 1000,
-                    loader.subscriber.dropped,
+                    len(scene_output.people),
+                    input_dropped,
                 )
     except KeyboardInterrupt:
         logger.info("Stopping server inference")
@@ -1104,6 +1788,40 @@ def main() -> None:
             zmq_output.close()
         if scene_publisher is not None:
             scene_publisher.close()
+        if telemetry is not None:
+            final_transport_metrics, _ = transport_counter_metrics(
+                loader,
+                scene_publisher,
+                previous_transport_counters,
+            )
+            telemetry.record_event(
+                {
+                    "event": "shutdown",
+                    "status": "ok",
+                    "batches_processed": batch_count,
+                    "reid_tracker": reid.metrics_snapshot(),
+                    "transport": final_transport_metrics,
+                    "resource": sample_resources(
+                        resource_sampler,
+                        force=True,
+                    ),
+                }
+            )
+            telemetry.close(
+                {
+                    "final_input_drops_by_edge": {
+                        edge_id: int(value)
+                        for edge_id, value in loader.subscriber.dropped.items()
+                    },
+                    "final_scene_output_drops": (
+                        0
+                        if scene_publisher is None
+                        else int(scene_publisher.dropped)
+                    ),
+                    "unique_global_ids_observed": len(seen_global_ids),
+                }
+            )
+            logger.info("Inference telemetry saved: %s", telemetry.run_dir)
 
 
 if __name__ == "__main__":

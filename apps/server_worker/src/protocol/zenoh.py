@@ -59,6 +59,9 @@ class ZenohSubscriber:
             for edge_id in topics
         }
         self.dropped = {edge_id: 0 for edge_id in topics}
+        self.received_messages = {edge_id: 0 for edge_id in topics}
+        self.received_bytes = {edge_id: 0 for edge_id in topics}
+        self.invalid_messages = {edge_id: 0 for edge_id in topics}
         self.closed = False
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -87,6 +90,8 @@ class ZenohSubscriber:
                 magic, timestamp = PAYLOAD_HEADER.unpack_from(payload)
                 if magic != PAYLOAD_MAGIC or not math.isfinite(timestamp):
                     raise ValueError("Invalid payload header")
+                self.received_messages[edge_id] += 1
+                self.received_bytes[edge_id] += len(payload)
                 message = CompressedMessage(timestamp, payload[PAYLOAD_HEADER.size:])
                 target_queue = self.queues[edge_id]
                 try:
@@ -99,6 +104,7 @@ class ZenohSubscriber:
             except (queue.Empty, queue.Full):
                 self.dropped[edge_id] += 1
             except Exception:
+                self.invalid_messages[edge_id] += 1
                 logger.exception("Invalid Zenoh message from %s", edge_id)
 
         try:
@@ -196,6 +202,9 @@ class ZenohDataLoader:
         self.device = device
         self.sync_tolerance = sync_tolerance
         self.buffers = {edge_id: deque(maxlen=buffer_size) for edge_id in edge_ids}
+        self.synchronization_discarded = {edge_id: 0 for edge_id in edge_ids}
+        self.decode_failures = 0
+        self.prepare_failures = 0
         self.subscriber = ZenohSubscriber(topics, endpoint, config_path, buffer_size)
         self._decompressor = zstd.ZstdDecompressor()
         self._batch_count = 0
@@ -229,6 +238,7 @@ class ZenohDataLoader:
             spread = max(timestamps) - min(timestamps)
             if spread <= self.sync_tolerance:
                 for edge_id, (index, _) in selected.items():
+                    self.synchronization_discarded[edge_id] += index
                     for _ in range(index + 1):
                         self.buffers[edge_id].popleft()
                 try:
@@ -239,6 +249,7 @@ class ZenohDataLoader:
                         for edge_id, (_, message) in selected.items()
                     }
                 except Exception:
+                    self.decode_failures += 1
                     logger.exception("Failed to decode synchronized batch")
                     continue
                 batch = SynchronizedBatch(
@@ -251,6 +262,7 @@ class ZenohDataLoader:
                         self._prepare_inputs(batch)
                     )
                 except Exception:
+                    self.prepare_failures += 1
                     logger.exception("Failed to prepare synchronized batch")
                     continue
                 self._batch_count += 1
@@ -263,6 +275,7 @@ class ZenohDataLoader:
                 return heatmaps, roots, reid_items, frame_timestamps, spread
             oldest_edge = min(selected, key=lambda edge_id: selected[edge_id][1].timestamp)
             oldest_index = selected[oldest_edge][0]
+            self.synchronization_discarded[oldest_edge] += oldest_index + 1
             for _ in range(oldest_index + 1):
                 self.buffers[oldest_edge].popleft()
         return None

@@ -43,6 +43,10 @@ class ZenohScenePublisher:
         self.queue = queue.Queue[bytes | object](maxsize=queue_size)
         self.closed = False
         self.dropped = 0
+        self.sent_messages = 0
+        self.sent_bytes = 0
+        self.router_ids: tuple[str, ...] = ()
+        self.link_count = 0
         self._ready = threading.Event()
         self._error: BaseException | None = None
         self.worker = threading.Thread(
@@ -82,6 +86,10 @@ class ZenohScenePublisher:
         try:
             with zenoh.open(self._config()) as session:
                 publisher = session.declare_publisher(self.topic)
+                self.router_ids = tuple(
+                    str(router_id) for router_id in session.info.routers_zid()
+                )
+                self.link_count = len(session.info.links())
                 logger.info(
                     "Zenoh scene publisher is ready: topic=%s endpoint=%s",
                     self.topic,
@@ -93,12 +101,18 @@ class ZenohScenePublisher:
                     if payload is _STOP:
                         break
                     publisher.put(payload)
+                    self.sent_messages += 1
+                    self.sent_bytes += len(payload)
         except Exception as exc:
             self._error = exc
             logger.exception("Zenoh scene publisher worker failed")
             self._ready.set()
 
     def send_scene(self, scene: dict[str, Any]) -> bool:
+        return self.send_payload(encode_scene(scene))
+
+    def send_payload(self, payload: bytes) -> bool:
+        """Queue an already encoded scene and avoid duplicate serialization."""
         if self.closed:
             return False
         if self._error is not None:
@@ -108,7 +122,6 @@ class ZenohScenePublisher:
             )
             return False
 
-        payload = encode_scene(scene)
         if self.queue.full():
             try:
                 self.queue.get_nowait()

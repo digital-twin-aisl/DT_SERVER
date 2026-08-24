@@ -37,17 +37,6 @@ class MultiPersonPoseNetSSV(nn.Module):
         self.num_cand = cfg.MULTI_PERSON.MAX_PEOPLE_NUM
         self.num_views = cfg.NUM_VIEWS
         self.heatmap_size = tuple(int(v) for v in cfg.NETWORK.HEATMAP_SIZE)
-        spatial_context = getattr(cfg, "SPATIAL_CONTEXT", None)
-        self.ground_surface = (
-            None if spatial_context is None else spatial_context.ground_surface
-        )
-        foot_clearance = (
-            (-150.0, 350.0)
-            if spatial_context is None
-            else spatial_context.policy.foot_clearance_mm
-        )
-        self.foot_clearance_min_mm = float(foot_clearance[0])
-        self.foot_clearance_max_mm = float(foot_clearance[1])
 
         self.inference_mode = inference_mode
 
@@ -146,29 +135,6 @@ class MultiPersonPoseNetSSV(nn.Module):
 
                 pred[batch_indices, cand_indices, :, 0:3] = batch_poses
 
-        foot_indices = [8, 14]
-        foot_points = pred[:, :, foot_indices, :3]
-        if self.ground_surface is not None:
-            flat_feet = foot_points.reshape(-1, 3)
-            ground_heights = self.ground_surface.heights_mm_torch(
-                flat_feet[:, :2]
-            ).view(batch_size, self.num_cand, len(foot_indices))
-            clearances = foot_points[:, :, :, 2] - ground_heights
-            min_clearance = torch.nan_to_num(
-                clearances,
-                nan=torch.inf,
-            ).min(dim=2).values
-            invalid_mask = valid_mask & (
-                (min_clearance < self.foot_clearance_min_mm)
-                | (min_clearance > self.foot_clearance_max_mm)
-                | ~torch.isfinite(min_clearance)
-            )
-        else:
-            min_z = torch.min(foot_points[:, :, :, 2], dim=2).values
-            invalid_mask = valid_mask & ((min_z < -50) | (min_z > 250))
-        grid_centers[:, :, 3] = torch.where(invalid_mask, -1, grid_centers[:, :, 3])
-        pred[:, :, :, 3] = torch.where(invalid_mask.unsqueeze(-1), -1, pred[:, :, :, 3])
-        
         result['pred'] = pred
         return result
 

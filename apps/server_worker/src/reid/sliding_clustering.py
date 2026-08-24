@@ -109,6 +109,27 @@ class ClusteringSliding:
             return self.cluster(latest_only=True)
         return []
 
+    def metrics_snapshot(self) -> dict[str, int]:
+        """Expose counter-only diagnostics without leaking Re-ID embeddings."""
+        confirmed_tracks = sum(
+            track.global_id is not None for track in self._tracks.values()
+        )
+        active_tracks = sum(
+            track.last_seen_step == self._cluster_step
+            for track in self._tracks.values()
+        )
+        return {
+            "window_frames": len(self.frame_buffer),
+            "window_observations": sum(
+                len(features) for features, _ in self.frame_buffer
+            ),
+            "active_tracks": active_tracks,
+            "retained_tracks": len(self._tracks),
+            "confirmed_tracks": confirmed_tracks,
+            "unconfirmed_tracks": len(self._tracks) - confirmed_tracks,
+            "global_ids_issued": self.next_global_id,
+        }
+
     @staticmethod
     def _normalize(feature: np.ndarray) -> np.ndarray | None:
         feature = np.asarray(feature, dtype=np.float32).reshape(-1)
