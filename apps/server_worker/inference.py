@@ -235,11 +235,17 @@ def get_parser():
         default=DEFAULT_MAX_OUTPUT_PEOPLE,
         help="Maximum number of person entities emitted per synchronized scene",
     )
-    parser.add_argument(
+    lod_policy = parser.add_mutually_exclusive_group()
+    lod_policy.add_argument(
         "--lod2-count",
         type=int,
         default=DEFAULT_LOD2_PEOPLE,
         help="Number of highest-priority people assigned to LOD 2",
+    )
+    lod_policy.add_argument(
+        "--all-lod2",
+        action="store_true",
+        help="Assign every mapped global ID to LOD 2",
     )
     parser.add_argument(
         "--priority-hazard",
@@ -921,7 +927,8 @@ def main() -> None:
     )
     priority_engine = PriorityEngine(PriorityConfig(hazards=priority_hazards))
     logger.info(
-        "Priority-based LOD assignment is ready: lod2_count=%d hazards=%s",
+        "LOD assignment is ready: policy=%s lod2_count=%d hazards=%s",
+        "all_lod2" if args.all_lod2 else "priority",
         args.lod2_count,
         priority_hazards,
     )
@@ -1027,13 +1034,16 @@ def main() -> None:
                         edge_metadata,
                     )
 
-                    lod_by_id = assign_priority_lods(
-                        ids,
-                        roots,
-                        timestamps,
-                        priority_engine,
-                        args.lod2_count,
-                    )
+                    if args.all_lod2:
+                        lod_by_id = lod_assign(ids, assign_all_lod2)
+                    else:
+                        lod_by_id = assign_priority_lods(
+                            ids,
+                            roots,
+                            timestamps,
+                            priority_engine,
+                            args.lod2_count,
+                        )
                     logger.debug("LOD assignments: %s", lod_by_id)
 
                     pose_result = run_pose_models(
