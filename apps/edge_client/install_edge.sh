@@ -70,8 +70,19 @@ else
 fi
 
 log "Installing PyTorch from Jetson AI Lab"
-python -m pip install --no-cache-dir --extra-index-url "$PYTORCH_INDEX" \
+# Keep PyPI out of this resolution.  With --extra-index-url, pip may choose the
+# public aarch64 wheel for the same version (currently built for CUDA 13), which
+# cannot run on JetPack 6 / CUDA 12.6.
+python -m pip install --no-cache-dir --index-url "$PYTORCH_INDEX" \
     torch==2.11.0 torchvision==0.26.0
+
+log "Installing the cuDSS runtime required by the Jetson PyTorch wheel"
+# Install only cuDSS: its declared dependencies would otherwise add a second
+# CUDA toolkit from PyPI instead of using the CUDA 12.6 libraries from JetPack.
+python -m pip install --no-cache-dir --no-deps nvidia-cudss-cu12==0.8.0.10
+SITE_PACKAGES="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+ln -sfn ../../nvidia/cu12/lib/libcudss.so.0 \
+    "${SITE_PACKAGES}/torch/lib/libcudss.so.0"
 
 log "Installing edge client dependencies"
 python -m pip install --no-cache-dir -r "${SCRIPT_DIR}/requirements.txt"
