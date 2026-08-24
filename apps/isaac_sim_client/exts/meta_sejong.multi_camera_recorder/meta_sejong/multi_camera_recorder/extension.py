@@ -24,7 +24,7 @@ from .camera_config import (
     opencv_camera_to_usd_matrix_rows,
     usd_camera_intrinsics,
 )
-from .video_encoder import FFmpegVideoEncoder
+from .video_encoder import FFmpegVideoEncoder, select_video_codec
 
 
 @dataclass
@@ -38,6 +38,7 @@ class _RecordingStream:
 
 class MultiCameraRecorderExtension(omni.ext.IExt):
     WINDOW_TITLE = "Meta Sejong Multi-Camera Recorder"
+    CAPTURE_BATCH_SIZE = 3
 
     def on_startup(self, ext_id: str) -> None:
         self._state = "idle"
@@ -57,9 +58,9 @@ class MultiCameraRecorderExtension(omni.ext.IExt):
         self._output_directory_model = ui.SimpleStringModel(
             str(self._default_output_directory())
         )
-        self._width_model = ui.SimpleIntModel(1280)
-        self._height_model = ui.SimpleIntModel(720)
-        self._fps_model = ui.SimpleIntModel(10)
+        self._width_model = ui.SimpleIntModel(640)
+        self._height_model = ui.SimpleIntModel(360)
+        self._fps_model = ui.SimpleIntModel(5)
         self._status_label = None
         self._start_button = None
         self._stop_button = None
@@ -100,7 +101,7 @@ class MultiCameraRecorderExtension(omni.ext.IExt):
                     ui.Label("FPS", width=38)
                     ui.IntField(model=self._fps_model, width=75)
                 ui.Label(
-                    "기본값은 GPU 부하를 고려한 1280x720 / 10 FPS입니다.",
+                    "성능 기본값: 640x360 / 5 FPS, 캡처 시에만 렌더링",
                     height=22,
                 )
                 with ui.HStack(height=42, spacing=10):
@@ -153,6 +154,8 @@ class MultiCameraRecorderExtension(omni.ext.IExt):
                     "ffmpeg 실행 파일을 찾을 수 없습니다. "
                     "시스템에 ffmpeg를 설치하세요."
                 )
+            self._set_status("사용 가능한 하드웨어 H.264 인코더 확인 중...")
+            video_codec = select_video_codec(ffmpeg_path, stream_count=9)
 
             context = omni.usd.get_context()
             stage = context.get_stage()
@@ -187,11 +190,22 @@ class MultiCameraRecorderExtension(omni.ext.IExt):
             camera_paths = [
                 f"{self._camera_root_path}/{camera.name}" for camera in CAMERAS
             ]
+            stream_count = 1 + len(CAMERAS)
+            batch_count = (
+                stream_count + self.CAPTURE_BATCH_SIZE - 1
+            ) // self.CAPTURE_BATCH_SIZE
             self._session_settings = {
                 "width": width,
                 "height": height,
                 "fps": fps,
                 "ffmpeg": ffmpeg_path,
+                "video_codec": video_codec,
+                "render_products_on_demand": True,
+                "capture_batch_size": self.CAPTURE_BATCH_SIZE,
+                "capture_batch_count": batch_count,
+                "maximum_inter_camera_skew_seconds": (
+                    (batch_count - 1) / (fps * batch_count)
+                ),
                 "viewport_camera_path": viewport_camera_path,
                 "meters_per_unit": meters_per_unit,
                 "stage": stage.GetRootLayer().identifier,
@@ -208,11 +222,13 @@ class MultiCameraRecorderExtension(omni.ext.IExt):
                 width,
                 height,
                 fps,
+                video_codec,
             )
             self._state = "recording"
             self._update_button_state()
             self._set_status(
-                f"녹화 중: 9개 화면, {width}x{height} @ {fps} FPS\n"
+                f"녹화 중: 9개 화면, {width}x{height} @ {fps} FPS "
+                f"({video_codec}, 3개씩 순환 렌더링)\n"
                 f"임시 저장 위치: {session_directory}"
             )
             self._capture_task = asyncio.ensure_future(self._record_loop())
@@ -316,6 +332,7 @@ class MultiCameraRecorderExtension(omni.ext.IExt):
         width: int,
         height: int,
         fps: int,
+        video_codec: str,
     ) -> list[_RecordingStream]:
         streams: list[_RecordingStream] = []
         try:
@@ -329,7 +346,13 @@ class MultiCameraRecorderExtension(omni.ext.IExt):
                         resolution=(width, height),
                         name=f"MetaSejongRecorder_{name}",
                     )
-                    annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+                    render_product.hydra_texture.set_updates_enabled(False)
+                    # The frame is converted to immutable bytes immediately,
+                    # so Replicator does not need to make an extra array copy.
+                    annotator = rep.AnnotatorRegistry.get_annotator(
+                        "rgb",
+                        do_array_copy=False,
+                    )
                     annotator.attach(render_product)
                     encoder = FFmpegVideoEncoder(
                         ffmpeg_path=ffmpeg_path,
@@ -337,6 +360,7 @@ class MultiCameraRecorderExtension(omni.ext.IExt):
                         width=width,
                         height=height,
                         fps=fps,
+                        codec=video_codec,
                     )
                 except Exception:
                     if encoder is not None:
@@ -363,7 +387,11 @@ class MultiCameraRecorderExtension(omni.ext.IExt):
 
     async def _record_loop(self) -> None:
         fps = int(self._session_settings["fps"])
-        frame_period = 1.0 / fps
+        batch_count = (
+            len(self._streams) + self.CAPTURE_BATCH_SIZE - 1
+        ) // self.CAPTURE_BATCH_SIZE
+        tick_period = 1.0 / (fps * batch_count)
+        batch_index = 0
         next_frame_time = time.monotonic()
         last_status_time = 0.0
         capture_error = None
@@ -374,22 +402,29 @@ class MultiCameraRecorderExtension(omni.ext.IExt):
                         "녹화 중 Stage가 변경되어 녹화를 종료합니다."
                     )
 
-                await rep.orchestrator.step_async(
-                    delta_time=0.0,
-                    pause_timeline=False,
-                )
-                for stream in self._streams:
-                    try:
-                        rgba_bytes = self._as_rgba_bytes(
-                            stream.annotator.get_data(),
-                            stream.encoder.width,
-                            stream.encoder.height,
-                        )
-                        stream.encoder.enqueue(rgba_bytes)
-                    except ValueError:
-                        # A newly attached RenderProduct can return an empty buffer
-                        # for its first update. It is safe to retry next frame.
-                        continue
+                start = batch_index * self.CAPTURE_BATCH_SIZE
+                batch = self._streams[start : start + self.CAPTURE_BATCH_SIZE]
+                self._set_render_products_enabled(batch, True)
+                try:
+                    await rep.orchestrator.step_async(
+                        delta_time=0.0,
+                        pause_timeline=False,
+                    )
+                    for stream in batch:
+                        try:
+                            rgba_bytes = self._as_rgba_bytes(
+                                stream.annotator.get_data(),
+                                stream.encoder.width,
+                                stream.encoder.height,
+                            )
+                            stream.encoder.enqueue(rgba_bytes)
+                        except ValueError:
+                            # A newly attached RenderProduct can return an empty
+                            # buffer for its first update. Retry next frame.
+                            continue
+                finally:
+                    self._set_render_products_enabled(batch, False)
+                batch_index = (batch_index + 1) % batch_count
 
                 now = time.monotonic()
                 if now - last_status_time >= 1.0:
@@ -404,8 +439,8 @@ class MultiCameraRecorderExtension(omni.ext.IExt):
                     )
                     last_status_time = now
 
-                next_frame_time += frame_period
-                if next_frame_time < now - frame_period:
+                next_frame_time += tick_period
+                if next_frame_time < now - tick_period:
                     next_frame_time = now
                 delay = next_frame_time - time.monotonic()
                 if delay > 0:
@@ -477,8 +512,20 @@ class MultiCameraRecorderExtension(omni.ext.IExt):
             self._set_status(f"9개 MP4 저장 완료\n{session_directory}")
 
     @staticmethod
+    def _set_render_products_enabled(
+        streams: list[_RecordingStream],
+        enabled: bool,
+    ) -> None:
+        for stream in streams:
+            stream.render_product.hydra_texture.set_updates_enabled(enabled)
+
+    @staticmethod
     def _release_rendering(streams: list[_RecordingStream]) -> None:
         for stream in streams:
+            try:
+                stream.render_product.hydra_texture.set_updates_enabled(False)
+            except Exception as exc:
+                print(f"[Multi-Camera Recorder] Render disable failed: {exc}")
             try:
                 stream.annotator.detach(stream.render_product)
             except Exception as exc:

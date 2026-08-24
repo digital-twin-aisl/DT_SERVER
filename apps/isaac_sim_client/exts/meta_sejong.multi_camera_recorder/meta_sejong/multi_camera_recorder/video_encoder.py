@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 import os
 from pathlib import Path
 import queue
@@ -12,14 +14,41 @@ import time
 from typing import Any
 
 
+HARDWARE_ENCODERS = ("h264_nvenc", "h264_v4l2m2m", "h264_omx")
+
+
+def _codec_arguments(codec: str) -> list[str]:
+    if codec == "libx264":
+        return [
+            "-c:v",
+            codec,
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-crf",
+            "23",
+            # Nine two-thread encoders oversubscribe an 8-core Orin. One
+            # thread per stream is slower in isolation but keeps Kit usable.
+            "-threads",
+            "1",
+        ]
+    if codec == "h264_nvenc":
+        return ["-c:v", codec, "-preset", "fast", "-b:v", "4M"]
+    if codec in {"h264_v4l2m2m", "h264_omx"}:
+        return ["-c:v", codec, "-b:v", "4M"]
+    raise ValueError(f"unsupported H.264 encoder: {codec}")
+
+
 def build_ffmpeg_command(
     ffmpeg_path: str,
     output_path: str | Path,
     width: int,
     height: int,
     fps: int,
+    codec: str = "libx264",
 ) -> list[str]:
-    """Build the bounded-CPU H.264 command used for each recorder stream."""
+    """Build an H.264 command for one recorder stream."""
     if width <= 0 or height <= 0 or fps <= 0:
         raise ValueError("width, height, and fps must be positive")
     return [
@@ -39,22 +68,112 @@ def build_ffmpeg_command(
         "-i",
         "pipe:0",
         "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-tune",
-        "zerolatency",
-        "-crf",
-        "23",
-        "-threads",
-        "2",
+        *_codec_arguments(codec),
         "-pix_fmt",
         "yuv420p",
         "-movflags",
         "+faststart",
         str(output_path),
     ]
+
+
+def _available_encoders(ffmpeg_path: str) -> set[str]:
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-encoders"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    output = f"{result.stdout}\n{result.stderr}"
+    return {
+        codec
+        for codec in (*HARDWARE_ENCODERS, "libx264")
+        if codec in output
+    }
+
+
+def _probe_encoder_instance(
+    ffmpeg_path: str,
+    codec: str,
+    output_path: Path,
+    barrier: threading.Barrier,
+) -> bool:
+    command = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-re",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=black:s=128x72:r=2",
+        "-t",
+        "1",
+        "-an",
+        *_codec_arguments(codec),
+        "-pix_fmt",
+        "yuv420p",
+        str(output_path),
+    ]
+    try:
+        barrier.wait(timeout=5.0)
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.TimeoutExpired, threading.BrokenBarrierError):
+        return False
+    return result.returncode == 0 and output_path.is_file()
+
+
+def _supports_concurrent_streams(
+    ffmpeg_path: str,
+    codec: str,
+    stream_count: int,
+) -> bool:
+    """Verify that all hardware sessions can really be opened concurrently."""
+    with tempfile.TemporaryDirectory(prefix="recorder-codec-probe-") as directory:
+        root = Path(directory)
+        barrier = threading.Barrier(stream_count)
+        with ThreadPoolExecutor(max_workers=stream_count) as executor:
+            futures = [
+                executor.submit(
+                    _probe_encoder_instance,
+                    ffmpeg_path,
+                    codec,
+                    root / f"probe_{index}.mp4",
+                    barrier,
+                )
+                for index in range(stream_count)
+            ]
+            return all(future.result() for future in futures)
+
+
+@lru_cache(maxsize=8)
+def select_video_codec(ffmpeg_path: str, stream_count: int = 9) -> str:
+    """Pick hardware H.264 only when the requested session count works."""
+    if stream_count <= 0:
+        raise ValueError("stream_count must be positive")
+    available = _available_encoders(ffmpeg_path)
+    for codec in HARDWARE_ENCODERS:
+        if codec in available and _supports_concurrent_streams(
+            ffmpeg_path,
+            codec,
+            stream_count,
+        ):
+            return codec
+    if "libx264" not in available:
+        raise RuntimeError("FFmpeg does not provide a usable H.264 encoder")
+    return "libx264"
 
 
 class FFmpegVideoEncoder:
@@ -67,6 +186,7 @@ class FFmpegVideoEncoder:
         width: int,
         height: int,
         fps: int,
+        codec: str = "libx264",
     ) -> None:
         self.output_path = Path(output_path)
         self.partial_path = self.output_path.with_name(
@@ -75,6 +195,7 @@ class FFmpegVideoEncoder:
         self.width = width
         self.height = height
         self.fps = fps
+        self.codec = codec
         self.submitted_frames = 0
         self.dropped_frames = 0
         self.error: str | None = None
@@ -89,6 +210,7 @@ class FFmpegVideoEncoder:
             width,
             height,
             fps,
+            codec,
         )
         self._process = subprocess.Popen(
             command,
@@ -191,6 +313,7 @@ class FFmpegVideoEncoder:
                 "frames": self.submitted_frames,
                 "dropped_frames": self.dropped_frames,
                 "encoded_duration_seconds": self.submitted_frames / self.fps,
+                "codec": self.codec,
                 "return_code": return_code,
                 "error": self.error,
             }

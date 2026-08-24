@@ -46,8 +46,13 @@ Isaac Sim 4.2 Extension Manager의 Extension Search Path에 다음 경로를
 `Meta Sejong Multi-Camera Recorder`를 검색해 활성화합니다. 창을 닫은 뒤에는
 상단 `Window > Meta Sejong Multi-Camera Recorder`에서 다시 열 수 있습니다.
 
-이 Extension은 MP4 인코딩에 시스템 `ffmpeg`와 `libx264`를 사용합니다. Isaac Sim을
-실행하는 호스트에서 다음 명령이 성공해야 합니다.
+이 Extension은 MP4 인코딩에 시스템 `ffmpeg`를 사용합니다. 녹화 시작 시
+`h264_nvenc`, `h264_v4l2m2m`, `h264_omx` 순서로 **9개 동시 인코딩 세션을 실제로
+열어보며**, 모두 성공한 하드웨어 인코더만 선택합니다. 사용할 수 없으면
+`libx264` 1-thread/stream으로 자동 fallback합니다. 선택 결과는 UI와
+`recording.json`의 `settings.video_codec`에서 확인할 수 있습니다.
+
+Isaac Sim을 실행하는 호스트에서 적어도 `libx264`가 보여야 합니다.
 
 ```bash
 ffmpeg -hide_banner -encoders | grep libx264
@@ -68,10 +73,19 @@ sudo apt-get install -y ffmpeg
 4. 녹화를 끝낼 때 `녹화 종료 및 저장`을 누릅니다.
 5. 상태가 `9개 MP4 저장 완료`로 바뀐 뒤 출력 디렉터리를 확인합니다.
 
-기본값은 9개 동시 렌더링 부하를 고려해 `1280x720 / 10 FPS`입니다. 해상도와
-FPS를 올리면 GPU 렌더링 및 CPU H.264 인코딩 부하가 크게 증가합니다. 인코더가
-처리 속도를 따라가지 못할 때 Isaac Sim UI를 멈추지 않도록 해당 스트림의 프레임을
-드롭하며, 수치는 `recording.json`에 남습니다.
+성능 기본값은 `640x360 / 5 FPS`입니다. 9개 RenderProduct는 대기 중에는 업데이트가
+꺼져 있고, 목표 FPS의 캡처 직전에만 켜진 뒤 프레임을 받으면 즉시 다시 꺼집니다.
+따라서 녹화 FPS와 무관하게 app FPS 전체로 9개 화면을 계속 렌더링하지 않습니다.
+한 번에 9개를 모두 렌더링해 UI가 길게 멈추는 현상을 줄이기 위해 3개씩 세 그룹으로
+순환 렌더링합니다. 각 카메라의 결과 FPS는 설정값을 유지하며, 기본 5 FPS에서
+카메라 사이의 최대 캡처 시차는 약 0.133초입니다. 정확한 동시 프레임보다 UI
+응답성과 지속 녹화를 우선한 설정입니다.
+
+해상도와 FPS를 올리면 GPU 렌더링 및 H.264 인코딩 부하가 크게 증가합니다.
+`1280x720 / 10 FPS`는 기본값보다 픽셀 처리량이 8배이므로, 먼저 기본값으로
+동작을 확인한 후 단계적으로 올리십시오. 인코더가 처리 속도를 따라가지 못할 때
+Isaac Sim UI를 멈추지 않도록 해당 스트림의 프레임을 드롭하며, 수치는
+`recording.json`에 남습니다.
 
 활성 Viewport는 녹화 시작 시 선택된 카메라 Prim을 사용합니다. 자유 시점 카메라를
 녹화 중 움직이면 같은 Prim의 갱신된 화면이 기록되지만, 녹화 도중 Viewport 자체를
