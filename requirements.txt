@@ -1,0 +1,47 @@
+# Server-side Python environment
+#
+# Covers:
+#   - apps/server_worker
+#   - apps/edge_manager
+#   - apps/calibration_worker
+#
+# Python 3.10 or 3.11 is required. Install the CUDA-compatible torch and
+# torchvision wheels before this file; see SERVER_SETUP.md. The lower bounds
+# below are also required by the pinned VGGT-Omega submodule.
+
+# CUDA inference
+torch>=2.3
+torchvision>=0.18
+
+# Numerical / vision stack
+# VGGT-Omega requires NumPy < 2. OpenCV 4.12+ requires NumPy 2 on modern
+# Python, so keep OpenCV below 4.12. Use only the contrib-headless wheel: it
+# provides cv2.aruco without installing a second, conflicting cv2 package.
+numpy>=1.24,<2
+scipy>=1.10,<2
+scikit-learn>=1.3,<2
+opencv-contrib-python-headless>=4.8,<4.12
+Pillow>=10,<13
+PyYAML>=6,<7
+easydict>=1.10,<2
+
+# VGGT-Omega runtime (the local submodule is installed separately with
+# --no-deps; see SERVER_SETUP.md)
+einops>=0.7,<1
+safetensors>=0.4,<1
+
+# Pixar USD bindings used by calibration_worker to read the marker tree.
+# Isaac Sim itself supplies pxr in its own Python runtime.
+usd-core>=24.5
+
+# Zenoh input/output and optional ZMQ output
+eclipse-zenoh==1.9.0
+pyzmq>=25,<28
+zstandard>=0.21,<1
+
+# Repository utilities and diagnostics
+gdown>=5,<6
+imageio>=2.31,<3
+matplotlib>=3.7,<4
+tqdm>=4.66,<5
+viser>=0.2.23,<1

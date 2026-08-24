@@ -140,6 +140,7 @@ celerybeat.pid
 .env
 apps/edge_client/config/cameras.local.yaml
 .venv
+.venv-server/
 env/
 venv/
 ENV/

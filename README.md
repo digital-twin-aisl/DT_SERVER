@@ -13,6 +13,10 @@ Jetson 엣지에서 멀티 카메라 영상을 처리하고, ReID 및 3D pose �
 
 ## 서버 실행
 
+`server_worker`, `edge_manager`, `calibration_worker`, `isaac_sim_client`의 Python
+가상환경과 GPU/Isaac Sim 준비 절차는 [SERVER_SETUP.md](SERVER_SETUP.md)를 먼저
+확인하세요.
+
 Docker와 Docker Compose를 설치한 서버에서 다음을 실행합니다.
 
 ```bash
