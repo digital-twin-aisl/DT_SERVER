@@ -1,0 +1,18 @@
+[package]
+version = "0.1.0"
+title = "Meta Sejong Multi-Camera Recorder"
+description = "Record the active viewport and eight calibrated campus cameras to MP4."
+category = "Meta Sejong"
+authors = ["Meta Sejong"]
+keywords = ["camera", "recording", "video", "viewport", "replicator"]
+readme = "docs/README.md"
+
+[dependencies]
+"omni.kit.uiapp" = {}
+"omni.kit.menu.utils" = {}
+"omni.kit.viewport.utility" = {}
+"omni.replicator.core" = {}
+"omni.usd" = {}
+
+[[python.module]]
+name = "meta_sejong.multi_camera_recorder"

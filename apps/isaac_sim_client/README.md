@@ -1,5 +1,13 @@
 # Meta Sejong Isaac Sim 연동 클라이언트
 
+## 9-view 영상 녹화 Extension
+
+현재 Viewport와 보정 카메라 8대를 동시에 MP4로 저장하는
+`Meta Sejong Multi-Camera Recorder` Extension이
+`exts/meta_sejong.multi_camera_recorder`에 있습니다. 설치, 출력 구조와 사용법은
+[Extension 문서](exts/meta_sejong.multi_camera_recorder/docs/README.md)를
+참고하십시오.
+
 `meta_sejong_script.py`는 기본적으로 `server_worker/inference.py`가 발행하는
 `SceneOutput` JSON을 Zenoh로 구독하여 Isaac Sim의 USD Stage에 반영합니다.
 기존 `sim_backend` WebSocket 경로도 선택적으로 사용할 수 있습니다.
