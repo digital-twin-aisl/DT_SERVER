@@ -162,6 +162,7 @@ class TelemetryRecorder:
         self._started_monotonic = time.monotonic()
         self._event_count = 0
         self._batch_count = 0
+        self._persisted_batch_count = 0
         self._successful_batches = 0
         self._failed_batches = 0
         self._processing_ms = RunningStats()
@@ -250,7 +251,13 @@ class TelemetryRecorder:
         self._event_count += 1
         return True
 
-    def record_batch(self, event: dict[str, Any]) -> bool:
+    def record_batch(
+        self,
+        event: dict[str, Any],
+        *,
+        persist: bool = True,
+    ) -> bool:
+        """Aggregate every batch while writing only selected batch records."""
         self._batch_count += 1
         if event.get("status") == "ok":
             self._successful_batches += 1
@@ -260,6 +267,9 @@ class TelemetryRecorder:
         workload = event.get("workload") or {}
         self._processing_ms.add(timings.get("processing_total"))
         self._people.add(workload.get("output_people"))
+        if not persist:
+            return True
+        self._persisted_batch_count += 1
         return self.record_event({"event": "batch", **event})
 
     def close(self, extra_summary: dict[str, Any] | None = None) -> None:
@@ -295,6 +305,7 @@ class TelemetryRecorder:
                 "total": self._batch_count,
                 "successful": self._successful_batches,
                 "failed": self._failed_batches,
+                "persisted": self._persisted_batch_count,
                 "successful_batches_per_second": (
                     self._successful_batches / duration if duration else None
                 ),
@@ -317,11 +328,13 @@ class ResourceSampler:
         device: torch.device,
         *,
         interval_seconds: float = 1.0,
+        include_device_metrics: bool = False,
     ) -> None:
         if interval_seconds < 0:
             raise ValueError("interval_seconds must not be negative")
         self.device = device
         self.interval_seconds = interval_seconds
+        self.include_device_metrics = include_device_metrics
         self._last_sample_time: float | None = None
         self._last_process_cpu: float | None = None
         self._last_system_cpu: tuple[int, int] | None = None
@@ -407,6 +420,9 @@ class ResourceSampler:
             )
         except Exception:
             pass
+
+        if not self.include_device_metrics:
+            return result
 
         optional_metrics = (
             ("utilization_percent", "utilization", 1.0),
