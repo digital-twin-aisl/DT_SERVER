@@ -1,42 +1,36 @@
-import json
 import logging
 import math
-import pickle
 import queue
-import struct
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import zenoh
-import zstandard as zstd
+
+
+from dt_common.inference_codec import inspect_message
+from dt_common.zenoh_transport import make_zenoh_config
+from .synchronization import CompressedMessage, SynchronizedBatch, InputScheduler
 
 
 logger = logging.getLogger(__name__)
-PAYLOAD_HEADER = struct.Struct("!4sd")
-PAYLOAD_MAGIC = b"ZNH1"
 
-@dataclass(frozen=True, slots=True)
-class CompressedMessage:
+
+@dataclass(slots=True)
+class PreparedInputs:
+    heatmaps: list
+    roots: torch.Tensor
+    reid_items: list
+    timestamps: list
+    spread: float
+    edge_ids: tuple
+    frames: dict
     timestamp: float
-    payload: bytes
 
-@dataclass(frozen=True, slots=True)
-class SynchronizedBatch:
-    timestamp: float
-    timestamp_spread: float
-    frames: dict[str, Any]
-
-PreparedInputs = tuple[
-    list[torch.Tensor],
-    torch.Tensor,
-    list[dict[str, Any]],
-    list[float],
-    float,
-]
+    def __iter__(self):
+        return iter((self.heatmaps, self.roots, self.reid_items, self.timestamps, self.spread))
 
 
 class ZenohSubscriber:
@@ -63,6 +57,7 @@ class ZenohSubscriber:
         self.received_bytes = {edge_id: 0 for edge_id in topics}
         self.invalid_messages = {edge_id: 0 for edge_id in topics}
         self.closed = False
+        self.last_received = {}
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._error: BaseException | None = None
@@ -87,12 +82,11 @@ class ZenohSubscriber:
         def on_sample(edge_id: str, sample: Any) -> None:
             try:
                 payload = sample.payload.to_bytes()
-                magic, timestamp = PAYLOAD_HEADER.unpack_from(payload)
-                if magic != PAYLOAD_MAGIC or not math.isfinite(timestamp):
-                    raise ValueError("Invalid payload header")
+                timestamp, _ = inspect_message(payload)
                 self.received_messages[edge_id] += 1
                 self.received_bytes[edge_id] += len(payload)
-                message = CompressedMessage(timestamp, payload[PAYLOAD_HEADER.size:])
+                self.last_received[edge_id] = time.monotonic()
+                message = CompressedMessage(timestamp, payload, self.last_received[edge_id])
                 target_queue = self.queues[edge_id]
                 try:
                     target_queue.put_nowait(message)
@@ -108,16 +102,7 @@ class ZenohSubscriber:
                 logger.exception("Invalid Zenoh message from %s", edge_id)
 
         try:
-            if self.config_path:
-                config = zenoh.Config.from_file(self.config_path)
-            elif self.endpoint:
-                endpoint = self.endpoint
-                if "/" not in endpoint:
-                    endpoint = f"tcp/{endpoint}"
-                config_data = {"mode": "client", "connect": {"endpoints": [endpoint]}}
-                config = zenoh.Config.from_json5(json.dumps(config_data))
-            else:
-                config = zenoh.Config()
+            config = make_zenoh_config(self.endpoint, self.config_path)
             logger.info("Opening Zenoh session")
             with zenoh.open(config) as session:
                 subscribers = [
@@ -138,6 +123,8 @@ class ZenohSubscriber:
             self._ready.set()
 
     def get(self, edge_id: str, timeout: float = 0.1) -> CompressedMessage | None:
+        if self._error is not None:
+            raise RuntimeError("Zenoh subscriber worker failed") from self._error
         try:
             return self.queues[edge_id].get(timeout=timeout)
         except queue.Empty:
@@ -166,9 +153,17 @@ class ZenohDataLoader:
         expected_workspace_ids: dict[str, str] | None = None,
         endpoint: str | None = None,
         config_path: str | None = None,
-        topic_template: str = "edge/{edge_id}",
+        topic_template: str = "dt/edges/{edge_id}/inference",
         buffer_size: int = 10,
         sync_tolerance: float = 0.03,
+        input_mode: str = "independent",
+        input_clock: str = "live",
+        max_input_age: float = 0.75,
+        future_tolerance: float = 0.1,
+        expected_calibration_digests: dict | None = None,
+        expected_heatmap_shape: tuple | None = None,
+        expected_root_count: int | None = None,
+        subscriber=None,
     ) -> None:
         if not edge_ids or len(edge_ids) != len(set(edge_ids)):
             raise ValueError("edge_ids must be non-empty and unique")
@@ -201,12 +196,17 @@ class ZenohDataLoader:
         self.expected_workspace_ids = expected_workspace_ids
         self.device = device
         self.sync_tolerance = sync_tolerance
-        self.buffers = {edge_id: deque(maxlen=buffer_size) for edge_id in edge_ids}
-        self.synchronization_discarded = {edge_id: 0 for edge_id in edge_ids}
-        self.decode_failures = 0
+        self.scheduler = InputScheduler(edge_ids, mode=input_mode, clock=input_clock,
+                                        buffer_size=buffer_size, sync_tolerance=sync_tolerance,
+                                        max_age=max_input_age, future_tolerance=future_tolerance)
+        self.buffers = self.scheduler.buffers
+        self.synchronization_discarded = self.scheduler.discarded
+        self.expected_calibration_digests = expected_calibration_digests
+        self.expected_heatmap_shape = expected_heatmap_shape
+        self.expected_root_count = expected_root_count
         self.prepare_failures = 0
-        self.subscriber = ZenohSubscriber(topics, endpoint, config_path, buffer_size)
-        self._decompressor = zstd.ZstdDecompressor()
+        self.subscriber = subscriber or ZenohSubscriber(topics, endpoint, config_path, buffer_size)
+        self.last_valid_received = {}
         self._batch_count = 0
         logger.info(
             "Zenoh data loader is initialized: edges=%s, sync_tolerance=%.3fs",
@@ -214,70 +214,57 @@ class ZenohDataLoader:
             self.sync_tolerance,
         )
 
+    @property
+    def decode_failures(self):
+        return self.scheduler.decode_failures
+
+    def edge_status(self):
+        now = time.monotonic()
+        return {edge: ("online" if now - self.last_valid_received.get(edge, -math.inf)
+                       <= self.scheduler.max_age else "offline") for edge in self.edge_ids}
+
     def get(self, timeout: float = 1.0) -> PreparedInputs | None:
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("receive timeout must be finite and positive")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            for edge_id, buffer in self.buffers.items():
-                if not buffer:
-                    remaining = max(0.0, deadline - time.monotonic())
-                    message = self.subscriber.get(edge_id, remaining)
-                    if message is None:
-                        return None
-                    buffer.append(message)
-                while (message := self.subscriber.get(edge_id, 0)) is not None:
-                    buffer.append(message)
-            watermark = min(buffer[-1].timestamp for buffer in self.buffers.values())
-            selected = {}
-            for edge_id, buffer in self.buffers.items():
-                index = min(
-                    range(len(buffer)),
-                    key=lambda i: abs(buffer[i].timestamp - watermark),
-                )
-                selected[edge_id] = index, buffer[index]
-            timestamps = [message.timestamp for _, message in selected.values()]
-            spread = max(timestamps) - min(timestamps)
-            if spread <= self.sync_tolerance:
-                for edge_id, (index, _) in selected.items():
-                    self.synchronization_discarded[edge_id] += index
-                    for _ in range(index + 1):
-                        self.buffers[edge_id].popleft()
-                try:
-                    frames = {
-                        edge_id: pickle.loads(
-                            self._decompressor.decompress(message.payload)
-                        )
-                        for edge_id, (_, message) in selected.items()
-                    }
-                except Exception:
-                    self.decode_failures += 1
-                    logger.exception("Failed to decode synchronized batch")
-                    continue
-                batch = SynchronizedBatch(
-                    sum(timestamps) / len(timestamps),
-                    spread,
-                    frames,
-                )
-                try:
-                    heatmaps, roots, reid_items, frame_timestamps = (
-                        self._prepare_inputs(batch)
-                    )
-                except Exception:
-                    self.prepare_failures += 1
-                    logger.exception("Failed to prepare synchronized batch")
-                    continue
+            for edge in self.edge_ids:
+                while (message := self.subscriber.get(edge, 0)) is not None:
+                    self.scheduler.add(edge, message)
+            batch = self.scheduler.select()
+            if batch is not None:
+                if self.scheduler.mode == "independent":
+                    valid = {}
+                    items = []
+                    for edge, frame in batch.frames.items():
+                        try:
+                            items.append(self._prepare_inputs(SynchronizedBatch(frame["time"], 0, {edge: frame})))
+                            valid[edge] = frame
+                        except Exception:
+                            self.prepare_failures += 1
+                            logger.exception("Invalid input from %s", edge)
+                    if not valid:
+                        continue
+                    if any(len(item[0]) != len(items[0][0]) for item in items):
+                        raise ValueError("configured edges must use the same number of views")
+                    prepared = ([torch.cat([item[0][view] for item in items], dim=0) for view in range(len(items[0][0]))],
+                                torch.cat([item[1] for item in items], dim=0),
+                                [person for item in items for person in item[2]],
+                                [timestamp for item in items for timestamp in item[3]])
+                    stamps = prepared[3]
+                    batch = SynchronizedBatch(max(batch.timestamp, max(stamps)), max(stamps) - min(stamps), valid)
+                else:
+                    try:
+                        prepared = self._prepare_inputs(batch)
+                    except Exception:
+                        self.prepare_failures += 1
+                        logger.exception("Failed to prepare input batch")
+                        continue
                 self._batch_count += 1
-                if self._batch_count == 1:
-                    logger.info(
-                        "First Zenoh batch prepared: views=%d, reid_items=%d",
-                        len(heatmaps),
-                        len(reid_items),
-                    )
-                return heatmaps, roots, reid_items, frame_timestamps, spread
-            oldest_edge = min(selected, key=lambda edge_id: selected[edge_id][1].timestamp)
-            oldest_index = selected[oldest_edge][0]
-            self.synchronization_discarded[oldest_edge] += oldest_index + 1
-            for _ in range(oldest_index + 1):
-                self.buffers[oldest_edge].popleft()
+                self.last_valid_received.update({edge: time.monotonic() for edge in batch.frames})
+                return PreparedInputs(*prepared, batch.timestamp_spread,
+                                      tuple(batch.frames), batch.frames, batch.timestamp)
+            time.sleep(min(0.002, max(0, deadline - time.monotonic())))
         return None
 
     def _prepare_inputs(
@@ -291,20 +278,29 @@ class ZenohDataLoader:
         timestamps = []
         view_count = None
 
-        for edge_id in self.edge_ids:
-            frame = batch.frames[edge_id]
+        for edge_id, frame in batch.frames.items():
             heatmap_values = frame.get("allheatmaps")
             root_values = frame.get("roots")
             if not heatmap_values or root_values is None:
                 raise ValueError(f"Missing heatmaps or roots from Edge {edge_id}")
 
+            expected_digest = (getattr(self, "expected_calibration_digests", None) or {}).get(edge_id)
+            if expected_digest and frame.get("calibration_digest") != expected_digest:
+                raise ValueError(f"Effective calibration mismatch from Edge {edge_id}")
+            if len(heatmap_values) != len(frame.get("camera_ids") or []):
+                raise ValueError(f"Camera/heatmap count mismatch from {edge_id}")
             views = []
             for value in heatmap_values:
                 heatmap = torch.as_tensor(value)
                 if heatmap.ndim == 4 and heatmap.shape[0] == 1:
                     heatmap = heatmap.squeeze(0)
+                if heatmap.dtype != torch.uint8:
+                    raise ValueError(f"Heatmaps from {edge_id} must use uint8")
                 if heatmap.ndim != 3:
                     raise ValueError(f"Invalid heatmap shape from Edge {edge_id}")
+                shape = getattr(self, "expected_heatmap_shape", None)
+                if shape and tuple(heatmap.shape) != tuple(shape):
+                    raise ValueError(f"Unexpected model heatmap shape from {edge_id}")
                 views.append(heatmap)
 
             if self.expected_camera_ids is not None:
@@ -361,6 +357,11 @@ class ZenohDataLoader:
                     f"Invalid root shape from Edge {edge_id}: "
                     f"expected [num_roots, 5], got {tuple(roots.shape)}"
                 )
+            if not torch.isfinite(roots).all():
+                raise ValueError(f"Non-finite roots from {edge_id}")
+            count = getattr(self, "expected_root_count", None)
+            if count is not None and roots.shape[0] != count:
+                raise ValueError(f"Unexpected root candidate count from {edge_id}")
             edge_roots.append(roots)
 
             for item in frame.get("reid") or []:

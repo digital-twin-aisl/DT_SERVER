@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import threading
 import time
+from dataclasses import dataclass
+from contextlib import ExitStack
 from multiprocessing import Process, shared_memory
 from urllib.parse import urlsplit
 
@@ -22,6 +24,52 @@ RTSP_SCHEMES = {"rtsp", "rtsps"}
 
 class FrameUnavailableError(RuntimeError):
     """A live camera has not produced a sufficiently fresh frame."""
+
+
+@dataclass(frozen=True)
+class FrameBundle:
+    frames: list
+    timestamps: list[float]
+    sequences: list[int]
+    timestamp_kind: str = "receive_unix"
+
+
+def snapshot_live_bundle(buffers, process, *, max_age, max_skew, previous_sequences=None):
+    """Select a near-time set from per-camera rings using receiver timestamps.
+
+    OpenCV does not expose a common camera exposure clock here. These timestamps
+    are explicitly labelled receive_unix, never advertised as capture time.
+    """
+    depth = process.buffer_depth
+    with ExitStack() as locks:
+        for lock in process.frame_locks:
+            locks.enter_context(lock)
+        now = time.monotonic()
+        candidates = []
+        for index in range(len(buffers)):
+            slots = [slot for slot in range(depth)
+                     if process.frame_timestamps[index * depth + slot] > 0
+                     and now - process.frame_timestamps[index * depth + slot] <= max_age
+                     and (previous_sequences is None or
+                          process.frame_sequences[index * depth + slot] > previous_sequences[index])]
+            if not slots:
+                raise FrameUnavailableError(f"camera {process.camera_ids[index]} has no new fresh frame")
+            candidates.append(slots)
+        target = min(max(process.frame_timestamps[index * depth + slot] for slot in slots)
+                     for index, slots in enumerate(candidates))
+        selected = [min(slots, key=lambda slot: abs(process.frame_timestamps[index * depth + slot] - target))
+                    for index, slots in enumerate(candidates)]
+        selected_mono = [process.frame_timestamps[index * depth + slot]
+                         for index, slot in enumerate(selected)]
+        if max(selected_mono) - min(selected_mono) > max_skew:
+            raise FrameUnavailableError(f"RTSP frame arrival skew exceeds {max_skew:.3f}s")
+        frames, timestamps, sequences = [], [], []
+        for index, ((shm, shape, dtype), slot) in enumerate(zip(buffers, selected)):
+            array = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+            frames.append((array[slot] if depth > 1 else array).copy())
+            timestamps.append(float(process.frame_wall_timestamps[index * depth + slot]))
+            sequences.append(int(process.frame_sequences[index * depth + slot]))
+    return FrameBundle(frames, timestamps, sequences)
 
 
 def load_camera_sources(path):
@@ -233,8 +281,11 @@ def select_dataset_camera_ids(path, edge_id, num_views):
 class SharedFrameProcess(Process):
     """Base process that exposes one shared-memory frame per video source."""
 
-    def __init__(self, paths, stop_event, conn, camera_ids=None):
+    def __init__(self, paths, stop_event, conn, camera_ids=None, buffer_depth=1):
         super().__init__(daemon=False)
+        self.buffer_depth = int(buffer_depth)
+        if not 1 <= self.buffer_depth <= 32:
+            raise ValueError("buffer_depth must be between 1 and 32")
         self.paths = list(paths)
         self.camera_ids = list(camera_ids or range(1, len(self.paths) + 1))
         if len(self.camera_ids) != len(self.paths):
@@ -247,9 +298,12 @@ class SharedFrameProcess(Process):
         self.frame_locks = [mp.Lock() for _ in self.paths]
         self.frame_timestamps = mp.Array(
             "d",
-            len(self.paths),
+            len(self.paths) * self.buffer_depth,
             lock=False,
         )
+        self.frame_wall_timestamps = mp.Array("d", len(self.paths) * self.buffer_depth, lock=False)
+        self.frame_sequences = mp.Array("Q", len(self.paths) * self.buffer_depth, lock=False)
+        self.frame_counts = [0] * len(self.paths)
 
     def _create_capture(self, path):
         return cv2.VideoCapture(path)
@@ -298,14 +352,13 @@ class SharedFrameProcess(Process):
                 )
                 continue
 
-            shm = shared_memory.SharedMemory(create=True, size=frame.nbytes)
+            shm = shared_memory.SharedMemory(create=True, size=frame.nbytes * self.buffer_depth)
             self.shms[index] = shm
             self.shapes[index] = frame.shape
             self.dtypes[index] = frame.dtype
-            self.conn.send(
-                ("OK", index, shm.name, frame.shape, frame.dtype.str)
-            )
             self._write_frame(index, frame)
+            shared_shape = (self.buffer_depth, *frame.shape) if self.buffer_depth > 1 else frame.shape
+            self.conn.send(("OK", index, shm.name, shared_shape, frame.dtype.str))
         return captures
 
     def _write_frame(self, index, frame):
@@ -316,12 +369,20 @@ class SharedFrameProcess(Process):
         if frame.dtype != dtype:
             frame = frame.astype(dtype)
         with self.frame_locks[index]:
-            np.ndarray(shape, dtype=dtype, buffer=self.shms[index].buf)[:] = frame
-            self.frame_timestamps[index] = time.monotonic()
+            slot = self.frame_counts[index] % self.buffer_depth
+            shared_shape = (self.buffer_depth, *shape) if self.buffer_depth > 1 else shape
+            array = np.ndarray(shared_shape, dtype=dtype, buffer=self.shms[index].buf)
+            (array[slot] if self.buffer_depth > 1 else array)[:] = frame
+            self.frame_counts[index] += 1
+            location = index * self.buffer_depth + slot
+            self.frame_timestamps[location] = time.monotonic()
+            self.frame_wall_timestamps[location] = time.time()
+            self.frame_sequences[location] = self.frame_counts[index]
 
     def _invalidate_frame(self, index):
         with self.frame_locks[index]:
-            self.frame_timestamps[index] = 0.0
+            for slot in range(self.buffer_depth):
+                self.frame_timestamps[index * self.buffer_depth + slot] = 0.0
 
     def _release_sources(self, captures):
         for capture in captures:
@@ -408,6 +469,7 @@ class IPCamera(SharedFrameProcess):
         read_timeout_ms=3000,
         reconnect_delay=0.5,
         expected_size=None,
+        buffer_depth=4,
     ):
         del input_flag  # Kept in the signature for legacy callers.
         if transport not in {"tcp", "udp"}:
@@ -430,6 +492,7 @@ class IPCamera(SharedFrameProcess):
             stop_event,
             conn,
             (int(camera["id"]) for camera in cameras),
+            buffer_depth=buffer_depth,
         )
 
     def _create_capture(self, path):

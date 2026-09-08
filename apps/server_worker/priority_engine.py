@@ -78,7 +78,13 @@ scenario:
 * the lower-left corner is the origin ``(0, 0)``,
 * positions and distances are measured in metres,
 * observations normally arrive once per second, and
-* the exact hazard point is ``(2 m, 4 m)``.
+* the original tuning used the hazard point ``(2 m, 4 m)``.
+
+The current deployment default is the MetaSejong campus point
+``(90.76 m, 6.82 m)``. The PoC runtime loads its hazard points from the deployment
+manifest and uses a 0.5 s initial decision interval. Individual persons may
+supply their observation ``timestamp`` so retained observations do not distort
+velocity estimation when edges have different processing delays.
 
 The map boundary itself is not used by the ranking calculation. These values
 are an initial corridor-specific setting and should be retuned if the physical
@@ -99,7 +105,8 @@ Point2D = Tuple[float, float]
 
 
 DEFAULT_HAZARDS: Tuple[Point2D, ...] = (
-    (2.0, 4.0),
+    # Campus stage XY (9076, 682), metersPerUnit=0.01; runtime uses metres.
+    (90.76, 6.82),
 )
 
 
@@ -171,7 +178,7 @@ class PriorityConfig:
     # 전체 우선순위에서 AoI 항에 곱하는 가중치입니다.
     # 클수록 위험 지역과의 거리보다 동기화되지 않은 시간이 중요해집니다.
     # 0이면 AoI는 랭킹에 영향을 주지 않습니다.
-    lambda_aoi: float = 0.1
+    lambda_aoi: float = 0
 
     # AoI 지수 계산값의 최대치로, 지나치게 큰 수와 overflow를 방지합니다.
     # 작게 설정하면 매우 오래 미동기화된 객체의 AoI 점수가 일찍 포화됩니다.
@@ -243,6 +250,7 @@ class _TrackState:
     velocity_y: float
     aoi_seconds: float
     selected_last_step: bool
+    observed_at: Optional[float] = None
 
 
 @dataclass
@@ -257,6 +265,7 @@ class _Candidate:
     hazard_score: float
     aoi_score: float
     score: float
+    observed_at: float
 
 
 class PriorityEngine:
@@ -274,6 +283,15 @@ class PriorityEngine:
         with self._lock:
             self._tracks.clear()
             self._last_decision_timestamp = None
+
+    def merge_identities(self, aliases: Mapping) -> None:
+        """Keep velocity history when a tentative ID gains a confirmed ID."""
+        with self._lock:
+            for old, new in aliases.items():
+                previous = self._tracks.pop(old, None)
+                current = self._tracks.get(new)
+                if previous is not None and (current is None or previous.timestamp > current.timestamp):
+                    self._tracks[new] = previous
 
     def assign_priority(
         self,
@@ -379,12 +397,15 @@ class PriorityEngine:
                 seen_track_ids.add(track_id)
 
                 plane_x, plane_y = self._read_ground_position(position, input_index)
+                observed_at = float(raw_person.get("timestamp", now))
+                if not math.isfinite(observed_at) or observed_at > now + 1e-6:
+                    raise ValueError("person timestamp must be finite and no later than decision time")
                 previous = self._tracks.get(track_id)
                 velocity_x, velocity_y = self._estimate_velocity(
                     previous,
                     plane_x,
                     plane_y,
-                    now,
+                    observed_at,
                 )
                 previous_aoi = self._current_aoi(previous, now)
 
@@ -413,6 +434,7 @@ class PriorityEngine:
                         hazard_score=hazard_score,
                         aoi_score=aoi_score,
                         score=score,
+                        observed_at=observed_at,
                     )
                 )
 
@@ -441,6 +463,7 @@ class PriorityEngine:
                     velocity_y=candidate.velocity_y,
                     aoi_seconds=next_aoi,
                     selected_last_step=is_selected,
+                    observed_at=candidate.observed_at,
                 )
 
             self._last_decision_timestamp = now
@@ -485,7 +508,7 @@ class PriorityEngine:
         if previous is None:
             return 0.0, 0.0
 
-        dt = now - previous.timestamp
+        dt = now - (previous.observed_at if previous.observed_at is not None else previous.timestamp)
         if dt < self.config.minimum_dt_s:
             return previous.velocity_x, previous.velocity_y
 
@@ -567,6 +590,12 @@ class PriorityEngine:
         if self.config.w_clip is not None:
             total = min(total, self.config.w_clip)
         return total
+
+    def instant_urgency(self, position: Point2D, velocity: Point2D) -> float:
+        """Spatial kernel shared with offline evaluation of actual future states."""
+        if not all(math.isfinite(float(value)) for value in (*position, *velocity)):
+            raise ValueError("position and velocity must be finite")
+        return self._instant_urgency(position, velocity)
 
     def _distance_kernel(self, distance: float) -> float:
         if self.config.kernel_mode == "rbf":

@@ -1,0 +1,127 @@
+{
+  "version": 3,
+  "coordinate_system": "USD world, Z-up",
+  "world_unit": "metre",
+  "model_unit": "millimetre",
+  "world_origin_m": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "scene": {
+    "id": "scene_0812_poc",
+    "ground_usd": "../../Ground.usd",
+    "ground_cache": "cache/scene_0812_2_ground.npz"
+  },
+  "calibration_result": "calibration_result_20260814-123941.json",
+  "workspace": {
+    "strategy": "explicit_aoi",
+    "min_views": 2,
+    "sample_spacing_mm": 250.0,
+    "boundary_padding_mm": 125.0,
+    "root_height_mm": 900.0,
+    "root_clearance_mm": [
+      400.0,
+      1400.0
+    ],
+    "foot_clearance_mm": [
+      -150.0,
+      350.0
+    ],
+    "preserve_voxel_spacing": true,
+    "camera_rectangle_fallback": true
+  },
+  "resolution": {
+    "width": 1920,
+    "height": 1080
+  },
+  "fps": 29.97002997002997,
+  "topic_root": "dt/edges",
+  "edges": [
+    {
+      "id": "edge_1",
+      "enabled": true,
+      "camera_ids": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "workspace": {
+        "polygon_xy_m": [
+          [
+            76.699439,
+            -7.423196
+          ],
+          [
+            71.889357,
+            -2.906324
+          ],
+          [
+            83.153728,
+            9.089269
+          ],
+          [
+            87.96381,
+            4.572397
+          ]
+        ]
+      }
+    },
+    {
+      "id": "edge_2",
+      "enabled": true,
+      "camera_ids": [
+        1,
+        3,
+        5,
+        7
+      ],
+      "workspace": {
+        "polygon_xy_m": [
+          [
+            84.962211,
+            0.803457
+          ],
+          [
+            80.155539,
+            5.214113
+          ],
+          [
+            90.33969,
+            16.312659
+          ],
+          [
+            95.146362,
+            11.902003
+          ]
+        ]
+      }
+    }
+  ],
+  "poc": {
+    "meeting": "260814 DT PoC 관련 미팅.pdf",
+    "hazards_metres": [
+      [
+        90.76,
+        6.82
+      ]
+    ],
+    "hazard_source": {
+      "stage_file": "2025_SejongUniv_All.usd",
+      "meters_per_unit": 0.01,
+      "stage_xy": [
+        9076,
+        682
+      ],
+      "coordinate_frame": "USD world, Z-up"
+    },
+    "priority_interval_s": 0.5,
+    "lambda_aoi": 0.0,
+    "zone_baseline": {
+      "edge_1": 2,
+      "edge_2": 1
+    },
+    "zone_baseline_note": "Fixed edge/zone LOD baseline follows legacy zone order; confirm zones for the evaluation scenario."
+  }
+}

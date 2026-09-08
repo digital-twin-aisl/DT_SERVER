@@ -4,6 +4,9 @@ Jetson에서 RTSP 카메라 영상을 추론하고 결과를 Zenoh router를 통
 전송합니다. 장비별 ID, 서버 주소, 카메라 설정과 추론 기본값은 로컬 파일에 한 번
 저장되며, 이후에는 같은 인자를 반복해서 입력하지 않습니다.
 
+두 엣지 + 한 서버의 회의 기반 실행 설정은 [PoC 실행 문서](../server_worker/docs/poc-runtime.md)를
+사용합니다. 0.5초 Rank/LOD, 공통 calibration, TCP router 및 오프라인 Rank/Zone 비교 명령을 포함합니다.
+
 ## 1. 설치
 
 지원 환경은 Jetson Orin 계열, JetPack 6/L4T R36, Python 3.10입니다. 저장소

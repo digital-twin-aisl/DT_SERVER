@@ -1,5 +1,9 @@
 # Server inference telemetry
 
+For the meeting-specific two-edge deployment, use the [PoC runtime guide](poc-runtime.md).
+Its online profile disables metrics by default; offline profiles record explicit
+decision/runtime files only when `--decision-output` is supplied.
+
 `inference.py` creates one telemetry directory per process under
 `apps/server_worker/data/metrics` by default. The writer is asynchronous and
 bounded; if storage cannot keep up, inference continues and the number of lost

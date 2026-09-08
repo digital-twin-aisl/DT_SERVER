@@ -1,0 +1,7 @@
+{
+  mode: "router",
+  // Both physical edges and the server/Isaac clients use this one router.
+  // TCP is the initial PoC baseline; the existing QUIC profile is still available.
+  listen: { endpoints: ["tcp/0.0.0.0:7447"] },
+  scouting: { multicast: { enabled: false } }
+}

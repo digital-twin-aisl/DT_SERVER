@@ -1,16 +1,16 @@
 # ruff: noqa: E402
 
 import argparse
+import json
 import hashlib
+import math
 import multiprocessing as mp
 from multiprocessing import shared_memory
 from pathlib import Path
-import pickle
-import struct
 import sys
 import time
 import traceback
-import zstandard as zstd
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -44,16 +44,25 @@ from apps.edge_client.src.utils.input import (
     select_dataset_camera_ids,
     select_live_cameras,
     snapshot_shared_frames,
+    snapshot_live_bundle,
 )
 from apps.edge_client.src.utils.pre_process import PREPROCESS
 from apps.edge_client.src.utils.tensorrt import load_tensorrt_model
 from apps.edge_client.config.config import config as focus_config
 from apps.edge_client.config.config import update_config as update_focus_config
 from dt_common.spatial.workspace import build_edge_workspace, load_spatial_context
+from dt_common.inference_codec import encode_frame
+from dt_common.runtime_config import parse_runtime_args
+from dt_common.calibration.identity import calibration_digest
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Edge inference with Zenoh")
+    parser.add_argument("--runtime-config", help="Portable JSON launch profile; CLI overrides it")
+    parser.add_argument("--validate-only", action="store_true", help="Validate configuration without opening cameras or loading GPU models")
+    parser.add_argument("--record-output", help="Record ZNH2 packets under PATH/edge_id for offline replay")
+    parser.add_argument("--require-identity", action=argparse.BooleanOptionalAction, default=False,
+                        help="Require an initialized edge identity and explicit router settings")
     parser.add_argument("--cfg-focus", "--cfg_focus", dest="cfg_focus")
     parser.add_argument(
         "--deployment",
@@ -83,8 +92,9 @@ def parse_args(argv=None):
     parser.add_argument("--rtsp-open-timeout-ms", type=int, default=8000)
     parser.add_argument("--rtsp-read-timeout-ms", type=int, default=3000)
     parser.add_argument("--rtsp-reconnect-delay", type=float, default=0.5)
-    parser.add_argument("--rtsp-max-frame-age", type=float, default=2.0)
-    parser.add_argument("--rtsp-max-skew", type=float, default=0.5)
+    parser.add_argument("--rtsp-max-frame-age", type=float, default=0.75)
+    parser.add_argument("--rtsp-max-skew", type=float, default=0.03)
+    parser.add_argument("--rtsp-buffer-frames", type=int, default=4)
     parser.add_argument("--zenoh-endpoint", type=str)
     parser.add_argument("--zenoh-config", type=str)
     parser.add_argument("--zenoh-topic", type=str, help=argparse.SUPPRESS)
@@ -106,19 +116,21 @@ def parse_args(argv=None):
         type=int,
         help="Stop after this many frames (useful for dataset smoke tests)",
     )
-    args = parser.parse_args(argv)
+    args = parse_runtime_args(parser, argv)
+    if not 1 <= args.rtsp_buffer_frames <= 32:
+        parser.error("--rtsp-buffer-frames must be between 1 and 32")
     if args.dataset and not args.example_folder:
         parser.error("--dataset requires --example-folder")
     if args.max_frames is not None and args.max_frames < 1:
         parser.error("--max-frames must be at least 1")
     if min(args.rtsp_open_timeout_ms, args.rtsp_read_timeout_ms) < 1:
         parser.error("RTSP timeouts must be positive")
-    if min(
+    if not all(math.isfinite(value) and value > 0 for value in (
         args.rtsp_reconnect_delay,
         args.rtsp_max_frame_age,
         args.rtsp_max_skew,
-    ) <= 0:
-        parser.error("RTSP reconnect/freshness values must be positive")
+    )):
+        parser.error("RTSP reconnect/freshness values must be finite and positive")
     return args
 
 
@@ -297,11 +309,6 @@ def load_models(use_tensorrt, use_reid, rebuild_tensorrt=False):
     return pose_preprocess, pose_model, reid_engine, yolo_model
 
 
-PAYLOAD_HEADER = struct.Struct("!4sd")
-PAYLOAD_MAGIC = b"ZNH1"
-COMPRESSOR = zstd.ZstdCompressor(level=1)
-
-
 def serialize_output(
     timestamp,
     reid,
@@ -309,6 +316,16 @@ def serialize_output(
     heatmaps,
     camera_ids,
     spatial_identity=None,
+    *,
+    edge_id=None,
+    session_id="manual",
+    sequence=0,
+    timestamp_kind="dataset_relative",
+    frame_timestamps=None,
+    frame_ids=None,
+    effective_calibration=None,
+    inference_started_at=None,
+    inference_finished_at=None,
 ):
     output = {
         "time": timestamp,
@@ -316,13 +333,40 @@ def serialize_output(
         "roots": roots,
         "allheatmaps": heatmaps,
         "camera_ids": list(camera_ids),
+        "edge_id": edge_id or (spatial_identity or {}).get("edge_id"),
+        "session_id": session_id,
+        "sequence": sequence,
+        "timestamp_kind": timestamp_kind,
+        "frame_timestamps": frame_timestamps or [timestamp] * len(camera_ids),
+        "frame_ids": frame_ids or [sequence] * len(camera_ids),
+        "calibration_digest": effective_calibration,
+        "inference_started_at": inference_started_at,
+        "inference_finished_at": inference_finished_at,
     }
     if spatial_identity is not None:
         output["spatial_context"] = dict(spatial_identity)
-    compressed = COMPRESSOR.compress(
-        pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL)
-    )
-    return PAYLOAD_HEADER.pack(PAYLOAD_MAGIC, timestamp) + compressed
+    return encode_frame(output)
+
+
+def count_valid_roots(roots):
+    values = np.asarray(roots).reshape(-1, 5)
+    return int(((values[:, 3] >= 0) & np.isfinite(values[:, 4])).sum())
+
+
+def print_startup_metadata(*, edge_id, edge_metadata, args, spatial_context,
+                           live_cameras, use_tensorrt, zenoh_endpoint, inference_topic):
+    metadata = {
+        "edge_id": edge_id, "display_name": edge_metadata.get("display_name"),
+        "approved": bool(edge_metadata.get("approved")),
+        "camera_ids": (list(spatial_context.edge_camera_ids[edge_id]) if spatial_context else
+                       [int(camera["id"]) for camera in live_cameras or []]),
+        "tensorrt": use_tensorrt, "dataset": args.dataset,
+        "deployment": args.deployment,
+        "timestamp_kind": "dataset_relative" if args.dataset else "receive_unix",
+        "server_router": {"endpoint": zenoh_endpoint, "topic": inference_topic,
+                          "status": "disabled" if args.no_zenoh else "connecting"},
+    }
+    print("Edge startup configuration:\n" + json.dumps(metadata, indent=2), flush=True)
 
 
 def attach_input_buffers(parent, process):
@@ -424,7 +468,8 @@ def create_input_process(
     )
     CalibrationData(
         sp3d_config,
-        cameras=live_cameras,
+        cameras=live_cameras if spatial_context is None else None,
+        calibration_path=spatial_context.calibration_path if spatial_context else None,
         camera_ids=camera_ids,
         world_origin_m=(
             spatial_context.world_origin_m
@@ -442,6 +487,7 @@ def create_input_process(
         read_timeout_ms=args.rtsp_read_timeout_ms,
         reconnect_delay=args.rtsp_reconnect_delay,
         expected_size=sp3d_config.NETWORK.IMAGE_SIZE_ORIG,
+        buffer_depth=args.rtsp_buffer_frames,
     )
 
 
@@ -490,6 +536,12 @@ def main():
     args.edge_id_file = str(
         resolve_edge_path(args.edge_id_file, must_exist=False)
     )
+    if args.require_identity:
+        identity = load_edge_metadata(args.edge_id_file) if Path(args.edge_id_file).is_file() else {}
+        if not identity or (args.edge_id and identity.get("edge_id") != args.edge_id):
+            raise ValueError("Initialize this edge profile with agent.py init before starting inference")
+        if not any((args.zenoh_endpoint, args.zenoh_config, identity.get("zenoh_endpoint"), identity.get("zenoh_config"))):
+            raise ValueError("Configure the server router endpoint with agent.py init --endpoint")
     edge_id = load_or_create_edge_id(args.edge_id_file, args.edge_id)
     edge_metadata = load_edge_metadata(args.edge_id_file)
     inference_defaults = edge_metadata.get("inference") or {}
@@ -498,9 +550,8 @@ def main():
 
     cfg_focus = args.cfg_focus or inference_defaults.get("cfg_focus")
     if cfg_focus:
-        update_focus_config(
-            resolve_identity_setting(cfg_focus, args.edge_id_file)
-        )
+        update_focus_config(resolve_edge_path(cfg_focus) if args.cfg_focus else
+                            resolve_identity_setting(cfg_focus, args.edge_id_file))
     update_sp3d_config(resolve_edge_path(focus_config.POSENET.CONFIG))
     use_tensorrt = (
         bool(inference_defaults.get("tensorrt", focus_config.POSENET.TENSORRT))
@@ -511,19 +562,23 @@ def main():
         args.example_folder = str(resolve_edge_path(args.example_folder))
     deployment = args.deployment or inference_defaults.get("deployment")
     args.deployment = (
-        str(resolve_identity_setting(deployment, args.edge_id_file))
+        str(resolve_edge_path(deployment) if args.deployment else
+            resolve_identity_setting(deployment, args.edge_id_file))
         if deployment
         else None
     )
     zenoh_config = args.zenoh_config or edge_metadata.get("zenoh_config")
     args.zenoh_config = (
-        str(resolve_identity_setting(zenoh_config, args.edge_id_file))
+        str(resolve_edge_path(zenoh_config) if args.zenoh_config else
+            resolve_identity_setting(zenoh_config, args.edge_id_file))
         if zenoh_config
         else None
     )
     spatial_context = (
         load_spatial_context(args.deployment) if args.deployment else None
     )
+    if spatial_context is not None and edge_id not in spatial_context.edge_camera_ids:
+        raise ValueError(f"edge {edge_id!r} is not enabled in the deployment")
     if args.dataset:
         validate_dataset_spatial_context(args.example_folder, spatial_context)
     sp3d_config.SPATIAL_CONTEXT = spatial_context
@@ -547,6 +602,10 @@ def main():
         edge_id,
         topic_root,
     ).inference
+    print_startup_metadata(edge_id=edge_id, edge_metadata=edge_metadata, args=args,
+                           spatial_context=spatial_context, live_cameras=live_cameras,
+                           use_tensorrt=use_tensorrt, zenoh_endpoint=zenoh_endpoint,
+                           inference_topic=inference_topic)
 
     stop_event = mp.Event()
     input_flag = mp.Value("b", not args.dataset)
@@ -596,12 +655,26 @@ def main():
         else:
             sp3d_config.EDGE_WORKSPACE = None
             spatial_identity = None
+        effective_calibration = calibration_digest(sp3d_config.CAMS)
+        if args.validate_only:
+            resolve_edge_path(focus_config.POSENET.CKPT)
+            print("Configuration validation passed (camera/network/GPU readiness not probed)")
+            return
+        record_dir = None
+        if args.record_output:
+            record_dir = Path(args.record_output).expanduser().resolve() / edge_id
+            record_dir.mkdir(parents=True, exist_ok=True)
+            if any(record_dir.glob("*.dtframe")):
+                raise ValueError(f"recording directory is not empty: {record_dir}")
         input_process.start()
         child.close()
 
         buffers = attach_input_buffers(parent, input_process)
         camera_ids = input_process.camera_ids
 
+        if not args.no_zenoh:
+            sender = ZenohSender(topic=inference_topic, endpoint=zenoh_endpoint,
+                                 config_path=args.zenoh_config, queue_size=2)
         pose_preprocess, pose_model, reid_engine, yolo_model = load_models(
             use_tensorrt,
             not args.no_reid,
@@ -620,38 +693,31 @@ def main():
 
         if args.no_zenoh:
             print("Zenoh output disabled")
-        else:
-            sender = ZenohSender(
-                topic=inference_topic,
-                endpoint=zenoh_endpoint,
-                config_path=args.zenoh_config,
-                queue_size=2,
-            )
-
         frame_num = 0
+        session_id = uuid4().hex
+        previous_sequences = None
         last_input_warning = 0.0
         with torch.inference_mode():
             while not stop_event.is_set():
+                if not input_process.is_alive():
+                    raise RuntimeError("camera input process exited")
                 started_at = time.time()
                 frame_timestamp = (
                     frame_num / input_process.fps if args.dataset else started_at
                 )
                 try:
-                    image_batches = snapshot_shared_frames(
-                        buffers,
-                        input_process.frame_locks,
-                        (
-                            None
-                            if args.dataset
-                            else input_process.frame_timestamps
-                        ),
-                        max_age=(
-                            None if args.dataset else args.rtsp_max_frame_age
-                        ),
-                        max_skew=(
-                            None if args.dataset else args.rtsp_max_skew
-                        ),
-                    )
+                    if args.dataset:
+                        image_batches = snapshot_shared_frames(buffers, input_process.frame_locks)
+                        frame_timestamps = [frame_timestamp] * len(camera_ids)
+                        frame_ids = [frame_num] * len(camera_ids)
+                    else:
+                        bundle = snapshot_live_bundle(buffers, input_process,
+                            max_age=args.rtsp_max_frame_age, max_skew=args.rtsp_max_skew,
+                            previous_sequences=previous_sequences)
+                        image_batches = bundle.frames
+                        frame_timestamps, frame_ids = bundle.timestamps, bundle.sequences
+                        frame_timestamp = min(frame_timestamps)
+                        previous_sequences = frame_ids
                 except FrameUnavailableError as exc:
                     now = time.monotonic()
                     if now - last_input_warning >= 2.0:
@@ -698,7 +764,15 @@ def main():
                     all_heatmaps,
                     camera_ids,
                     spatial_identity,
+                    edge_id=edge_id, session_id=session_id, sequence=frame_num,
+                    timestamp_kind="dataset_relative" if args.dataset else "receive_unix",
+                    frame_timestamps=frame_timestamps, frame_ids=frame_ids,
+                    effective_calibration=effective_calibration,
+                    inference_started_at=started_at, inference_finished_at=time.time(),
                 )
+                if record_dir is not None:
+                    with (record_dir / f"{frame_num:09d}.dtframe").open("xb") as stream:
+                        stream.write(payload)
                 if sender is not None:
                     sender.send(payload)
 

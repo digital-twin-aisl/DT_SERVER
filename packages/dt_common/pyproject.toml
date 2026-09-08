@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dt-common"
-version = "0.1.0"
-description = "Shared calibration and spatial contracts for DT edge/server apps"
+version = "0.2.0"
+description = "Shared calibration, inference wire protocol, and runtime contracts for DT edge/server apps"
 requires-python = ">=3.10"
 
 [tool.setuptools]
@@ -13,4 +13,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

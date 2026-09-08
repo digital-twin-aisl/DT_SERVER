@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "arguments": {
+    "deployment": "../scene_0812_poc.json",
+    "edge_id": "edge_2",
+    "edge_id_file": "../../edge_client/config/edge_2.poc.json",
+    "camera_config": "../../edge_client/config/cameras.local.yaml",
+    "rtsp_max_frame_age": 0.75,
+    "rtsp_max_skew": 0.03,
+    "rtsp_buffer_frames": 4,
+    "tensorrt": true,
+    "dataset": true,
+    "no_zenoh": true
+  }
+}

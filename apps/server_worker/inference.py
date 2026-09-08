@@ -2,7 +2,7 @@
 
 import argparse
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import logging
 import math
@@ -21,6 +21,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import apps  # noqa: E402,F401
 from dt_common.spatial.workspace import build_edge_workspace, load_spatial_context
+from dt_common.runtime_config import parse_runtime_args
+from dt_common.calibration.identity import calibration_digest
+from apps.server_worker.lod_scheduler import LodScheduler
+from apps.server_worker.scene_state import SceneState
+from apps.server_worker.root_tracks import RootTracks, TEMPORARY_ID_START
 from apps.server_worker.config.config import config as focus_config
 from apps.server_worker.config.config import update_config as update_focus_config
 from apps.server_worker.priority_engine import PriorityConfig, PriorityEngine
@@ -38,6 +43,7 @@ from apps.server_worker.src.protocol.scene_zenoh import (
     encode_scene,
 )
 from apps.server_worker.src.protocol.zenoh import ZenohDataLoader
+from apps.server_worker.src.protocol.replay import ReplayDataLoader
 from apps.server_worker.src.protocol.zmq import Protocol
 from apps.server_worker.src.reid.sliding_clustering import ClusteringSliding
 from apps.server_worker.src.utils.edgemetadata import EdgeMetadataLoader
@@ -160,15 +166,19 @@ class SceneOutput:
     timestamp: float
     sync_spread_seconds: float
     people: list[PersonEntity]
+    runtime: dict | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        output = {
             "schema_version": OUTPUT_SCHEMA_VERSION,
             "coordinate_system": OUTPUT_COORDINATE_SYSTEM,
             "timestamp": self.timestamp,
             "sync_spread_seconds": self.sync_spread_seconds,
             "people": [person.to_dict() for person in self.people],
         }
+        if self.runtime is not None:
+            output["runtime"] = self.runtime
+        return output
 
 
 def setup_cuda() -> torch.device:
@@ -188,6 +198,21 @@ def setup_cuda() -> torch.device:
 
 def get_parser():
     parser = argparse.ArgumentParser(description="PyTorch AISL Inference")
+    parser.add_argument("--runtime-config", help="Portable JSON profile; explicit CLI options override it")
+    parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--input-mode", choices=("independent", "strict"), default="independent")
+    parser.add_argument("--input-clock", choices=("live", "dataset"), default="live")
+    parser.add_argument("--max-input-age", type=float, default=0.75)
+    parser.add_argument("--future-tolerance", type=float, default=0.1)
+    parser.add_argument("--replay-inputs", help="Replay recorded edge packets; no Zenoh subscription")
+    parser.add_argument("--max-batches", type=int)
+    parser.add_argument("--priority-interval", type=float, default=0.5)
+    parser.add_argument("--lambda-aoi", type=float, default=0.0)
+    parser.add_argument("--lod-policy", choices=("rank", "zone", "all"), default="rank")
+    parser.add_argument("--lod-zones", type=json.loads, default=[])
+    parser.add_argument("--lod-edge-zones", type=json.loads, default={})
+    parser.add_argument("--root-fallback", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--decision-output", help="Record per-batch decisions and pose timings as JSONL")
     parser.add_argument(
         "--cfg-focus",
         dest="cfg_focus",
@@ -320,7 +345,7 @@ def get_parser():
         metavar=("X", "Y"),
         help=(
             "Hazard point in metre-based root world coordinates; may be repeated. "
-            "Defaults to the PriorityEngine hazard (2.0, 4.0)"
+            "Required unless a runtime profile supplies priority_hazard"
         ),
     )
     parser.add_argument("--no-zmq", action="store_true")
@@ -1197,7 +1222,25 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    args = get_parser().parse_args()
+    args = parse_runtime_args(get_parser())
+    deployment_document = json.loads(Path(args.deployment).expanduser().read_text())
+    if not args.priority_hazard:
+        args.priority_hazard = deployment_document.get("poc", {}).get("hazards_metres")
+    if not args.priority_hazard:
+        raise ValueError("Configure --priority-hazard X Y in USD world metres (or priority_hazard in a runtime profile)")
+    if args.replay_inputs and (args.input_clock != "dataset" or args.input_mode != "strict"):
+        raise ValueError("recording replay requires --input-clock dataset --input-mode strict")
+    if not math.isfinite(args.lambda_aoi) or args.lambda_aoi < 0:
+        raise ValueError("lambda_aoi must be finite and nonnegative")
+    if args.max_batches is not None and args.max_batches < 1:
+        raise ValueError("max_batches must be positive")
+    if args.max_input_age <= 0 or not math.isfinite(args.max_input_age):
+        raise ValueError("max_input_age must be finite and positive")
+    if args.receive_timeout <= 0 or not math.isfinite(args.receive_timeout):
+        raise ValueError("receive_timeout must be finite and positive")
+    if args.buffer_size < 1 or not all(math.isfinite(value) and value >= 0
+                                     for value in (args.sync_tolerance, args.future_tolerance)):
+        raise ValueError("invalid synchronization settings")
     logger.info("Starting server inference: args=%s", args)
     if args.max_output_people < 1:
         raise ValueError("--max-output-people must be at least 1")
@@ -1225,7 +1268,6 @@ def main() -> None:
     sp3d_config.SPATIAL_CONTEXT = spatial_context
     logger.info("Pose config is ready: %s", pose_config_path)
 
-    device = setup_cuda()
     use_tensorrt = (
         bool(focus_config.POSENET.TENSORRT) if args.tensorrt is None else args.tensorrt
     )
@@ -1236,7 +1278,7 @@ def main() -> None:
     )
     logger.info(
         "Runtime options: device=%s, tensorrt=%s, zmq=%s:%s",
-        device,
+        "cuda",
         use_tensorrt,
         zmq_host,
         zmq_port,
@@ -1288,10 +1330,16 @@ def main() -> None:
         if args.priority_hazard
         else PriorityConfig().hazards
     )
-    priority_engine = PriorityEngine(PriorityConfig(hazards=priority_hazards))
+    priority_engine = PriorityEngine(PriorityConfig(hazards=priority_hazards,
+        lambda_aoi=args.lambda_aoi, initial_unit_time_s=args.priority_interval or 0.1))
+    scheduler = LodScheduler(priority_engine, interval=args.priority_interval,
+        lod2_count=args.lod2_count, policy="all" if args.all_lod2 else args.lod_policy,
+        zones=args.lod_zones, edge_lods=args.lod_edge_zones, observation_ttl=args.max_input_age)
+    scene_state = SceneState(edge_ids, ttl=args.max_input_age)
+    root_tracks = RootTracks(ttl=args.max_input_age)
     logger.info(
         "LOD assignment is ready: policy=%s lod2_count=%d hazards=%s",
-        "all_lod2" if args.all_lod2 else "priority",
+        scheduler.policy,
         args.lod2_count,
         priority_hazards,
     )
@@ -1301,6 +1349,13 @@ def main() -> None:
     LoD=2 선별된 ID들이 각 pose_model에서 추론됨
     """
     pose_models = {}
+    if args.validate_only:
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(checkpoint_path)
+        logger.info("Configuration validation passed: topics=%s hazards_metres=%s policy=%s interval=%s AoI=%s",
+                    edge_metadata.topics, priority_hazards, scheduler.policy, args.priority_interval, args.lambda_aoi)
+        return
+    device = setup_cuda()
     for edge_id in edge_ids:
         metadata = edge_metadata[edge_id]
         pose_models[edge_id] = load_pose_model(
@@ -1319,7 +1374,9 @@ def main() -> None:
         edge_id: [int(camera["id"]) for camera in edge_metadata[edge_id].cams]
         for edge_id in edge_ids
     }
-    loader = ZenohDataLoader(
+    loader_type = ReplayDataLoader if args.replay_inputs else ZenohDataLoader
+    loader = loader_type(
+        **({"root": args.replay_inputs} if args.replay_inputs else {}),
         edge_ids=edge_ids,
         device=device,
         topics=edge_metadata.topics,
@@ -1332,6 +1389,12 @@ def main() -> None:
         config_path=args.zenoh_config,
         buffer_size=args.buffer_size,
         sync_tolerance=args.sync_tolerance,
+        input_mode=args.input_mode, input_clock=args.input_clock,
+        max_input_age=args.max_input_age, future_tolerance=args.future_tolerance,
+        expected_calibration_digests={edge: calibration_digest(edge_metadata[edge].cams) for edge in edge_ids},
+        expected_heatmap_shape=(sp3d_config.NETWORK.NUM_JOINTS,
+                               sp3d_config.NETWORK.HEATMAP_SIZE[1], sp3d_config.NETWORK.HEATMAP_SIZE[0]),
+        expected_root_count=sp3d_config.MULTI_PERSON.MAX_PEOPLE_NUM,
     )
     logger.info("Zenoh data loader is ready; waiting for synchronized batches")
     zmq_output = None
@@ -1374,7 +1437,7 @@ def main() -> None:
                     "checkpoint_path": str(checkpoint_path),
                     "deployment_path": str(edge_metadata_path),
                     "tensorrt": use_tensorrt,
-                    "lod_policy": "all_lod2" if args.all_lod2 else "priority",
+                    "lod_policy": scheduler.policy,
                     "priority_hazards_metres": priority_hazards,
                     "telemetry_sampling": {
                         "batch_interval": args.metrics_sample_every,
@@ -1439,7 +1502,15 @@ def main() -> None:
             scene_publisher.close()
         raise
 
+    decision_stream = None
+    batch_count = 0
+    previous_transport_counters = {}
+    seen_global_ids = set()
     try:
+        if args.decision_output:
+            decision_path = Path(args.decision_output).expanduser().resolve()
+            decision_path.parent.mkdir(parents=True, exist_ok=True)
+            decision_stream = decision_path.open("x", encoding="utf-8")
         logger.info("[7/8] Entering inference loop")
         batch_count = 0
         last_wait_log = time.monotonic()
@@ -1450,10 +1521,10 @@ def main() -> None:
         previous_output_dropped = 0
         previous_transport_counters: dict[str, Any] = {}
         pose_cuda_start = (
-            torch.cuda.Event(enable_timing=True) if telemetry is not None else None
+            torch.cuda.Event(enable_timing=True) if device.type == "cuda" and (telemetry is not None or args.decision_output) else None
         )
         pose_cuda_end = (
-            torch.cuda.Event(enable_timing=True) if telemetry is not None else None
+            torch.cuda.Event(enable_timing=True) if device.type == "cuda" and (telemetry is not None or args.decision_output) else None
         )
         viser_debug_output_path = (
             None
@@ -1471,6 +1542,18 @@ def main() -> None:
                 prepared = loader.get(timeout=args.receive_timeout)
                 batch_received_at = time.perf_counter()
                 if prepared is None:
+                    if getattr(loader, "finished", False):
+                        logger.info("Recording replay completed")
+                        break
+                    if args.input_clock == "live":
+                        idle_scene = scene_state.update(SceneOutput(time.time(), 0.0, []), [],
+                            time.time(), scheduler.assignments, args.max_output_people)
+                        idle_scene = replace(idle_scene, runtime={"input_status": loader.edge_status(),
+                            "timestamp_kind": "receive_unix", "status": "waiting_for_input"})
+                        if scene_publisher is not None:
+                            scene_publisher.send_scene(idle_scene.to_dict())
+                        if zmq_output is not None:
+                            zmq_output.send_scene(idle_scene.to_dict())
                     now = time.monotonic()
                     if now - last_wait_log >= 10:
                         input_dropped = {
@@ -1564,11 +1647,12 @@ def main() -> None:
                 batch_failed = False
                 try:
                     heatmaps, roots, reid_items, timestamps, sync_spread = prepared
+                    batch_edge_ids = list(prepared.edge_ids)
 
                     batch_event["source"] = {
                         "edge_timestamps": {
                             edge_id: float(timestamp)
-                            for edge_id, timestamp in zip(edge_ids, timestamps)
+                            for edge_id, timestamp in zip(batch_edge_ids, timestamps)
                         },
                         "sync_spread_ms": float(sync_spread) * 1000.0,
                         "timestamp_kind": (
@@ -1580,7 +1664,7 @@ def main() -> None:
                     if persist_batch_metrics:
                         input_by_edge, input_by_camera = count_reid_items(
                             reid_items,
-                            edge_ids,
+                            batch_edge_ids,
                         )
                         batch_event["data_volume_bytes"] = {
                             "heatmaps": sum(
@@ -1608,9 +1692,13 @@ def main() -> None:
                     ids = assign_global_ids(
                         reid_results,
                         roots,
-                        edge_ids,
+                        batch_edge_ids,
                         edge_metadata,
                     )
+                    if args.root_fallback:
+                        ids = root_tracks.assign(ids, roots, batch_edge_ids, timestamps)
+                        scheduler.merge_identities(root_tracks.aliases)
+                        scene_state.merge_identities(root_tracks.aliases)
                     timings_ms["root_association"] = (
                         time.perf_counter() - stage_started_at
                     ) * 1000.0
@@ -1639,36 +1727,32 @@ def main() -> None:
                     )
 
                     stage_started_at = time.perf_counter()
-                    if args.all_lod2:
-                        lod_by_id = lod_assign(ids, assign_all_lod2)
-                    else:
-                        lod_by_id = assign_priority_lods(
-                            ids,
-                            roots,
-                            timestamps,
-                            priority_engine,
-                            args.lod2_count,
-                        )
+                    persons = build_priority_input(ids, roots)["persons"]
+                    ownership = {identity: (edge, stamp) for edge, edge_values, stamp in
+                                 zip(batch_edge_ids, ids, timestamps) for identity in edge_values if identity is not None}
+                    for person in persons:
+                        person["edge_id"], person["timestamp"] = ownership[person["track_id"]]
+                    lod_by_id = scheduler.assign(persons, prepared.timestamp)
                     timings_ms["lod_assignment"] = (
                         time.perf_counter() - stage_started_at
                     ) * 1000.0
                     logger.debug("LOD assignments: %s", lod_by_id)
 
                     stage_started_at = time.perf_counter()
-                    if persist_batch_metrics:
-                        assert pose_cuda_start is not None
-                        assert pose_cuda_end is not None
+                    if pose_cuda_start is not None and (persist_batch_metrics or args.decision_output):
                         pose_cuda_start.record()
                     pose_result = run_pose_models(
                         pose_models,
                         heatmaps,
                         roots,
-                        edge_ids,
+                        batch_edge_ids,
                         ids,
                         lod_by_id,
                     )
-                    if persist_batch_metrics:
+                    if pose_cuda_end is not None and (persist_batch_metrics or args.decision_output):
                         pose_cuda_end.record()
+                        if args.decision_output:
+                            pose_cuda_end.synchronize()
                     timings_ms["pose_inference"] = (
                         time.perf_counter() - stage_started_at
                     ) * 1000.0
@@ -1680,14 +1764,33 @@ def main() -> None:
                         ids,
                         lod_by_id,
                         timestamps,
-                        edge_ids,
+                        batch_edge_ids,
                         sync_spread,
                         max_people=args.max_output_people,
                     )
+                    scene_output = scene_state.update(scene_output, batch_edge_ids,
+                        time.time() if args.input_clock == "live" else prepared.timestamp,
+                        scheduler.assignments, args.max_output_people)
+                    scene_output = replace(scene_output, runtime={
+                        "input_status": loader.edge_status(),
+                        "active_edges": batch_edge_ids,
+                        "timestamp_kind": next(iter(prepared.frames.values()))["timestamp_kind"],
+                        "priority": {"policy": scheduler.policy,
+                                     "decision_timestamp": scheduler.last_decision,
+                                     "interval_s": scheduler.interval,
+                                     "updated": scheduler.updated,
+                                     "hazards_metres": priority_hazards,
+                                     "lambda_aoi": args.lambda_aoi,
+                                     "rank_by_id": {person["track_id"]: person["rank"]
+                                                    for person in (scheduler.decision or {}).get("persons", [])}},
+                        "temporary_ids": [person.global_id for person in scene_output.people
+                                          if person.global_id >= TEMPORARY_ID_START],
+                        "id_aliases": root_tracks.aliases if args.root_fallback else {},
+                    })
                     timings_ms["scene_build"] = (
                         time.perf_counter() - stage_started_at
                     ) * 1000.0
-                    if persist_batch_metrics:
+                    if pose_cuda_start is not None and (persist_batch_metrics or args.decision_output):
                         # Scene construction has already copied the predictions
                         # to CPU, so the event is complete without an extra
                         # telemetry-only CUDA synchronization.
@@ -1747,7 +1850,7 @@ def main() -> None:
                         )
                         batch_event["workload"].update(
                             {
-                                "edges": len(edge_ids),
+                                "edges": len(batch_edge_ids),
                                 "camera_views_per_edge": len(heatmaps),
                                 "reid_input_by_edge": input_by_edge,
                                 "reid_input_by_edge_camera": input_by_camera,
@@ -1755,7 +1858,7 @@ def main() -> None:
                                     edge_id: int(
                                         (roots_cpu[index, :, 3] >= 0).sum()
                                     )
-                                    for index, edge_id in enumerate(edge_ids)
+                                    for index, edge_id in enumerate(batch_edge_ids)
                                 },
                                 "mapped_people_by_edge": {
                                     edge_id: sum(
@@ -1763,7 +1866,7 @@ def main() -> None:
                                         for global_id in edge_root_ids
                                     )
                                     for edge_id, edge_root_ids in zip(
-                                        edge_ids,
+                                        batch_edge_ids,
                                         ids,
                                     )
                                 },
@@ -1791,6 +1894,22 @@ def main() -> None:
                         batch_event["source"]["source_to_output_age_ms"] = (
                             unix_input_age_ms(timestamps, output_wall_time)
                         )
+                    if args.decision_output:
+                        decision_record = {"schema_version": 1, "timestamp": prepared.timestamp,
+                            "policy": scheduler.policy, "decision_updated": scheduler.updated,
+                            "decision": scheduler.decision,
+                            "observations": persons,
+                            "input_sha256": {edge: frame["_wire_sha256"] for edge, frame in prepared.frames.items()},
+                            "selected_ids": [identity for identity, lod in lod_by_id.items() if lod == 2],
+                            "lod_by_id": lod_by_id,
+                            "pose_runtime_ms": timings_ms["pose_inference"],
+                            "pipeline_runtime_ms": sum(timings_ms.get(stage, 0) for stage in
+                                ("reid_clustering", "root_association", "lod_assignment", "pose_inference", "scene_build")),
+                            "pose_gpu_ms": timings_ms.get("pose_gpu"),
+                            "configuration": {"priority_interval": args.priority_interval,
+                                "lambda_aoi": args.lambda_aoi, "hazards_metres": priority_hazards},
+                        }
+                        decision_stream.write(json.dumps(decision_record, allow_nan=False) + "\n")
                     batch_event["status"] = "ok"
                 except Exception as exc:
                     batch_failed = True
@@ -1884,6 +2003,10 @@ def main() -> None:
                         )
 
                 if batch_failed:
+                    if args.replay_inputs:
+                        raise RuntimeError("Offline replay batch failed; refusing an incomplete evaluation run")
+                    if args.max_batches is not None and batch_count >= args.max_batches:
+                        break
                     continue
                 if (
                     batch_count == 1
@@ -1898,10 +2021,14 @@ def main() -> None:
                         len(scene_output.people),
                         input_dropped,
                     )
+                if args.max_batches is not None and batch_count >= args.max_batches:
+                    break
     except KeyboardInterrupt:
         logger.info("Stopping server inference")
     finally:
         logger.info("[8/8] Closing inference resources")
+        if decision_stream is not None:
+            decision_stream.close()
         loader.close()
         if zmq_output is not None:
             zmq_output.close()

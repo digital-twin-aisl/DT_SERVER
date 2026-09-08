@@ -2,7 +2,7 @@
 
 import argparse
 import json
-import pickle
+from dt_common.inference_codec import decode_frame
 import time
 
 import zenoh
@@ -30,7 +30,7 @@ def make_config(endpoint=None, config_path=None):
 def main():
     parser = argparse.ArgumentParser(description="Subscribe to edge inference output")
     parser.add_argument("--endpoint", default="tcp/127.0.0.1:7447")
-    parser.add_argument("--topic", default="0_edge")
+    parser.add_argument("--topic", default="dt/edges/*/inference")
     parser.add_argument("--config")
     args = parser.parse_args()
 
@@ -43,9 +43,9 @@ def main():
         payload = sample.payload.to_bytes()
         message = None
         try:
-            message = pickle.loads(payload)
-        except Exception:
-            pass
+            message = decode_frame(payload)
+        except Exception as exc:
+            print(f"Invalid inference frame: {exc}", flush=True)
 
         print(
             f"[{received}] topic={sample.key_expr} "
@@ -70,7 +70,7 @@ def main():
                     flush=True,
                 )
         else:
-            print("    payload is not a pickle dictionary", flush=True)
+            print("    payload is not a valid ZNH2 frame", flush=True)
 
     print(f"Connecting to {args.endpoint}")
     print(f"Subscribing to {args.topic}")

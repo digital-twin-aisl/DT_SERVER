@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "arguments": {
+    "deployment": "../scene_0812_poc.json",
+    "priority_interval": 0.5,
+    "lambda_aoi": 0.0,
+    "lod2_count": 1,
+    "root_fallback": true,
+    "max_input_age": 0.75,
+    "no_zmq": true,
+    "input_mode": "strict",
+    "input_clock": "dataset",
+    "sync_tolerance": 0.001,
+    "buffer_size": 4,
+    "lod_policy": "zone",
+    "lod_edge_zones": {
+      "edge_1": 2,
+      "edge_2": 1
+    },
+    "no_scene_zenoh": true,
+    "no_metrics": true
+  }
+}

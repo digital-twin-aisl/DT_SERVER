@@ -77,8 +77,9 @@ def test_zenoh_sender_exposes_router_connection(monkeypatch):
             return None
 
         @staticmethod
-        def declare_publisher(topic):
+        def declare_publisher(topic, **kwargs):
             del topic
+            assert kwargs["congestion_control"] == zenoh_protocol.zenoh.CongestionControl.DROP
             return FakePublisher()
 
     monkeypatch.setattr(zenoh_protocol.zenoh, "open", lambda config: FakeSession())

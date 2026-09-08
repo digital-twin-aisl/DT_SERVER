@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 from pathlib import Path
 import platform
@@ -122,6 +123,20 @@ def configure_edge_identity(args: argparse.Namespace) -> dict[str, Any]:
         camera_ids.append(camera_id)
     if not camera_ids:
         raise ValueError(f"camera config has no cameras: {camera_config}")
+
+    # A development camera registry may contain all eight cameras. Persist only
+    # this edge's ordered assignment, rather than making inference select eight.
+    deployment_value = args.deployment or (current.get("inference") or {}).get("deployment")
+    if deployment_value:
+        deployment_path = _resolve_identity_path(deployment_value, identity_path)
+        deployment_data = json.loads(deployment_path.read_text(encoding="utf-8"))
+        assignments = {edge["id"]: edge for edge in deployment_data.get("edges", []) if edge.get("enabled", True)}
+        if requested_edge_id not in assignments:
+            raise ValueError(f"edge {requested_edge_id!r} is not enabled in the deployment")
+        selected_ids = [int(value) for value in assignments[requested_edge_id].get("camera_ids", [])]
+        if not selected_ids or len(set(selected_ids)) != len(selected_ids) or not set(selected_ids) <= set(camera_ids):
+            raise ValueError("camera registry must contain every unique deployment camera assignment")
+        camera_ids = selected_ids
 
     endpoint = args.endpoint or current.get("zenoh_endpoint")
     zenoh_config = args.zenoh_config or current.get("zenoh_config")
