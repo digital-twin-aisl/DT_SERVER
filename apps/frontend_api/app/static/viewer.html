@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Meta Sejong · Live Twin</title>
+<link rel="stylesheet" href="/static/viewer.css">
+</head>
+<body>
+<main id="viewport" aria-label="세종대학교 실시간 3D 지도"></main>
+<header class="panel brand"><span class="mark">M</span><div><strong>META SEJONG</strong><small>DIGITAL TWIN / 세종대학교</small></div></header>
+<section class="panel controls" aria-label="뷰어 제어">
+  <button id="focus">관측 구역</button><button id="campus">캠퍼스 전체</button><button id="follow">사람 따라가기</button>
+  <label><input id="show-zones" type="checkbox" checked> 관측 영역</label>
+  <label><input id="xray" type="checkbox" checked> 가려진 사람 표시</label>
+</section>
+<aside class="panel info">
+  <div class="status-line"><span id="dot" class="dot"></span><strong id="connection">연결 준비 중</strong><span class="tag">LIVE</span></div>
+  <p id="map-status">캠퍼스 맵을 불러오는 중…</p>
+  <div class="metrics"><div><b id="people-count">—</b><small>추적 인원</small></div><div><b id="pose-count">—</b><small>관절 추적</small></div><div><b id="fps">—</b><small>FPS</small></div></div>
+  <div id="people-list"></div>
+  <p id="source-status" class="muted">서버의 첫 장면을 기다립니다.</p>
+</aside>
+<footer class="panel help">드래그 회전 <span>·</span> 우클릭 이동 <span>·</span> 스크롤 확대 <span class="engine">Three.js / 브라우저 렌더링</span></footer>
+<div id="error" role="alert" hidden></div>
+<script type="module" src="/static/dist/viewer.js"></script>
+</body></html>

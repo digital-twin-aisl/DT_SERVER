@@ -1,16 +1,33 @@
 import asyncio
 import os
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import pathlib
-from urllib.parse import urlparse
+from contextlib import asynccontextmanager, suppress
+import json
 
-from .viewer_config import viewer_config
+from .viewer_config import assets_dir, viewer_config
+from .scene_bridge import SceneBridge
 
-app = FastAPI(title="Frontend API Gateway")
+@asynccontextmanager
+async def lifespan(app):
+    bridge = SceneBridge(
+        os.getenv("SCENE_ZENOH_ENDPOINT", "tcp/127.0.0.1:10020"),
+        os.getenv("SCENE_ZENOH_TOPIC", "meta-sejong/scene/v1"),
+        viewer_config()["stale_seconds"],
+    )
+    app.state.scene_bridge = bridge
+    await bridge.start()
+    try:
+        yield
+    finally:
+        await bridge.close()
+
+
+app = FastAPI(title="Frontend API Gateway", lifespan=lifespan)
 
 # 프론트엔드(React, Vue 등) 브라우저에서 직접 API를 찌를 수 있도록 CORS 허용 세팅
 app.add_middleware(
@@ -56,87 +73,71 @@ async def get_system_status():
 
 @app.get("/api/v1/viewer/config")
 async def get_viewer_config():
-    """Configuration used by the dashboard to build the WebRTC viewer URL."""
+    """Same-origin browser renderer configuration."""
     return viewer_config()
+
+
+@app.get("/viewer")
+async def browser_viewer():
+    return FileResponse(static_dir / "viewer.html")
+
+
+@app.get("/healthz")
+async def health():
+    return {"status": "ok", "renderer": "threejs"}
 
 
 @app.get("/api/v1/viewer/status")
 async def get_viewer_status():
-    """Probe Isaac Sim's HTTP viewer from the server side.
+    return {**app.state.scene_bridge.status(),
+            "renderer": "threejs", "map_ready": (assets_dir() / "map.glb").is_file()}
 
-    This only proves that the web client on port 8211 is ready. The browser must
-    still be able to reach the signaling TCP and media UDP ports.
-    """
-    internal_url = os.getenv(
-        "ISAAC_WEBRTC_INTERNAL_URL", "http://host.docker.internal:8211"
-    ).strip().rstrip("/")
-    if not internal_url.startswith(("http://", "https://")):
-        return {
-            "status": "disabled",
-            "viewer": {
-                "status": "disabled",
-                "http_status": None,
-                "detail": "invalid internal viewer URL",
-            },
-            "signaling": {"status": "disabled"},
-            "media": {"status": "disabled"},
-        }
 
-    viewer_status = "offline"
-    viewer_http_status = None
-    viewer_detail = None
+@app.get("/assets/{name}")
+async def get_map_asset(name: str):
+    if name not in {"map.glb", "map.json"}:
+        raise HTTPException(404)
+    path = assets_dir() / name
+    if not path.is_file():
+        raise HTTPException(404, "Map is not exported. Run tools/export_map.py first.")
+    return FileResponse(path, media_type="model/gltf-binary" if name.endswith(".glb") else "application/json")
+
+
+@app.websocket("/ws/scene")
+async def scene_socket(websocket: WebSocket):
+    # Viewer streams are read-only. Reject cross-origin browser subscriptions.
+    origin = websocket.headers.get("origin")
+    if origin:
+        from urllib.parse import urlsplit
+        if urlsplit(origin).netloc != websocket.headers.get("host"):
+            await websocket.close(code=1008)
+            return
+    await websocket.accept()
+    bridge = app.state.scene_bridge
+    queue = bridge.subscribe()
+
+    async def send():
+        while True:
+            try:
+                payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                payload = json.dumps({"type": "status", **bridge.status()})
+            await asyncio.wait_for(websocket.send_text(payload), timeout=5.0)
+
+    async def receive():
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect": return
+
+    tasks = [asyncio.create_task(send()), asyncio.create_task(receive())]
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.get(internal_url, timeout=2.0)
-        viewer_http_status = response.status_code
-        viewer_status = "online" if response.status_code < 500 else "degraded"
-    except httpx.RequestError as exc:
-        viewer_detail = str(exc)
-
-    config = viewer_config()
-    signal_host = os.getenv("ISAAC_WEBRTC_SIGNAL_INTERNAL_HOST", "").strip()
-    if not signal_host:
-        signal_host = urlparse(internal_url).hostname or "host.docker.internal"
-
-    signal_status = "offline"
-    signal_detail = None
-    try:
-        _reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(signal_host, config["signal_port"]),
-            timeout=2.0,
-        )
-        signal_status = "online"
-        writer.close()
-        await writer.wait_closed()
-    except (OSError, asyncio.TimeoutError) as exc:
-        signal_detail = str(exc)
-
-    if viewer_status == "online" and signal_status == "online":
-        overall_status = "online"
-    elif viewer_status == "offline" and signal_status == "offline":
-        overall_status = "offline"
-    else:
-        overall_status = "degraded"
-
-    return {
-        "status": overall_status,
-        "viewer": {
-            "status": viewer_status,
-            "http_status": viewer_http_status,
-            "detail": viewer_detail,
-        },
-        "signaling": {
-            "status": signal_status,
-            "host": signal_host,
-            "port": config["signal_port"],
-            "detail": signal_detail,
-        },
-        "media": {
-            "status": "browser-check-required",
-            "protocol": "udp",
-            "port": config["stream_port"],
-        },
-    }
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks: task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        bridge.clients.discard(queue)
+        with suppress(RuntimeError, OSError):
+            await websocket.close()
 
 @app.get("/api/v1/edges")
 async def get_edges_list():
