@@ -1,0 +1,20 @@
+version = 1
+SPDX-PackageName = "DT_SERVER"
+
+# Files without an in-file header (JSON, YAML, Markdown, USD, GLB, ...) are
+# project files under the project license. Per-file headers take precedence,
+# so the VoxelPose-derived sources keep their MIT notice.
+[[annotations]]
+path = "**"
+precedence = "closest"
+SPDX-FileCopyrightText = "2025-2026 DT_SERVER contributors"
+SPDX-License-Identifier = "LGPL-2.1-or-later"
+
+
+# Patch against the VGGT-Omega submodule: a derivative of FAIR Noncommercial
+# Research Materials, so it stays under that license (non-commercial only).
+[[annotations]]
+path = "apps/calibration_worker/patches/vggt-omega-*.patch"
+precedence = "override"
+SPDX-FileCopyrightText = "Meta Platforms, Inc. and affiliates; 2025-2026 DT_SERVER contributors"
+SPDX-License-Identifier = "LicenseRef-FAIR-Noncommercial-Research"
