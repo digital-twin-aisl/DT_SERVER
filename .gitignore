@@ -143,6 +143,7 @@ celerybeat.pid
 # Environments
 .env
 apps/edge_client/config/cameras.local.yaml
+apps/edge_client/config/cameras.local_v2.yaml
 apps/edge_client/config/edge_*.poc.json
 *.dtframe
 apps/isaac_sim_client/recordings/
@@ -191,3 +192,42 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 result1.pkl
+
+# Managed runtime state and generated launch/service files
+/data/manager/
+/data/services/
+/apps/edge_client/config/runtime/
+/apps/edge_manager/data/
+node_modules/
+
+# --- Open-source hygiene -------------------------------------------------
+# Personal working files and data that must never be published.
+/data/local/
+**/data/recordings/
+*.jsonl
+!examples/**/*.jsonl
+*.point_cloud.*.npz
+*.local.*
+*.pdf
+
+# Raw media (participants may be visible). Generated docs/assets are allowed.
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.jpg
+*.jpeg
+!docs/**/*.jpg
+
+# Model weights and engines are distributed separately, never in git.
+*.pt
+*.pth
+*.pth.tar
+*.engine
+*.onnx
+apps/*/models/*
+
+# Untracked upstream checkouts and the separate redesign.
+/new_DT_SERVER/
+/Faster-VoxelPose/
+/SelfPose3d/
