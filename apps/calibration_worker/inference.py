@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Estimate CCTV extrinsics in the Isaac Sim ArUco-marker coordinate system.
 
 The calibration sequence is:
@@ -20,13 +22,15 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import itertools
 import json
 import logging
 import math
 import os
 from pathlib import Path
 import re
+import shutil
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -47,6 +51,11 @@ from dt_common.calibration.protocol import (  # noqa: E402
     file_sha256,
 )
 from dt_common.calibration.preprocess import preprocess_frame  # noqa: E402
+from apps.calibration_worker.domain.alignment import (  # noqa: E402,F401 - legacy exports
+    SimilarityTransform, fit_similarity_transform,
+    robust_similarity_transform, transform_camera_extrinsic,
+)
+from apps.calibration_worker.domain.point_cloud import export_depth_cloud, preserve_offline_cloud
 
 
 LOGGER = logging.getLogger("calibration_worker")
@@ -69,6 +78,15 @@ SUPPORTED_OFFLINE_IMAGE_SUFFIXES = {
     ".tiff",
     ".webp",
 }
+BA_MAX_FEATURES_PER_IMAGE = 2_048
+BA_MAX_MATCHES_PER_PAIR = 256
+BA_DEFAULT_MAX_TRACKS = 300
+BA_DEFAULT_MAX_IMAGES = 32
+DEFAULT_REFERENCE_SAMPLE_COUNT = 130
+BA_MAX_INITIAL_REPROJECTION_ERROR_PX = 32.0
+BA_MAX_ITERATIONS = 300
+BA_MIN_CCTV_OBSERVATIONS = 20
+BA_MIN_REFERENCE_OBSERVATIONS = 8
 
 
 @dataclass(frozen=True)
@@ -102,24 +120,6 @@ class MarkerDefinition:
     prim_path: str
 
 
-@dataclass(frozen=True)
-class SimilarityTransform:
-    scale: float
-    rotation: np.ndarray
-    translation: np.ndarray
-    inlier_mask: np.ndarray
-    residuals: np.ndarray
-
-    def transform_points(self, points: np.ndarray) -> np.ndarray:
-        points = np.asarray(points, dtype=np.float64)
-        return self.scale * (points @ self.rotation.T) + self.translation
-
-    def matrix4(self) -> np.ndarray:
-        """Return the homogeneous VGGT-to-USD similarity matrix."""
-        matrix = np.eye(4, dtype=np.float64)
-        matrix[:3, :3] = self.scale * self.rotation
-        matrix[:3, 3] = self.translation
-        return matrix
 
 
 @dataclass(frozen=True)
@@ -138,6 +138,50 @@ class RemotePreparedInputs:
     cctv_new_camera_matrices: tuple[np.ndarray, ...]
     reference_frame_indices: tuple[int, ...]
     reference_new_camera_matrix: np.ndarray
+
+
+@dataclass(frozen=True)
+class _BundleTrack:
+    """A matched image track and its VGGT-depth-derived initial 3D point."""
+
+    observations: tuple[tuple[int, np.ndarray], ...]
+    initial_xyz: np.ndarray
+
+
+@dataclass(frozen=True)
+class BundleAdjustmentResult:
+    extrinsics: np.ndarray
+    camera_count: int
+    selected_image_count: int
+    track_count: int
+    observation_count: int
+    mean_track_length: float
+    multi_view_track_count: int
+    cctv_observation_counts: tuple[int, ...]
+    fixed_cctv_indices: tuple[int, ...]
+    initial_rmse_px: float
+    final_rmse_px: float
+    solver_nfev: int
+    solver_optimality: float
+    solver_message: str
+    solver_converged: bool
+    variable_image_indices: tuple[int, ...]
+    fixed_image_indices: tuple[int, ...]
+    unobserved_image_indices: tuple[int, ...]
+    image_budget: int
+    track_budget: int
+    iteration_budget: int
+
+
+@dataclass(frozen=True)
+class ColmapReconstructionResult:
+    """Sparse COLMAP poses keyed by the prepared input-image index."""
+
+    extrinsics: dict[int, np.ndarray]
+    registered_image_count: int
+    point_count: int
+    match_pair_count: int
+    sparse_model_dir: Path
 
 
 def _require_mapping(value: Any, name: str) -> dict[str, Any]:
@@ -292,8 +336,7 @@ def estimate_max_images_from_gpu(
     """Conservatively estimate a VGGT-Omega frame limit from free GPU memory.
 
     The released 512px benchmark reports about 6.02 GiB for one frame and
-    43.15 GiB for 500 frames.  Linear interpolation is only a planning estimate;
-    ``--max-images`` remains the reliable override for a particular GPU.
+    43.15 GiB for 500 frames. Linear interpolation is only a planning estimate.
     """
     if not torch.cuda.is_available():
         raise RuntimeError("VGGT-Omega inference requires a CUDA GPU.")
@@ -386,16 +429,13 @@ def sample_video_frames(video_path: Path, sample_count: int) -> list[tuple[int, 
 def prepare_inputs(
     calibration_input: CalibrationInput,
     output_dir: Path,
-    max_images: int,
+    reference_sample_count: int,
     *,
     undistort_alpha: float = 0.0,
 ) -> PreparedInputs:
     cctv_count = len(calibration_input.cctv_cameras)
-    if max_images <= cctv_count:
-        raise ValueError(
-            f"max_images ({max_images}) must leave room for at least one reference "
-            f"frame after {cctv_count} CCTV image(s)."
-        )
+    if reference_sample_count <= 0:
+        raise ValueError("reference sample count must be greater than zero")
 
     undistorted_dir = output_dir / "undistorted"
     paths: list[Path] = []
@@ -415,12 +455,8 @@ def prepare_inputs(
         paths.append(destination)
         cctv_new_matrices.append(new_matrix)
 
-    reference_slots = max_images - cctv_count
-    requested = calibration_input.reference_video.sample_count
-    if requested is not None:
-        reference_slots = min(reference_slots, requested)
     sampled_frames = sample_video_frames(
-        calibration_input.reference_video.video_path, reference_slots
+        calibration_input.reference_video.video_path, reference_sample_count
     )
 
     reference_indices: list[int] = []
@@ -453,16 +489,102 @@ def prepare_inputs(
     )
 
 
+def build_vggt_preprocessed_intrinsics(
+    image_paths: Sequence[Path],
+    camera_matrices: Sequence[np.ndarray],
+    *,
+    image_resolution: int,
+    resize_mode: str,
+    patch_size: int = 16,
+    return_valid_regions: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """Map calibrated intrinsics into VGGT's crop/resize/padding coordinates."""
+    if len(image_paths) != len(camera_matrices):
+        raise ValueError("image paths and camera matrices must have the same length")
+    if resize_mode not in {"balanced", "max_size"}:
+        raise ValueError(f"Unsupported VGGT resize mode: {resize_mode}")
+
+    records: list[tuple[np.ndarray, int, int]] = []
+    target_shapes: list[tuple[int, int]] = []
+    for image_path, camera_matrix in zip(image_paths, camera_matrices, strict=True):
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError(f"Could not read prepared image: {image_path}")
+        height, width = image.shape[:2]
+        crop_left = 0
+        crop_top = 0
+        cropped_width = width
+        cropped_height = height
+        aspect_ratio = height / max(width, 1)
+        if aspect_ratio < 0.5:
+            cropped_width = min(width, max(1, int(round(height / 0.5))))
+            crop_left = max((width - cropped_width) // 2, 0)
+        elif aspect_ratio > 2.0:
+            cropped_height = min(height, max(1, int(round(width * 2.0))))
+            crop_top = max((height - cropped_height) // 2, 0)
+
+        aspect_ratio = cropped_height / max(cropped_width, 1)
+        if resize_mode == "balanced":
+            token_count = (image_resolution // patch_size) ** 2
+            unrounded_width_patches = np.sqrt(token_count / aspect_ratio)
+            width_patches = max(
+                1, int(np.round(unrounded_width_patches))
+            )
+            height_patches = max(
+                1, int(np.round(token_count / unrounded_width_patches))
+            )
+            target_width = width_patches * patch_size
+            target_height = height_patches * patch_size
+        else:
+            if aspect_ratio >= 1.0:
+                target_height = image_resolution
+                target_width = max(
+                    patch_size,
+                    int(np.round((image_resolution / aspect_ratio) / patch_size))
+                    * patch_size,
+                )
+            else:
+                target_width = image_resolution
+                target_height = max(
+                    patch_size,
+                    int(np.round((image_resolution * aspect_ratio) / patch_size))
+                    * patch_size,
+                )
+
+        matrix = _matrix3(camera_matrix, f"prepared intrinsic {image_path}").copy()
+        matrix[0, 2] -= crop_left
+        matrix[1, 2] -= crop_top
+        matrix[0, :] *= target_width / cropped_width
+        matrix[1, :] *= target_height / cropped_height
+        matrix[2, :] = (0.0, 0.0, 1.0)
+        records.append((matrix, target_height, target_width))
+        target_shapes.append((target_height, target_width))
+
+    common_height = max(height for height, _ in target_shapes)
+    common_width = max(width for _, width in target_shapes)
+    adjusted: list[np.ndarray] = []
+    valid_regions = []
+    for matrix, target_height, target_width in records:
+        matrix = matrix.copy()
+        matrix[0, 2] += (common_width - target_width) // 2
+        matrix[1, 2] += (common_height - target_height) // 2
+        adjusted.append(matrix)
+        left, top = (common_width-target_width)//2, (common_height-target_height)//2
+        valid_regions.append([left, top, left+target_width, top+target_height])
+    matrices = np.asarray(adjusted, dtype=np.float64)
+    return (matrices, np.asarray(valid_regions, dtype=np.int32)) if return_valid_regions else matrices
+
+
 def prepare_remote_inputs(
     calibration_input: CalibrationInput,
     metadata: dict[str, Any],
     output_dir: Path,
-    max_images: int,
+    reference_sample_count: int,
 ) -> RemotePreparedInputs:
     """Preprocess server-owned reference frames with the edge token contract."""
     cctv_count = len(calibration_input.cctv_cameras)
-    if max_images <= cctv_count:
-        raise ValueError("max_images must leave room for a reference frame")
+    if reference_sample_count <= 0:
+        raise ValueError("reference sample count must be greater than zero")
     image_size_value = metadata.get("image_size")
     if (
         not isinstance(image_size_value, list)
@@ -477,10 +599,9 @@ def prepare_remote_inputs(
         raise ValueError("unsupported distributed patch size")
     if metadata.get("encoder_dtype") != "float16":
         raise ValueError("unsupported distributed encoder dtype")
-    reference_slots = max_images - cctv_count
-    if calibration_input.reference_video.sample_count is not None:
-        reference_slots = min(reference_slots, calibration_input.reference_video.sample_count)
-    sampled = sample_video_frames(calibration_input.reference_video.video_path, reference_slots)
+    sampled = sample_video_frames(
+        calibration_input.reference_video.video_path, reference_sample_count
+    )
     images: list[np.ndarray] = []
     indices: list[int] = []
     reference_matrix: np.ndarray | None = None
@@ -520,7 +641,8 @@ def load_marker_tree(tree_path: str | Path) -> dict[tuple[str, int], MarkerDefin
         from pxr import Gf, Usd, UsdGeom
     except ImportError as exc:
         raise RuntimeError(
-            "Pixar USD Python modules are required to read the marker tree."
+            "Pixar USD Python modules are required to read the marker tree "
+            f"(pxr import failed: {exc})."
         ) from exc
 
     path = Path(tree_path).expanduser().resolve()
@@ -666,6 +788,530 @@ def unproject_pixel(
     return rotation.T @ (camera_point - translation)
 
 
+def _project_pixel(
+    point_xyz: np.ndarray,
+    world_to_camera: np.ndarray,
+    camera_matrix: np.ndarray,
+) -> np.ndarray | None:
+    """Project a VGGT-world point, returning ``None`` when it is behind a camera."""
+    camera_point = world_to_camera[:, :3] @ point_xyz + world_to_camera[:, 3]
+    if not np.isfinite(camera_point).all() or camera_point[2] <= 1.0e-6:
+        return None
+    projected = camera_matrix @ camera_point
+    return projected[:2] / projected[2]
+
+
+class _DisjointSet:
+    """Small union-find helper for turning pairwise matches into feature tracks."""
+
+    def __init__(self) -> None:
+        self._parent: dict[tuple[int, int], tuple[int, int]] = {}
+
+    def find(self, item: tuple[int, int]) -> tuple[int, int]:
+        parent = self._parent.setdefault(item, item)
+        if parent != item:
+            parent = self.find(parent)
+            self._parent[item] = parent
+        return parent
+
+    def union(self, left: tuple[int, int], right: tuple[int, int]) -> None:
+        left_root, right_root = self.find(left), self.find(right)
+        if left_root != right_root:
+            self._parent[right_root] = left_root
+
+    def items(self) -> Iterable[tuple[int, int]]:
+        return self._parent
+
+
+def _ba_candidate_pairs(image_count: int, cctv_count: int) -> list[tuple[int, int]]:
+    """Select useful, bounded matching pairs for local BA.
+
+    Every CCTV still is matched against every reference frame, while reference
+    frames are matched to their two temporal neighbours. This preserves links
+    from each fixed camera to the moving reference camera without the quadratic
+    all-pairs cost for a long reference video.
+    """
+    pairs: set[tuple[int, int]] = set()
+    reference_start = cctv_count
+    for cctv_index in range(cctv_count):
+        for reference_index in range(reference_start, image_count):
+            pairs.add((cctv_index, reference_index))
+    for image_index in range(reference_start, image_count):
+        for offset in (1, 2):
+            other_index = image_index + offset
+            if other_index < image_count:
+                pairs.add((image_index, other_index))
+    for left_index in range(cctv_count):
+        for right_index in range(left_index + 1, cctv_count):
+            pairs.add((left_index, right_index))
+    return sorted(pairs)
+
+
+def _mutual_sift_matches(
+    left_descriptors: np.ndarray,
+    right_descriptors: np.ndarray,
+) -> list[cv2.DMatch]:
+    """Return ratio-tested mutual SIFT matches, capped for BA tractability."""
+    matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+    left_knn = matcher.knnMatch(left_descriptors, right_descriptors, k=2)
+    right_knn = matcher.knnMatch(right_descriptors, left_descriptors, k=2)
+
+    def accepted(matches: list[list[cv2.DMatch]]) -> dict[int, cv2.DMatch]:
+        return {
+            pair[0].queryIdx: pair[0]
+            for pair in matches
+            if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance
+        }
+
+    forward = accepted(left_knn)
+    reverse = accepted(right_knn)
+    matches = [
+        match
+        for query_index, match in forward.items()
+        if (backward := reverse.get(match.trainIdx)) is not None
+        and backward.trainIdx == query_index
+    ]
+    return sorted(matches, key=lambda match: match.distance)[:BA_MAX_MATCHES_PER_PAIR]
+
+
+def _build_bundle_tracks(
+    images: np.ndarray,
+    depths: np.ndarray,
+    depth_confidences: np.ndarray,
+    extrinsics: np.ndarray,
+    intrinsics: np.ndarray,
+    *,
+    cctv_count: int,
+    min_depth_confidence: float,
+    max_tracks: int,
+) -> list[_BundleTrack]:
+    """Build repeatable SIFT tracks and initialize their points from VGGT depth."""
+    if not hasattr(cv2, "SIFT_create"):
+        raise RuntimeError("--use_ba requires OpenCV built with SIFT support.")
+    sift = cv2.SIFT_create(nfeatures=BA_MAX_FEATURES_PER_IMAGE)
+    keypoints_by_image: list[list[cv2.KeyPoint]] = []
+    descriptors_by_image: list[np.ndarray | None] = []
+    for image in images:
+        rgb = _rgb_to_uint8(image)
+        grayscale = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        keypoints, descriptors = sift.detectAndCompute(grayscale, None)
+        keypoints_by_image.append(keypoints)
+        descriptors_by_image.append(descriptors)
+
+    matches = _DisjointSet()
+    pair_count = 0
+    for left_index, right_index in _ba_candidate_pairs(len(images), cctv_count):
+        left_descriptors = descriptors_by_image[left_index]
+        right_descriptors = descriptors_by_image[right_index]
+        if left_descriptors is None or right_descriptors is None:
+            continue
+        pair_matches = _mutual_sift_matches(left_descriptors, right_descriptors)
+        if len(pair_matches) >= 8:
+            left_points = np.asarray(
+                [keypoints_by_image[left_index][match.queryIdx].pt for match in pair_matches],
+                dtype=np.float32,
+            )
+            right_points = np.asarray(
+                [keypoints_by_image[right_index][match.trainIdx].pt for match in pair_matches],
+                dtype=np.float32,
+            )
+            _, inlier_mask = cv2.findFundamentalMat(
+                left_points,
+                right_points,
+                cv2.FM_RANSAC,
+                2.0,
+                0.999,
+            )
+            if inlier_mask is not None and int(inlier_mask.sum()) >= 8:
+                pair_matches = [
+                    match
+                    for match, is_inlier in zip(
+                        pair_matches, inlier_mask.reshape(-1), strict=True
+                    )
+                    if is_inlier
+                ]
+        if pair_matches:
+            pair_count += 1
+        for match in pair_matches:
+            matches.union(
+                (left_index, match.queryIdx), (right_index, match.trainIdx)
+            )
+    if not pair_count:
+        raise RuntimeError(
+            "--use_ba found no repeatable image features. Use images with "
+            "overlapping scene content or run without --use_ba."
+        )
+
+    grouped: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for observation in matches.items():
+        grouped.setdefault(matches.find(observation), []).append(observation)
+
+    tracks: list[tuple[tuple[int, float], _BundleTrack]] = []
+    for observations in grouped.values():
+        # A valid feature track has exactly one keypoint per image and at least
+        # two usable depth observations.
+        image_indices = [image_index for image_index, _ in observations]
+        if len(observations) < 2 or len(set(image_indices)) != len(observations):
+            continue
+        usable: list[tuple[int, np.ndarray, np.ndarray]] = []
+        for image_index, keypoint_index in observations:
+            xy = np.asarray(keypoints_by_image[image_index][keypoint_index].pt)
+            sampled_depth = _depth_at_corner(
+                depths[image_index],
+                depth_confidences[image_index],
+                xy,
+                min_depth_confidence,
+            )
+            if sampled_depth is None:
+                continue
+            usable.append(
+                (
+                    image_index,
+                    xy,
+                    unproject_pixel(
+                        xy,
+                        sampled_depth,
+                        extrinsics[image_index],
+                        intrinsics[image_index],
+                    ),
+                )
+            )
+        if len(usable) < 2:
+            continue
+        initial_xyz = np.median(
+            np.asarray([point for _, _, point in usable]), axis=0
+        )
+        errors: list[float] = []
+        for image_index, xy, _ in usable:
+            projected = _project_pixel(
+                initial_xyz, extrinsics[image_index], intrinsics[image_index]
+            )
+            if projected is None:
+                errors.append(float("inf"))
+            else:
+                errors.append(float(np.linalg.norm(projected - xy)))
+        # A track with one observation behind its initial camera can still have
+        # a small median error. Reject it entirely: retaining that observation
+        # injects a 1,000 px penalty into BA and lets a false match dominate.
+        max_error = float(np.max(errors))
+        if not math.isfinite(max_error) or max_error > BA_MAX_INITIAL_REPROJECTION_ERROR_PX:
+            continue
+        tracks.append(
+            (
+                (-len(usable), float(np.median(errors))),
+                _BundleTrack(
+                    observations=tuple((index, xy) for index, xy, _ in usable),
+                    initial_xyz=initial_xyz,
+                ),
+            )
+        )
+    tracks.sort(key=lambda item: item[0])
+    ranked_tracks = [track for _, track in tracks]
+    selected_indices: set[int] = set()
+    # Reserve half of the track budget for balanced CCTV connectivity. Without
+    # this quota, long reference-only tracks can occupy the whole budget while
+    # one or more fixed CCTV images remain weakly constrained.
+    per_cctv_quota = max(8, max_tracks // max(2 * cctv_count, 1))
+    for cctv_index in range(cctv_count):
+        candidates = [
+            index
+            for index, track in enumerate(ranked_tracks)
+            if any(image_index == cctv_index for image_index, _ in track.observations)
+        ]
+        for index in candidates[:per_cctv_quota]:
+            if len(selected_indices) >= max_tracks:
+                break
+            selected_indices.add(index)
+
+    cctv_track_target = min(max_tracks, int(math.ceil(0.75 * max_tracks)))
+    for index, track in enumerate(ranked_tracks):
+        if len(selected_indices) >= cctv_track_target:
+            break
+        if any(image_index < cctv_count for image_index, _ in track.observations):
+            selected_indices.add(index)
+    for index in range(len(ranked_tracks)):
+        if len(selected_indices) >= max_tracks:
+            break
+        selected_indices.add(index)
+    return [ranked_tracks[index] for index in sorted(selected_indices)]
+
+
+def _ba_selected_image_indices(
+    image_count: int,
+    cctv_count: int,
+    max_images: int,
+) -> np.ndarray:
+    """Keep every CCTV image and evenly sample reference keyframes."""
+    if not cctv_count or cctv_count >= image_count:
+        raise ValueError("BA requires at least one CCTV and one reference image")
+    if max_images <= cctv_count:
+        raise ValueError("Internal BA image budget must leave room for reference keyframes")
+    if image_count <= max_images:
+        return np.arange(image_count, dtype=np.int64)
+    reference_count = min(image_count - cctv_count, max_images - cctv_count)
+    selected: set[int] = set()
+    evenly_spaced = np.linspace(
+        cctv_count, image_count - 1, reference_count, dtype=np.int64
+    )
+    for index in evenly_spaced:
+        if len(selected) >= reference_count:
+            break
+        selected.add(int(index))
+    if len(selected) < reference_count:
+        for index in range(cctv_count, image_count):
+            if len(selected) >= reference_count:
+                break
+            selected.add(index)
+    reference_indices = np.asarray(sorted(selected), dtype=np.int64)
+    return np.concatenate((np.arange(cctv_count, dtype=np.int64), reference_indices))
+
+
+def bundle_adjustment_limits(image_count, cctv_count, *, max_images=None,
+                             max_tracks=None, max_iterations=BA_MAX_ITERATIONS):
+    """Default to all input views; scale the feature budget with selected views."""
+    image_budget = image_count if max_images is None else min(max_images, image_count)
+    if image_budget <= cctv_count or cctv_count < 1:
+        raise ValueError('BA image budget must include every CCTV and at least one reference.')
+    track_budget = (max(BA_DEFAULT_MAX_TRACKS, math.ceil(BA_DEFAULT_MAX_TRACKS * image_budget / BA_DEFAULT_MAX_IMAGES))
+                    if max_tracks is None else max_tracks)
+    if track_budget < 8 or max_iterations < 1:
+        raise ValueError('BA requires at least 8 tracks and a positive iteration budget.')
+    return dict(max_images=image_budget, max_tracks=track_budget, max_iterations=max_iterations)
+
+
+def run_bundle_adjustment(
+    predictions: dict[str, np.ndarray],
+    *,
+    cctv_count: int,
+    min_depth_confidence: float,
+    max_images: int | None = None,
+    max_tracks: int | None = None,
+    max_iterations: int = BA_MAX_ITERATIONS,
+) -> BundleAdjustmentResult:
+    """Refine VGGT poses and depth-initialized scene points from image tracks.
+
+    Camera intrinsics stay fixed while matched 2D features jointly refine
+    world-to-camera extrinsics and 3D track points. ArUco/USD geometry is
+    deliberately excluded and is used only for post-BA coordinate alignment.
+    """
+    try:
+        from scipy.optimize import least_squares
+        from scipy.sparse import lil_matrix
+    except ImportError as exc:
+        raise RuntimeError("--use_ba requires scipy. Install requirements.txt.") from exc
+
+    source_extrinsics = np.asarray(predictions["extrinsics"], dtype=np.float64).copy()
+    source_intrinsics = np.asarray(predictions["intrinsics"], dtype=np.float64)
+    intrinsics = np.asarray(
+        predictions.get("ba_intrinsics", predictions["intrinsics"]),
+        dtype=np.float64,
+    )
+    limits = bundle_adjustment_limits(len(source_extrinsics), cctv_count,
+        max_images=max_images, max_tracks=max_tracks, max_iterations=max_iterations)
+    max_images, max_tracks = limits['max_images'], limits['max_tracks']
+    selected_indices = _ba_selected_image_indices(
+        len(source_extrinsics),
+        cctv_count,
+        max_images,
+    )
+    LOGGER.info(
+        "BA uses %d/%d images (%d CCTV + %d reference keyframes), up to %d tracks",
+        len(selected_indices),
+        len(source_extrinsics),
+        cctv_count,
+        len(selected_indices) - cctv_count,
+        max_tracks,
+    )
+    extrinsics = source_extrinsics.copy()
+    tracks = _build_bundle_tracks(
+        predictions["images"][selected_indices],
+        predictions["depth"][selected_indices],
+        predictions["depth_conf"][selected_indices],
+        source_extrinsics[selected_indices],
+        source_intrinsics[selected_indices],
+        cctv_count=cctv_count,
+        min_depth_confidence=min_depth_confidence,
+        max_tracks=max_tracks,
+    )
+    tracks = [
+        _BundleTrack(
+            observations=tuple(
+                (int(selected_indices[image_index]), xy)
+                for image_index, xy in track.observations
+            ),
+            initial_xyz=track.initial_xyz,
+        )
+        for track in tracks
+    ]
+    active_images = sorted(
+        {
+            image_index
+            for track in tracks
+            for image_index, _ in track.observations
+        }
+    )
+    observation_count = sum(len(track.observations) for track in tracks)
+    if len(active_images) < 3 or len(tracks) < 8:
+        raise RuntimeError(
+            "--use_ba needs at least three overlapping images and eight reliable "
+            "depth-initialized feature tracks."
+        )
+
+    observation_counts = {
+        image_index: sum(
+            image_index in {index for index, _ in track.observations}
+            for track in tracks
+        )
+        for image_index in active_images
+    }
+    # Feature-only BA has an arbitrary global frame, so retain the two strongest
+    # poses as gauge anchors. Weakly connected poses also remain at their VGGT
+    # initialization instead of being moved by insufficient track evidence.
+    anchor_images = sorted(
+        active_images,
+        key=lambda image_index: observation_counts[image_index],
+        reverse=True,
+    )[:2]
+    weak_images = [
+        image_index
+        for image_index in selected_indices
+        if (
+            image_index < cctv_count
+            and observation_counts.get(image_index, 0) < BA_MIN_CCTV_OBSERVATIONS
+        )
+        or (
+            image_index >= cctv_count
+            and observation_counts.get(image_index, 0) < BA_MIN_REFERENCE_OBSERVATIONS
+        )
+    ]
+    fixed_images = sorted(set(anchor_images) | set(weak_images))
+    variable_images = [
+        image_index for image_index in active_images if image_index not in fixed_images
+    ]
+    variable_index = {
+        image_index: offset for offset, image_index in enumerate(variable_images)
+    }
+    point_offset = 6 * len(variable_images)
+    point_end = point_offset + 3 * len(tracks)
+
+    initial_parameters: list[float] = []
+    for image_index in variable_images:
+        rotation_vector, _ = cv2.Rodrigues(extrinsics[image_index, :, :3])
+        initial_parameters.extend(rotation_vector.reshape(-1).tolist())
+        initial_parameters.extend(extrinsics[image_index, :, 3].tolist())
+    initial_parameters.extend(
+        coordinate for track in tracks for coordinate in track.initial_xyz.tolist()
+    )
+    initial_parameters_array = np.asarray(initial_parameters, dtype=np.float64)
+
+    def unpack(parameters: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        current_extrinsics = extrinsics.copy()
+        for image_index, offset in variable_index.items():
+            start = 6 * offset
+            rotation, _ = cv2.Rodrigues(parameters[start : start + 3])
+            current_extrinsics[image_index, :, :3] = rotation
+            current_extrinsics[image_index, :, 3] = parameters[start + 3 : start + 6]
+        points = parameters[point_offset:point_end].reshape(len(tracks), 3)
+        return current_extrinsics, points
+
+    def residual(parameters: np.ndarray) -> np.ndarray:
+        current_extrinsics, points = unpack(parameters)
+        values: list[float] = []
+        for point, track in zip(points, tracks, strict=True):
+            for image_index, xy in track.observations:
+                projected = _project_pixel(
+                    point, current_extrinsics[image_index], intrinsics[image_index]
+                )
+                if projected is None:
+                    values.extend((1_000.0, 1_000.0))
+                else:
+                    values.extend((projected - xy).tolist())
+        return np.asarray(values, dtype=np.float64)
+
+    initial_residuals = residual(initial_parameters_array)
+    parameter_count = len(initial_parameters_array)
+    if len(initial_residuals) <= parameter_count:
+        raise RuntimeError(
+            "--use_ba has too few feature observations for its camera and point variables."
+        )
+    jacobian_sparsity = lil_matrix(
+        (len(initial_residuals), parameter_count), dtype=np.int8
+    )
+    row = 0
+    for track_index, track in enumerate(tracks):
+        point_columns = slice(point_offset + 3 * track_index, point_offset + 3 * track_index + 3)
+        for image_index, _ in track.observations:
+            jacobian_sparsity[row : row + 2, point_columns] = 1
+            if image_index in variable_index:
+                camera_offset = 6 * variable_index[image_index]
+                jacobian_sparsity[row : row + 2, camera_offset : camera_offset + 6] = 1
+            row += 2
+    solution = least_squares(
+        residual,
+        initial_parameters_array,
+        loss="huber",
+        f_scale=4.0,
+        max_nfev=max_iterations,
+        method="trf",
+        jac_sparsity=jacobian_sparsity.tocsr(),
+        tr_solver="lsmr",
+        x_scale="jac",
+    )
+    refined_extrinsics, _ = unpack(solution.x)
+    final_residuals = residual(solution.x)
+    if not solution.success:
+        initial_squared_error = float(np.dot(initial_residuals, initial_residuals))
+        final_squared_error = float(np.dot(final_residuals, final_residuals))
+        usable_limited_solution = (
+            solution.status == 0
+            and np.isfinite(solution.x).all()
+            and np.isfinite(final_squared_error)
+            and final_squared_error < 0.995 * initial_squared_error
+        )
+        if not usable_limited_solution:
+            raise RuntimeError(f"--use_ba did not converge: {solution.message}")
+        LOGGER.warning(
+            "BA reached its iteration limit but retained a finite improving solution "
+            "(squared error %.3g -> %.3g)",
+            initial_squared_error,
+            final_squared_error,
+        )
+    return BundleAdjustmentResult(
+        extrinsics=refined_extrinsics,
+        camera_count=len(active_images),
+        selected_image_count=len(selected_indices),
+        track_count=len(tracks),
+        observation_count=observation_count,
+        mean_track_length=float(observation_count / len(tracks)),
+        multi_view_track_count=sum(
+            len(track.observations) >= 3 for track in tracks
+        ),
+        cctv_observation_counts=tuple(
+            sum(
+                image_index == cctv_index
+                for track in tracks
+                for image_index, _ in track.observations
+            )
+            for cctv_index in range(cctv_count)
+        ),
+        fixed_cctv_indices=tuple(
+            image_index
+            for image_index in weak_images
+            if image_index < cctv_count
+        ),
+        initial_rmse_px=float(np.sqrt(np.mean(initial_residuals**2))),
+        final_rmse_px=float(np.sqrt(np.mean(final_residuals**2))),
+        solver_nfev=int(solution.nfev),
+        solver_optimality=float(solution.optimality),
+        solver_message=str(solution.message),
+        solver_converged=bool(solution.success),
+        variable_image_indices=tuple(int(i) for i in variable_images),
+        fixed_image_indices=tuple(int(i) for i in fixed_images),
+        unobserved_image_indices=tuple(int(i) for i in selected_indices if i not in active_images),
+        image_budget=max_images, track_budget=max_tracks, iteration_budget=max_iterations,
+    )
+
+
 def collect_marker_correspondences(
     processed_rgb: np.ndarray,
     depths: np.ndarray,
@@ -748,135 +1394,175 @@ def collect_marker_correspondences(
     )
 
 
-def fit_similarity_transform(source: np.ndarray, target: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
-    """Fit ``target = scale * rotation @ source + translation`` (Umeyama)."""
-    source = np.asarray(source, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
-        raise ValueError("source and target must have matching Nx3 shapes.")
-    if len(source) < 3:
-        raise ValueError("At least three point correspondences are required.")
-
-    source_centered = source - source.mean(axis=0)
-    target_centered = target - target.mean(axis=0)
-    source_variance = float(np.sum(source_centered**2) / len(source))
-    if source_variance <= 1.0e-12 or np.linalg.matrix_rank(source_centered) < 2:
-        raise ValueError("Source correspondences are degenerate.")
-    if np.linalg.matrix_rank(target_centered) < 2:
-        raise ValueError("Target correspondences are degenerate.")
-
-    covariance = target_centered.T @ source_centered / len(source)
-    left, singular_values, right_transpose = np.linalg.svd(covariance)
-    sign = np.ones(3, dtype=np.float64)
-    if np.linalg.det(left @ right_transpose) < 0:
-        sign[-1] = -1.0
-    rotation = left @ np.diag(sign) @ right_transpose
-    scale = float(np.sum(singular_values * sign) / source_variance)
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("Estimated similarity scale is not positive.")
-    translation = target.mean(axis=0) - scale * (rotation @ source.mean(axis=0))
-    return scale, rotation, translation
+def _camera_center(world_to_camera: np.ndarray) -> np.ndarray:
+    rotation = np.asarray(world_to_camera, dtype=np.float64)[:, :3]
+    translation = np.asarray(world_to_camera, dtype=np.float64)[:, 3]
+    return -rotation.T @ translation
 
 
-def robust_similarity_transform(
-    source: np.ndarray,
-    target: np.ndarray,
+def _mean_rotation(rotations: Sequence[np.ndarray]) -> np.ndarray:
+    if not rotations:
+        raise ValueError("At least one rotation is required")
+    left, _, right_transpose = np.linalg.svd(np.sum(rotations, axis=0))
+    rotation = left @ right_transpose
+    if np.linalg.det(rotation) < 0:
+        left[:, -1] *= -1
+        rotation = left @ right_transpose
+    return rotation
+
+
+def fit_similarity_from_camera_poses(
+    colmap_extrinsics: Sequence[np.ndarray],
+    usd_extrinsics: Sequence[np.ndarray],
     *,
-    inlier_threshold_m: float = 0.10,
-    max_hypotheses: int = 1000,
-    random_seed: int = 0,
+    inlier_threshold_m: float,
 ) -> SimilarityTransform:
-    """RANSAC wrapper around the metric similarity fit."""
-    source = np.asarray(source, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
-        raise ValueError("source and target must have matching Nx3 shapes.")
-    if len(source) < 3:
-        raise ValueError("At least three point correspondences are required.")
+    """Fit COLMAP-world to USD-world similarity from matched camera poses.
+
+    Camera rotations determine the global orientation even for a reference video
+    moving mostly along one corridor axis; camera centres then determine scale
+    and translation. This avoids the VGGT-depth dependency in the COLMAP path.
+    """
+    if len(colmap_extrinsics) != len(usd_extrinsics) or len(colmap_extrinsics) < 2:
+        raise ValueError("At least two matched COLMAP and USD camera poses are required")
     if inlier_threshold_m <= 0:
-        raise ValueError("inlier_threshold_m must be positive.")
-
-    all_combinations: Iterable[tuple[int, int, int]] = itertools.combinations(
-        range(len(source)), 3
-    )
-    combination_count = math.comb(len(source), 3)
-    if combination_count <= max_hypotheses:
-        samples = list(all_combinations)
-    else:
-        rng = np.random.default_rng(random_seed)
-        sample_set: set[tuple[int, int, int]] = set()
-        while len(sample_set) < max_hypotheses:
-            sample_set.add(tuple(sorted(rng.choice(len(source), 3, replace=False).tolist())))
-        samples = list(sample_set)
-
-    best_mask: np.ndarray | None = None
-    best_score = (-1, -math.inf)
-    for indices in samples:
-        try:
-            scale, rotation, translation = fit_similarity_transform(
-                source[list(indices)], target[list(indices)]
-            )
-        except ValueError:
-            continue
-        predicted = scale * (source @ rotation.T) + translation
-        residuals = np.linalg.norm(predicted - target, axis=1)
-        mask = residuals <= inlier_threshold_m
-        inlier_count = int(mask.sum())
-        if inlier_count < 3:
-            continue
-        median_error = float(np.median(residuals[mask]))
-        score = (inlier_count, -median_error)
-        if score > best_score:
-            best_score = score
-            best_mask = mask
-
-    if best_mask is None:
-        raise RuntimeError(
-            "Could not find a non-degenerate ArUco alignment. Increase marker "
-            "visibility or adjust --alignment-threshold-m."
+        raise ValueError("inlier_threshold_m must be positive")
+    colmap = np.asarray(colmap_extrinsics, dtype=np.float64)
+    usd = np.asarray(usd_extrinsics, dtype=np.float64)
+    if colmap.shape[1:] != (3, 4) or usd.shape[1:] != (3, 4):
+        raise ValueError("Camera extrinsics must have shape Nx3x4")
+    rotation_candidates = [
+        usd_pose[:, :3].T @ colmap_pose[:, :3]
+        for colmap_pose, usd_pose in zip(colmap, usd, strict=True)
+    ]
+    source_centers = np.asarray([_camera_center(pose) for pose in colmap])
+    target_centers = np.asarray([_camera_center(pose) for pose in usd])
+    inlier_mask = np.ones(len(colmap), dtype=bool)
+    for _ in range(3):
+        rotation = _mean_rotation(
+            [candidate for candidate, keep in zip(rotation_candidates, inlier_mask, strict=True) if keep]
         )
-    scale, rotation, translation = fit_similarity_transform(
-        source[best_mask], target[best_mask]
-    )
-    residuals = np.linalg.norm(
-        scale * (source @ rotation.T) + translation - target,
-        axis=1,
-    )
-    final_mask = residuals <= inlier_threshold_m
-    if int(final_mask.sum()) >= 3 and not np.array_equal(final_mask, best_mask):
-        scale, rotation, translation = fit_similarity_transform(
-            source[final_mask], target[final_mask]
-        )
+        rotated_source = source_centers @ rotation.T
+        source_mean = rotated_source[inlier_mask].mean(axis=0)
+        target_mean = target_centers[inlier_mask].mean(axis=0)
+        source_centered = rotated_source[inlier_mask] - source_mean
+        target_centered = target_centers[inlier_mask] - target_mean
+        denominator = float(np.sum(source_centered**2))
+        if denominator <= 1.0e-12:
+            raise ValueError("COLMAP reference camera centres are degenerate")
+        scale = float(np.sum(source_centered * target_centered) / denominator)
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("COLMAP-to-USD pose alignment has a non-positive scale")
+        translation = target_mean - scale * source_mean
         residuals = np.linalg.norm(
-            scale * (source @ rotation.T) + translation - target,
-            axis=1,
+            scale * rotated_source + translation - target_centers, axis=1
         )
-    else:
-        final_mask = best_mask
-    return SimilarityTransform(scale, rotation, translation, final_mask, residuals)
+        new_mask = residuals <= inlier_threshold_m
+        if new_mask.sum() < 2:
+            break
+        if np.array_equal(new_mask, inlier_mask):
+            inlier_mask = new_mask
+            break
+        inlier_mask = new_mask
+    if inlier_mask.sum() < 2:
+        raise RuntimeError(
+            "COLMAP-to-USD alignment found fewer than two consistent ArUco PnP poses"
+        )
+    rotation = _mean_rotation(
+        [candidate for candidate, keep in zip(rotation_candidates, inlier_mask, strict=True) if keep]
+    )
+    rotated_source = source_centers @ rotation.T
+    source_mean = rotated_source[inlier_mask].mean(axis=0)
+    target_mean = target_centers[inlier_mask].mean(axis=0)
+    scale = float(
+        np.sum(
+            (rotated_source[inlier_mask] - source_mean)
+            * (target_centers[inlier_mask] - target_mean)
+        )
+        / np.sum((rotated_source[inlier_mask] - source_mean) ** 2)
+    )
+    translation = target_mean - scale * source_mean
+    residuals = np.linalg.norm(scale * rotated_source + translation - target_centers, axis=1)
+    return SimilarityTransform(scale, rotation, translation, inlier_mask, residuals)
 
 
-def transform_camera_extrinsic(
-    vggt_world_to_camera: np.ndarray,
-    alignment: SimilarityTransform,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Move a VGGT camera pose into the metric marker-tree world."""
-    source_extrinsic = np.asarray(vggt_world_to_camera, dtype=np.float64)
-    if source_extrinsic.shape != (3, 4):
-        raise ValueError("VGGT extrinsic must have shape 3x4.")
-    source_rotation = source_extrinsic[:, :3]
-    source_translation = source_extrinsic[:, 3]
-    source_camera_center = -source_rotation.T @ source_translation
+def collect_colmap_pnp_alignment(
+    prepared: PreparedInputs,
+    colmap_extrinsics: dict[int, np.ndarray],
+    marker_definitions: dict[tuple[str, int], MarkerDefinition],
+    *,
+    inlier_threshold_m: float,
+) -> tuple[SimilarityTransform, list[dict[str, Any]], int]:
+    """Anchor COLMAP's arbitrary world to the USD marker-tree via ArUco PnP."""
+    colmap_poses: list[np.ndarray] = []
+    usd_poses: list[np.ndarray] = []
+    observations: list[dict[str, Any]] = []
+    for image_index in range(prepared.cctv_count, len(prepared.image_paths)):
+        if image_index not in colmap_extrinsics:
+            continue
+        image = cv2.imread(str(prepared.image_paths[image_index]), cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError(f"Could not read reference image for ArUco PnP: {prepared.image_paths[image_index]}")
+        detections = detect_known_markers(
+            cv2.cvtColor(image, cv2.COLOR_BGR2RGB), marker_definitions
+        )
+        object_points: list[np.ndarray] = []
+        image_points: list[np.ndarray] = []
+        marker_ids: list[int] = []
+        for definition, corners in detections:
+            object_points.extend(definition.world_corners)
+            image_points.extend(corners)
+            marker_ids.append(definition.marker_id)
+        if len(object_points) < 4:
+            continue
+        success, rvec, translation, inliers = cv2.solvePnPRansac(
+            np.asarray(object_points, dtype=np.float64),
+            np.asarray(image_points, dtype=np.float64),
+            prepared.reference_new_camera_matrix,
+            None,
+            flags=cv2.SOLVEPNP_EPNP,
+            reprojectionError=3.0,
+            confidence=0.999,
+            iterationsCount=1_000,
+        )
+        if not success or inliers is None or len(inliers) < 4:
+            continue
+        inlier_indices = inliers.reshape(-1)
+        rvec, translation = cv2.solvePnPRefineLM(
+            np.asarray(object_points, dtype=np.float64)[inlier_indices],
+            np.asarray(image_points, dtype=np.float64)[inlier_indices],
+            prepared.reference_new_camera_matrix,
+            None,
+            rvec,
+            translation,
+        )
+        rotation, _ = cv2.Rodrigues(rvec)
+        usd_pose = np.column_stack((rotation, translation.reshape(3)))
+        colmap_poses.append(colmap_extrinsics[image_index])
+        usd_poses.append(usd_pose)
+        observations.append(
+            {
+                "image_index": image_index,
+                "reference_video_frame_index": prepared.reference_frame_indices[
+                    image_index - prepared.cctv_count
+                ],
+                "marker_ids": sorted(set(marker_ids)),
+                "corner_count": len(object_points),
+                "pnp_inlier_count": len(inlier_indices),
+            }
+        )
+    alignment = fit_similarity_from_camera_poses(
+        colmap_poses,
+        usd_poses,
+        inlier_threshold_m=inlier_threshold_m,
+    )
+    return alignment, observations, len(colmap_poses)
 
-    world_camera_center = alignment.transform_points(source_camera_center)
-    world_to_camera_rotation = source_rotation @ alignment.rotation.T
-    world_to_camera_translation = -world_to_camera_rotation @ world_camera_center
 
-    world_to_camera = np.eye(4, dtype=np.float64)
-    world_to_camera[:3, :3] = world_to_camera_rotation
-    world_to_camera[:3, 3] = world_to_camera_translation
-    camera_to_world = np.linalg.inv(world_to_camera)
-    return world_to_camera, camera_to_world
+
+
+
+
 
 
 def _load_vggt_api() -> tuple[Any, Any, Any]:
@@ -959,7 +1645,8 @@ def run_vggt_inference(
             predictions = model(images)
     except torch.cuda.OutOfMemoryError as exc:
         raise RuntimeError(
-            "VGGT-Omega ran out of GPU memory; retry with a smaller --max-images."
+            "VGGT-Omega ran out of GPU memory; retry with a smaller "
+            "--reference-sample-count."
         ) from exc
 
     extrinsics, intrinsics = encoding_to_camera(
@@ -1048,20 +1735,314 @@ def run_vggt_feature_inference(
     return result
 
 
+def _run_colmap(command: Sequence[str], *, cwd: Path) -> None:
+    """Run one COLMAP CLI stage and surface its useful error output."""
+    LOGGER.info("Running COLMAP: %s", " ".join(command))
+    completed = subprocess.run(
+        command,
+        cwd=str(cwd),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if completed.returncode:
+        output = completed.stdout.strip()
+        tail = output[-4_000:] if output else "no COLMAP output"
+        raise RuntimeError(f"COLMAP command failed ({command[1]}):\n{tail}")
+    if completed.stdout:
+        LOGGER.debug("COLMAP %s output:\n%s", command[1], completed.stdout)
+
+
+def _colmap_rotation_matrix(qvec: Sequence[float]) -> np.ndarray:
+    """Convert COLMAP's [qw, qx, qy, qz] world-to-camera quaternion to R."""
+    quaternion = np.asarray(qvec, dtype=np.float64)
+    if quaternion.shape != (4,) or not np.isfinite(quaternion).all():
+        raise ValueError("COLMAP quaternion must contain four finite values")
+    quaternion /= np.linalg.norm(quaternion)
+    qw, qx, qy, qz = quaternion
+    return np.asarray(
+        (
+            (1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)),
+            (2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)),
+            (2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)),
+        ),
+        dtype=np.float64,
+    )
+
+
+def _colmap_image_extrinsics(images_txt: Path) -> dict[str, np.ndarray]:
+    """Read registered camera poses from COLMAP's human-readable images.txt."""
+    poses: dict[str, np.ndarray] = {}
+    for line in images_txt.read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if not fields or fields[0].startswith("#") or len(fields) < 10:
+            continue
+        try:
+            int(fields[0])
+            qvec = [float(value) for value in fields[1:5]]
+            translation = [float(value) for value in fields[5:8]]
+            int(fields[8])
+        except ValueError:
+            continue
+        extrinsic = np.empty((3, 4), dtype=np.float64)
+        extrinsic[:, :3] = _colmap_rotation_matrix(qvec)
+        extrinsic[:, 3] = translation
+        poses[fields[9]] = extrinsic
+    return poses
+
+
+def _prepare_colmap_database(
+    image_paths: Sequence[Path],
+    camera_matrices: Sequence[np.ndarray],
+    workspace: Path,
+) -> dict[str, int]:
+    """Pre-register one fixed PINHOLE camera for every undistorted image."""
+    if len(image_paths) != len(camera_matrices):
+        raise ValueError("COLMAP image paths and camera matrices must have equal length")
+    image_dir = workspace / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    database_path = workspace / "database.db"
+    _run_colmap(("colmap", "database_creator", "--database_path", str(database_path)), cwd=workspace)
+
+    staged_names: dict[str, int] = {}
+    connection = sqlite3.connect(database_path)
+    try:
+        with connection:
+            for index, (source, intrinsic) in enumerate(
+                zip(image_paths, camera_matrices, strict=True)
+            ):
+                image = cv2.imread(str(source), cv2.IMREAD_UNCHANGED)
+                if image is None:
+                    raise RuntimeError(f"Could not read COLMAP input image: {source}")
+                height, width = image.shape[:2]
+                matrix = _matrix3(intrinsic, f"COLMAP camera matrix for {source.name}")
+                if matrix[0, 2] < 0 or matrix[1, 2] < 0:
+                    raise ValueError(f"COLMAP camera principal point is invalid: {source}")
+                staged_name = f"{index:04d}_{_safe_name(source.name)}"
+                staged_path = image_dir / staged_name
+                try:
+                    staged_path.symlink_to(source.resolve())
+                except OSError:
+                    shutil.copy2(source, staged_path)
+                cursor = connection.execute(
+                    "INSERT INTO cameras(model, width, height, params, prior_focal_length) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        1,  # COLMAP CameraModelId.PINHOLE
+                        int(width),
+                        int(height),
+                        np.asarray(
+                            (matrix[0, 0], matrix[1, 1], matrix[0, 2], matrix[1, 2]),
+                            dtype=np.float64,
+                        ).tobytes(),
+                        1,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO images(name, camera_id) VALUES (?, ?)",
+                    (staged_name, int(cursor.lastrowid)),
+                )
+                staged_names[staged_name] = index
+    finally:
+        connection.close()
+    return staged_names
+
+
+def _colmap_candidate_pairs(
+    staged_names: dict[str, int],
+    cctv_count: int,
+    *,
+    reference_window: int = 5,
+) -> list[tuple[str, str]]:
+    """Build match pairs suited to fixed CCTV images plus a reference video.
+
+    Every CCTV is compared with every reference frame, while reference frames
+    are compared only with nearby frames in time. This keeps the bridge from
+    each fixed camera into the video reconstruction without spending most of
+    the matching time on distant video frames that are unlikely to overlap.
+    """
+    if cctv_count < 0 or cctv_count > len(staged_names):
+        raise ValueError("COLMAP CCTV count is outside the staged image range")
+    if reference_window <= 0:
+        raise ValueError("COLMAP reference match window must be positive")
+
+    names_by_index = {index: name for name, index in staged_names.items()}
+    if set(names_by_index) != set(range(len(staged_names))):
+        raise ValueError("COLMAP staged image indices must be contiguous")
+
+    pairs: set[tuple[int, int]] = set()
+    image_count = len(staged_names)
+    # Fixed CCTV views may overlap one another.
+    for left in range(cctv_count):
+        for right in range(left + 1, cctv_count):
+            pairs.add((left, right))
+    # A fixed CCTV image may match any point along the reference walk-through.
+    for cctv_index in range(cctv_count):
+        for reference_index in range(cctv_count, image_count):
+            pairs.add((cctv_index, reference_index))
+    # Nearby video frames supply the continuous SfM backbone.
+    for left in range(cctv_count, image_count):
+        stop = min(image_count, left + reference_window + 1)
+        for right in range(left + 1, stop):
+            pairs.add((left, right))
+
+    return [
+        (names_by_index[left], names_by_index[right])
+        for left, right in sorted(pairs)
+    ]
+
+
+def run_colmap_reconstruction(
+    prepared: PreparedInputs,
+    output_dir: Path,
+    *,
+    max_image_size: int = 1600,
+) -> ColmapReconstructionResult:
+    """Run fixed-intrinsic sparse COLMAP SfM on prepared local images."""
+    if shutil.which("colmap") is None:
+        raise RuntimeError("COLMAP CLI is not installed or is not on PATH")
+    if max_image_size <= 0:
+        raise ValueError("COLMAP max image size must be positive")
+    camera_matrices = [*prepared.cctv_new_camera_matrices]
+    camera_matrices.extend(
+        prepared.reference_new_camera_matrix
+        for _ in prepared.reference_frame_indices
+    )
+    if len(camera_matrices) != len(prepared.image_paths):
+        raise RuntimeError("Prepared input count does not match COLMAP camera matrices")
+
+    workspace = output_dir / "colmap"
+    workspace.mkdir(parents=True, exist_ok=True)
+    staged_names = _prepare_colmap_database(
+        prepared.image_paths, camera_matrices, workspace
+    )
+    database_path = workspace / "database.db"
+    image_dir = workspace / "images"
+    _run_colmap(
+        (
+            "colmap", "feature_extractor",
+            "--database_path", str(database_path),
+            "--image_path", str(image_dir),
+            "--SiftExtraction.use_gpu", "0",
+            "--SiftExtraction.max_image_size", str(max_image_size),
+        ),
+        cwd=workspace,
+    )
+    match_pairs = _colmap_candidate_pairs(staged_names, prepared.cctv_count)
+    match_list_path = workspace / "match_pairs.txt"
+    match_list_path.write_text(
+        "".join(f"{left} {right}\n" for left, right in match_pairs),
+        encoding="utf-8",
+    )
+    LOGGER.info(
+        "COLMAP matching %d selected image pair(s) instead of %d exhaustive pair(s)",
+        len(match_pairs),
+        len(staged_names) * (len(staged_names) - 1) // 2,
+    )
+    _run_colmap(
+        (
+            "colmap", "matches_importer",
+            "--database_path", str(database_path),
+            "--match_list_path", str(match_list_path),
+            "--match_type", "pairs",
+            "--SiftMatching.use_gpu", "0",
+            "--TwoViewGeometry.min_num_inliers", "10",
+            "--TwoViewGeometry.min_inlier_ratio", "0.10",
+        ),
+        cwd=workspace,
+    )
+    sparse_dir = workspace / "sparse"
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    _run_colmap(
+        (
+            "colmap", "mapper",
+            "--database_path", str(database_path),
+            "--image_path", str(image_dir),
+            "--output_path", str(sparse_dir),
+            "--Mapper.multiple_models", "0",
+            "--Mapper.max_num_models", "1",
+            "--Mapper.min_model_size", "3",
+            "--Mapper.min_num_matches", "10",
+            "--Mapper.abs_pose_min_num_inliers", "15",
+            "--Mapper.abs_pose_min_inlier_ratio", "0.10",
+            "--Mapper.max_reg_trials", "5",
+            "--Mapper.ba_refine_focal_length", "0",
+            "--Mapper.ba_refine_principal_point", "0",
+            "--Mapper.ba_refine_extra_params", "0",
+        ),
+        cwd=workspace,
+    )
+    models = sorted(
+        path for path in sparse_dir.iterdir()
+        if path.is_dir() and (path / "cameras.bin").is_file()
+    ) if sparse_dir.is_dir() else []
+    if not models:
+        raise RuntimeError(
+            "COLMAP produced no sparse reconstruction. Ensure CCTV and reference "
+            "images share enough static, textured scene content."
+    )
+    model_dir = models[0]
+    text_dir = workspace / "sparse_text"
+    text_dir.mkdir(parents=True, exist_ok=True)
+    _run_colmap(
+        (
+            "colmap", "model_converter",
+            "--input_path", str(model_dir),
+            "--output_path", str(text_dir),
+            "--output_type", "TXT",
+        ),
+        cwd=workspace,
+    )
+    poses_by_name = _colmap_image_extrinsics(text_dir / "images.txt")
+    poses = {
+        staged_names[name]: extrinsic
+        for name, extrinsic in poses_by_name.items()
+        if name in staged_names
+    }
+    if len(poses) < 3:
+        raise RuntimeError("COLMAP registered fewer than three input images")
+    point_count = sum(
+        1
+        for line in (text_dir / "points3D.txt").read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    )
+    return ColmapReconstructionResult(
+        extrinsics=poses,
+        registered_image_count=len(poses),
+        point_count=point_count,
+        match_pair_count=len(match_pairs),
+        sparse_model_dir=model_dir,
+    )
+
+
 def _json_matrix(matrix: np.ndarray) -> list[list[float]]:
     return np.asarray(matrix, dtype=np.float64).tolist()
 
 
 def run_calibration(args: argparse.Namespace) -> Path:
+    if not 1 <= getattr(args, 'point_cloud_max_points', 1_000_000) <= 2_000_000:
+        raise ValueError('--point-cloud-max-points must be between 1 and 2000000.')
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    max_images = args.max_images
-    if max_images is None:
-        max_images = estimate_max_images_from_gpu(args.device)
-        LOGGER.info("GPU memory estimate allows up to %d total images", max_images)
-    checkpoint = Path(args.checkpoint).expanduser().resolve()
+    backend = getattr(args, "backend", "vggt")
+    if backend not in {"vggt", "colmap"}:
+        raise ValueError(f"Unsupported reconstruction backend: {backend}")
+    if backend == "colmap" and getattr(args, "use_ba", False):
+        raise ValueError("--use_ba is only available with --backend vggt")
+    checkpoint = (
+        Path(args.checkpoint).expanduser().resolve()
+        if backend == "vggt" and args.checkpoint
+        else None
+    )
     feature_metadata: dict[str, Any] | None = None
     if args.feature_bundle:
+        if backend == "colmap":
+            raise ValueError(
+                "--backend colmap is unavailable with --feature-bundle because "
+                "COLMAP needs source CCTV images, not patch tokens."
+            )
+        assert checkpoint is not None
         feature_payload = Path(args.feature_bundle).expanduser().resolve().read_bytes()
         feature_metadata, edge_tokens = decode_feature_bundle(feature_payload)
         if feature_metadata.get("preprocess") != PREPROCESS_NAME:
@@ -1069,15 +2050,57 @@ def run_calibration(args: argparse.Namespace) -> Path:
         if feature_metadata.get("checkpoint_sha256") != file_sha256(checkpoint):
             raise ValueError("edge and server VGGT checkpoints do not match")
         calibration_input = load_remote_calibration_input(args.config, feature_metadata)
-        prepared = prepare_remote_inputs(
-            calibration_input, feature_metadata, output_dir, max_images
-        )
     else:
         calibration_input = load_calibration_input(args.config)
+
+    requested_reference_count = getattr(args, "reference_sample_count", None)
+    if requested_reference_count is None:
+        requested_reference_count = (
+            calibration_input.reference_video.sample_count
+            or DEFAULT_REFERENCE_SAMPLE_COUNT
+        )
+    requested_reference_count = int(requested_reference_count)
+    if requested_reference_count <= 0:
+        raise ValueError("reference sample count must be greater than zero")
+    requested_total_count = (
+        len(calibration_input.cctv_cameras) + requested_reference_count
+    )
+    if getattr(args, 'use_ba', False):
+        bundle_adjustment_limits(requested_total_count, len(calibration_input.cctv_cameras),
+            max_images=getattr(args, 'ba_max_images', None), max_tracks=getattr(args, 'ba_max_tracks', None),
+            max_iterations=getattr(args, 'ba_max_iterations', BA_MAX_ITERATIONS))
+    maximum_images = getattr(args, 'max_images', None)
+    if maximum_images is not None and (maximum_images <= 0 or requested_total_count > maximum_images):
+        raise ValueError(f'Requested {requested_total_count} images exceed --max-images {maximum_images}; reduce --reference-sample-count.')
+    if backend == "vggt":
+        gpu_image_limit = estimate_max_images_from_gpu(args.device)
+        LOGGER.info(
+            "Requested %d total image(s); GPU estimate allows up to %d",
+            requested_total_count,
+            gpu_image_limit,
+        )
+        if requested_total_count > gpu_image_limit:
+            maximum_reference_count = max(
+                1, gpu_image_limit - len(calibration_input.cctv_cameras)
+            )
+            raise RuntimeError(
+                f"{requested_total_count} total images exceed the estimated GPU "
+                f"limit ({gpu_image_limit}). Reduce --reference-sample-count to "
+                f"{maximum_reference_count} or less."
+            )
+
+    if feature_metadata is not None:
+        prepared = prepare_remote_inputs(
+            calibration_input,
+            feature_metadata,
+            output_dir,
+            requested_reference_count,
+        )
+    else:
         prepared = prepare_inputs(
             calibration_input,
             output_dir,
-            max_images,
+            requested_reference_count,
             undistort_alpha=args.undistort_alpha,
         )
     LOGGER.info(
@@ -1086,38 +2109,147 @@ def run_calibration(args: argparse.Namespace) -> Path:
         len(prepared.reference_frame_indices),
     )
 
-    if feature_metadata is not None:
-        predictions = run_vggt_feature_inference(
-            edge_tokens,
-            prepared.reference_images,
-            checkpoint,
-            device=args.device,
-        )
-    else:
-        predictions = run_vggt_inference(
-            prepared.image_paths,
-            checkpoint,
-            device=args.device,
-            image_resolution=args.image_resolution,
-            resize_mode=args.resize_mode,
-        )
     marker_definitions = load_marker_tree(args.marker_tree)
-    source_points, target_points, observations = collect_marker_correspondences(
-        predictions["images"],
-        predictions["depth"],
-        predictions["depth_conf"],
-        predictions["extrinsics"],
-        predictions["intrinsics"],
-        prepared.cctv_count,
-        marker_definitions,
-        min_depth_confidence=args.min_depth_confidence,
-        artifact_dir=output_dir / "aruco_detections",
-    )
-    alignment = robust_similarity_transform(
-        source_points,
-        target_points,
-        inlier_threshold_m=args.alignment_threshold_m,
-    )
+    ba_result: BundleAdjustmentResult | None = None
+    colmap_result: ColmapReconstructionResult | None = None
+    missing_cctv: list[str] = []
+    intrinsics_diagnostics: dict[str, Any] | None = None
+    if backend == "colmap":
+        if not isinstance(prepared, PreparedInputs):
+            raise RuntimeError("COLMAP requires local prepared images")
+        colmap_result = run_colmap_reconstruction(
+            prepared,
+            output_dir,
+            max_image_size=getattr(args, "colmap_max_image_size", 1600),
+        )
+        missing_cctv = [
+            camera.camera_id
+            for index, camera in enumerate(calibration_input.cctv_cameras)
+            if index not in colmap_result.extrinsics
+        ]
+        if missing_cctv:
+            LOGGER.warning(
+                "COLMAP did not register CCTV image(s); the result will contain "
+                "only geometrically verified cameras: %s",
+                ", ".join(missing_cctv),
+            )
+        alignment, observations, alignment_pose_count = collect_colmap_pnp_alignment(
+            prepared,
+            colmap_result.extrinsics,
+            marker_definitions,
+            inlier_threshold_m=args.alignment_threshold_m,
+        )
+        camera_extrinsics = colmap_result.extrinsics
+    else:
+        assert checkpoint is not None
+        if feature_metadata is not None:
+            predictions = run_vggt_feature_inference(
+                edge_tokens,
+                prepared.reference_images,
+                checkpoint,
+                device=args.device,
+            )
+        else:
+            predictions = run_vggt_inference(
+                prepared.image_paths,
+                checkpoint,
+                device=args.device,
+                image_resolution=args.image_resolution,
+                resize_mode=args.resize_mode,
+            )
+            calibrated_matrices = (
+                list(prepared.cctv_new_camera_matrices)
+                + [prepared.reference_new_camera_matrix]
+                * len(prepared.reference_frame_indices)
+            )
+            calibrated_intrinsics, valid_regions = build_vggt_preprocessed_intrinsics(
+                prepared.image_paths,
+                calibrated_matrices,
+                image_resolution=args.image_resolution,
+                resize_mode=args.resize_mode,
+                return_valid_regions=True,
+            )
+            predictions['valid_regions'] = valid_regions
+            model_intrinsics = np.asarray(predictions["intrinsics"], dtype=np.float64)
+            focal_relative_error = np.abs(
+                np.stack(
+                    (
+                        model_intrinsics[:, 0, 0] - calibrated_intrinsics[:, 0, 0],
+                        model_intrinsics[:, 1, 1] - calibrated_intrinsics[:, 1, 1],
+                    ),
+                    axis=1,
+                )
+                / np.stack(
+                    (
+                        calibrated_intrinsics[:, 0, 0],
+                        calibrated_intrinsics[:, 1, 1],
+                    ),
+                    axis=1,
+                )
+            )
+            principal_point_error = np.linalg.norm(
+                model_intrinsics[:, :2, 2] - calibrated_intrinsics[:, :2, 2],
+                axis=1,
+            )
+            intrinsics_diagnostics = {
+                "source": "calibrated intrinsics transformed through VGGT crop/resize/padding",
+                "model_focal_relative_error_mean": float(np.mean(focal_relative_error)),
+                "model_focal_relative_error_max": float(np.max(focal_relative_error)),
+                "model_principal_point_error_mean_px": float(np.mean(principal_point_error)),
+                "model_principal_point_error_max_px": float(np.max(principal_point_error)),
+            }
+            # VGGT depth/extrinsics are geometrically coupled to the model's
+            # predicted K, so retain that K for depth unprojection and final
+            # ArUco alignment. Calibrated K is used by feature-track BA.
+            predictions["ba_intrinsics"] = calibrated_intrinsics
+            LOGGER.info(
+                "Using calibrated preprocessed intrinsics for BA/alignment "
+                "(VGGT focal difference mean %.1f%%, principal-point difference mean %.1f px)",
+                100.0 * intrinsics_diagnostics["model_focal_relative_error_mean"],
+                intrinsics_diagnostics["model_principal_point_error_mean_px"],
+            )
+        if getattr(args, "use_ba", False):
+            if feature_metadata is not None:
+                raise ValueError(
+                    "--use_ba is unavailable with --feature-bundle because the server "
+                    "receives CCTV patch tokens, not the source images needed to match tracks."
+                )
+            LOGGER.info(
+                "Running feature-track BA without ArUco/USD constraints"
+            )
+            ba_result = run_bundle_adjustment(
+                predictions,
+                cctv_count=prepared.cctv_count,
+                min_depth_confidence=args.min_depth_confidence,
+                max_images=getattr(args, 'ba_max_images', None),
+                max_tracks=getattr(args, 'ba_max_tracks', None),
+                max_iterations=getattr(args, 'ba_max_iterations', BA_MAX_ITERATIONS),
+            )
+            predictions["extrinsics"] = ba_result.extrinsics
+        source_points, target_points, observations = collect_marker_correspondences(
+            predictions["images"],
+            predictions["depth"],
+            predictions["depth_conf"],
+            predictions["extrinsics"],
+            predictions["intrinsics"],
+            prepared.cctv_count,
+            marker_definitions,
+            min_depth_confidence=args.min_depth_confidence,
+            artifact_dir=output_dir / "aruco_detections",
+        )
+        # ArUco geometry is intentionally applied only after feature BA. It
+        # estimates one similarity transform from the refined VGGT frame into
+        # the USD map frame and never changes relative camera poses inside BA.
+        alignment = robust_similarity_transform(
+            source_points,
+            target_points,
+            inlier_threshold_m=args.alignment_threshold_m,
+        )
+        camera_extrinsics = {
+            index: extrinsic for index, extrinsic in enumerate(predictions["extrinsics"])
+        }
+        alignment_pose_count = None
+
     inlier_residuals = alignment.residuals[alignment.inlier_mask]
     LOGGER.info(
         "Alignment: %d/%d inliers, scale %.6f, RMSE %.4f m",
@@ -1126,11 +2258,45 @@ def run_calibration(args: argparse.Namespace) -> Path:
         alignment.scale,
         float(np.sqrt(np.mean(inlier_residuals**2))),
     )
+    if ba_result is not None:
+        LOGGER.info(
+            "BA has observations in %d camera(s) from %d selected image(s), using %d track(s) / %d observation(s) "
+            "(mean %.2f, %d multi-view): RMSE %.2f px -> %.2f px",
+            ba_result.camera_count,
+            ba_result.selected_image_count,
+            ba_result.track_count,
+            ba_result.observation_count,
+            ba_result.mean_track_length,
+            ba_result.multi_view_track_count,
+            ba_result.initial_rmse_px,
+            ba_result.final_rmse_px,
+        )
+        LOGGER.info('BA optimized %d poses; fixed %d poses (%d without observations); converged=%s',
+                    len(ba_result.variable_image_indices), len(ba_result.fixed_image_indices),
+                    len(ba_result.unobserved_image_indices), ba_result.solver_converged)
+        LOGGER.info(
+            "BA CCTV feature observations: %s",
+            ", ".join(
+                f"{camera.camera_id}={ba_result.cctv_observation_counts[index]}"
+                for index, camera in enumerate(calibration_input.cctv_cameras)
+            ),
+        )
+        if ba_result.fixed_cctv_indices:
+            LOGGER.warning(
+                "BA kept weakly connected CCTV pose(s) fixed (<%d observations): %s",
+                BA_MIN_CCTV_OBSERVATIONS,
+                ", ".join(
+                    calibration_input.cctv_cameras[index].camera_id
+                    for index in ba_result.fixed_cctv_indices
+                ),
+            )
 
     cameras_output = []
     for index, camera in enumerate(calibration_input.cctv_cameras):
+        if index not in camera_extrinsics:
+            continue
         world_to_camera, camera_to_world = transform_camera_extrinsic(
-            predictions["extrinsics"][index], alignment
+            camera_extrinsics[index], alignment
         )
         camera_output = {
                 "camera_id": camera.camera_id,
@@ -1156,6 +2322,11 @@ def run_calibration(args: argparse.Namespace) -> Path:
                     "source_image_size": edge_camera.get("source_image_size"),
                 }
             )
+        else:
+            source_image = cv2.imread(str(camera.image_path))
+            if source_image is None:
+                raise ValueError(f'Cannot read camera source image size: {camera.camera_id}')
+            camera_output['source_image_size'] = [int(source_image.shape[1]), int(source_image.shape[0])]
         cameras_output.append(camera_output)
 
     result = {
@@ -1168,9 +2339,10 @@ def run_calibration(args: argparse.Namespace) -> Path:
         "marker_tree": str(Path(args.marker_tree).expanduser().resolve()),
         "input": {
             "mode": "edge_patch_tokens" if feature_metadata else "local_images",
+            "reconstruction_backend": backend,
             "edge_id": feature_metadata.get("edge_id") if feature_metadata else None,
             "request_id": feature_metadata.get("request_id") if feature_metadata else None,
-            "checkpoint_sha256": file_sha256(checkpoint),
+            "checkpoint_sha256": file_sha256(checkpoint) if checkpoint else None,
             "preprocess": feature_metadata.get("preprocess") if feature_metadata else None,
             "total_images": prepared.cctv_count + len(prepared.reference_frame_indices),
             "cctv_images": prepared.cctv_count,
@@ -1178,13 +2350,81 @@ def run_calibration(args: argparse.Namespace) -> Path:
             "reference_video_frame_indices": list(prepared.reference_frame_indices),
             "image_resolution": args.image_resolution,
             "resize_mode": args.resize_mode,
+            "intrinsics": intrinsics_diagnostics,
+            "bundle_adjustment": (
+                {
+                    "enabled": True,
+                    "camera_count": ba_result.camera_count,
+                    "selected_image_count": ba_result.selected_image_count,
+                    "track_count": ba_result.track_count,
+                    "observation_count": ba_result.observation_count,
+                    "mean_track_length": ba_result.mean_track_length,
+                    "multi_view_track_count": ba_result.multi_view_track_count,
+                    "cctv_observation_counts": {
+                        camera.camera_id: ba_result.cctv_observation_counts[index]
+                        for index, camera in enumerate(calibration_input.cctv_cameras)
+                    },
+                    "fixed_weak_cctv": [
+                        calibration_input.cctv_cameras[index].camera_id
+                        for index in ba_result.fixed_cctv_indices
+                    ],
+                    "initial_rmse_px": ba_result.initial_rmse_px,
+                    "final_rmse_px": ba_result.final_rmse_px,
+                    "solver_nfev": ba_result.solver_nfev,
+                    "solver_optimality": ba_result.solver_optimality,
+                    "solver_message": ba_result.solver_message,
+                    "solver_converged": ba_result.solver_converged,
+                    "image_budget": ba_result.image_budget,
+                    "track_budget": ba_result.track_budget,
+                    "iteration_budget": ba_result.iteration_budget,
+                    "variable_image_indices": list(ba_result.variable_image_indices),
+                    "fixed_image_indices": list(ba_result.fixed_image_indices),
+                    "unobserved_image_indices": list(ba_result.unobserved_image_indices),
+                    "coordinate_constraint": "none; ArUco is applied only after BA",
+                }
+                if ba_result is not None
+                else {"enabled": False}
+            ),
+            "colmap": (
+                {
+                    "registered_image_count": colmap_result.registered_image_count,
+                    "registered_cctv_count": sum(
+                        index in colmap_result.extrinsics
+                        for index in range(prepared.cctv_count)
+                    ),
+                    "unregistered_cctv": missing_cctv,
+                    "complete": not missing_cctv,
+                    "sparse_point_count": colmap_result.point_count,
+                    "matched_pair_count": colmap_result.match_pair_count,
+                    "aruco_pnp_pose_count": alignment_pose_count,
+                    "intrinsics": "fixed per undistorted image (PINHOLE)",
+                }
+                if colmap_result is not None
+                else None
+            ),
         },
         "alignment": {
+            "method": (
+                "aruco_pnp_camera_poses"
+                if backend == "colmap"
+                else (
+                    "vggt_ba_then_aruco_depth_corners"
+                    if ba_result is not None
+                    else "vggt_depth_corners"
+                )
+            ),
             "scale": alignment.scale,
             "rotation": _json_matrix(alignment.rotation),
             "translation_m": alignment.translation.tolist(),
-            "vggt_to_usd": _json_matrix(alignment.matrix4()),
-            "correspondence_count": len(source_points),
+            "reconstruction_to_usd": _json_matrix(alignment.matrix4()),
+            # Kept for existing VGGT-result consumers; COLMAP uses the neutral
+            # reconstruction_to_usd field above.
+            "vggt_to_usd": (
+                _json_matrix(alignment.matrix4()) if backend == "vggt" else None
+            ),
+            "correspondence_count": (
+                alignment_pose_count if backend == "colmap" else len(source_points)
+            ),
             "inlier_count": int(alignment.inlier_mask.sum()),
             "rmse_m": float(np.sqrt(np.mean(inlier_residuals**2))),
             "max_error_m": float(np.max(inlier_residuals)),
@@ -1193,6 +2433,15 @@ def run_calibration(args: argparse.Namespace) -> Path:
         "marker_observations": observations,
         "cameras": cameras_output,
     }
+    if backend == 'vggt' and feature_metadata is None:
+        sources = [dict(kind='cctv', camera_id=c.camera_id) for c in calibration_input.cctv_cameras]
+        sources += [dict(kind='reference', frame_index=int(frame)) for frame in prepared.reference_frame_indices]
+        result['point_cloud'] = export_depth_cloud(
+            output_dir / 'point_cloud.npz', predictions, alignment, sources,
+            min_confidence=args.min_depth_confidence,
+            max_points=getattr(args, 'point_cloud_max_points', 1_000_000),
+            ba_applied=ba_result is not None)
+        LOGGER.info('Saved %d aligned point-cloud points', result['point_cloud']['point_count'])
     result_path = output_dir / "calibration_result.json"
     result_path.write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -1552,7 +2801,7 @@ def _resolve_checkpoint(value: str | None) -> Path:
 def select_cli_mode(requested_mode: str | None = None) -> str:
     print("\n캘리브레이션 실행 모드")
     print("  1. 온라인  - 등록 edge에서 DINO token 수신")
-    print("  2. 오프라인 - 로컬 사진/폴더에서 pose 계산, JSON만 출력")
+    print("  2. 오프라인 - 로컬 사진/폴더에서 pose 계산, JSON 및 VGGT point cloud 출력")
     answer = (requested_mode or input("모드 선택 [1/2]: ").strip()).lower()
     aliases = {
         "1": "online",
@@ -1596,7 +2845,7 @@ def _offline_json_destination(args: argparse.Namespace) -> Path:
 
 
 def run_offline_calibration(args: argparse.Namespace) -> Path:
-    """Calibrate local photos and persist only the final JSON result."""
+    """Calibrate local photos and preserve the final JSON and paired point cloud."""
     image_source = args.images or input(
         "포즈를 구할 사진 또는 사진 폴더 경로: "
     ).strip()
@@ -1604,7 +2853,9 @@ def run_offline_calibration(args: argparse.Namespace) -> Path:
         "reference 용 영상 경로를 입력해주세요: "
     ).strip()
     marker_tree = _interactive_marker_tree(args.marker_tree)
-    checkpoint = _resolve_checkpoint(args.checkpoint)
+    checkpoint = (
+        _resolve_checkpoint(args.checkpoint) if args.backend == "vggt" else None
+    )
     destination = _offline_json_destination(args)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1614,17 +2865,22 @@ def run_offline_calibration(args: argparse.Namespace) -> Path:
             image_source,
             reference_video,
             working_dir / "offline_input.json",
-            sample_count=args.reference_sample_count,
+            sample_count=(
+                args.reference_sample_count or DEFAULT_REFERENCE_SAMPLE_COUNT
+            ),
             camera_config=getattr(args, "camera_config", None),
         )
         print("\nOffline 입력 intrinsic")
         for description in descriptions:
             print(f"  - {description}")
-        print("로컬 사진과 reference 영상을 결합해 VGGT-Omega 추론을 시작합니다.")
+        print(
+            "로컬 사진과 reference 영상을 결합해 "
+            f"{args.backend.upper()} 추론을 시작합니다."
+        )
 
         args.config = str(manifest_path)
         args.feature_bundle = None
-        args.checkpoint = str(checkpoint)
+        args.checkpoint = str(checkpoint) if checkpoint is not None else None
         args.output_dir = str(working_dir)
         args.marker_tree = str(marker_tree)
         temporary_result = run_calibration(args)
@@ -1633,6 +2889,7 @@ def run_offline_calibration(args: argparse.Namespace) -> Path:
         result["input"]["offline_image_source"] = str(
             Path(image_source).expanduser().resolve()
         )
+        preserve_offline_cloud(result, working_dir, destination)
         destination.write_text(
             json.dumps(result, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -1647,7 +2904,7 @@ def run_interactive_calibration(args: argparse.Namespace) -> Path:
         publish_calibration_result,
         request_calibration_features,
     )
-    from apps.edge_manager.app.protocol import DEFAULT_TOPIC_ROOT
+    from dt_common.contracts.edge import DEFAULT_TOPIC_ROOT
     from apps.edge_manager.app.registry import EdgeRegistry
 
     registry = EdgeRegistry(args.registry)
@@ -1672,7 +2929,7 @@ def run_interactive_calibration(args: argparse.Namespace) -> Path:
     manifest_path, reference_description = build_reference_manifest(
         reference_video,
         output_dir / "reference_input.json",
-        sample_count=args.reference_sample_count,
+        sample_count=(args.reference_sample_count or DEFAULT_REFERENCE_SAMPLE_COUNT),
     )
     print(f"Reference 전처리: {reference_description}")
 
@@ -1749,7 +3006,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--feature-bundle",
         help="Edge-produced DINO patch token .npz; config then only needs reference_video",
     )
-    parser.add_argument("--checkpoint", help="VGGT-Omega .pt checkpoint")
+    parser.add_argument("--checkpoint", help="VGGT-Omega .pt checkpoint (VGGT backend only)")
+    parser.add_argument(
+        "--backend",
+        choices=("vggt", "colmap"),
+        default="vggt",
+        help="Pose reconstruction backend; COLMAP accepts only local images.",
+    )
     parser.add_argument("--output-dir", help="Directory for artifacts/results")
     parser.add_argument(
         "--marker-tree",
@@ -1787,12 +3050,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--topic-root", default=os.getenv("EDGE_TOPIC_ROOT"))
     parser.add_argument("--transfer-timeout", type=float, default=300.0)
     parser.add_argument("--result-timeout", type=float, default=30.0)
-    parser.add_argument("--reference-sample-count", type=int, default=40)
     parser.add_argument(
-        "--max-images",
+        "--reference-sample-count",
         type=int,
         default=None,
-        help="Total CCTV + reference images; default estimates from free GPU memory",
+        help=f"Reference video frames to sample (default: {DEFAULT_REFERENCE_SAMPLE_COUNT}).",
     )
     parser.add_argument("--device", default="cuda", help="CUDA device, e.g. cuda:0")
     parser.add_argument("--image-resolution", type=int, default=512)
@@ -1806,6 +3068,27 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="OpenCV undistortion alpha: 0 crops invalid borders, 1 keeps all pixels",
     )
     parser.add_argument("--min-depth-confidence", type=float, default=1.0)
+    parser.add_argument('--max-images', type=int, help='Maximum total CCTV + reference images; does not bypass GPU memory checks.')
+    parser.add_argument('--ba-max-images', type=int, help='Optional BA subsampling cap; default uses ALL input images.')
+    parser.add_argument('--ba-max-tracks', type=int, help='BA track budget; default scales with the number of input images.')
+    parser.add_argument('--ba-max-iterations', type=int, default=BA_MAX_ITERATIONS,
+                        help='Maximum BA solver evaluations (default: 300); convergence is reported in JSON.')
+    parser.add_argument('--point-cloud-max-points', type=int, default=1_000_000,
+                        help='Saved local VGGT cloud point budget (1 to 2000000).')
+    parser.add_argument(
+        "--colmap-max-image-size",
+        type=int,
+        default=1600,
+        help="Maximum image side used by COLMAP SIFT extraction.",
+    )
+    parser.add_argument(
+        "--use_ba",
+        action="store_true",
+        help=(
+            "Refine local-image VGGT poses with SIFT feature-track bundle "
+            "adjustment; unavailable with --feature-bundle."
+        ),
+    )
     parser.add_argument("--alignment-threshold-m", type=float, default=0.10)
     parser.add_argument("--log-level", default="INFO")
     return parser
@@ -1819,18 +3102,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
+        if (
+            args.reference_sample_count is not None
+            and args.reference_sample_count <= 0
+        ):
+            raise ValueError("reference sample count must be greater than zero")
         if args.config is None:
-            if args.reference_sample_count <= 0:
-                raise ValueError("reference sample count must be greater than zero")
             mode = select_cli_mode(args.mode)
             if mode == "online":
+                if args.backend == "colmap":
+                    raise ValueError(
+                        "--backend colmap is only supported in offline/local manifest mode"
+                    )
                 if args.transfer_timeout <= 0 or args.result_timeout <= 0:
                     raise ValueError("Zenoh timeout must be greater than zero")
                 result_path = run_interactive_calibration(args)
             else:
                 result_path = run_offline_calibration(args)
         else:
-            if not args.checkpoint:
+            if args.backend == "vggt" and not args.checkpoint:
                 raise ValueError("--checkpoint is required in manifest mode")
             if not args.output_dir:
                 raise ValueError("--output-dir is required in manifest mode")

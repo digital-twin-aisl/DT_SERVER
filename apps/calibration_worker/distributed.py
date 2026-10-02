@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Zenoh orchestration for privacy-preserving distributed calibration."""
 
 from __future__ import annotations
@@ -16,16 +18,17 @@ if str(REPOSITORY_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 import apps  # noqa: E402,F401
-from dt_common.calibration.protocol import ChunkCollector  # noqa: E402
-from apps.edge_manager.app.protocol import (  # noqa: E402
+from dt_common.contracts.chunks import ChunkCollector  # noqa: E402
+from dt_common.contracts.edge import (  # noqa: E402
     DEFAULT_TOPIC_ROOT,
     SCHEMA_VERSION,
     EdgeTopics,
     decode_json,
     encode_json,
-    make_zenoh_config,
     validate_edge_id,
 )
+
+from dt_common.infrastructure.zenoh import make_zenoh_config
 
 
 @dataclass(frozen=True)

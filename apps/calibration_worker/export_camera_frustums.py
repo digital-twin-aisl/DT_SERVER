@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Export calibration-result camera poses as USD wireframe frustums."""
 
 from __future__ import annotations
@@ -138,6 +140,105 @@ def _author_linear_curves(
     )
 
 
+def _author_colored_mesh(
+    stage: Any,
+    path: str,
+    points: Sequence[np.ndarray],
+    face_vertex_counts: Sequence[int],
+    face_vertex_indices: Sequence[int],
+    color: tuple[float, float, float],
+    *,
+    opacity: float = 1.0,
+) -> None:
+    """Author a double-sided coloured mesh in world coordinates."""
+    from pxr import Gf, UsdGeom, Vt
+
+    mesh = UsdGeom.Mesh.Define(stage, path)
+    mesh.CreatePointsAttr(
+        Vt.Vec3fArray(
+            [Gf.Vec3f(*(float(value) for value in point)) for point in points]
+        )
+    )
+    mesh.CreateFaceVertexCountsAttr(Vt.IntArray(face_vertex_counts))
+    mesh.CreateFaceVertexIndicesAttr(Vt.IntArray(face_vertex_indices))
+    mesh.CreateDoubleSidedAttr(True)
+    mesh.CreateDisplayColorPrimvar(UsdGeom.Tokens.constant).Set(
+        Vt.Vec3fArray([Gf.Vec3f(*color)])
+    )
+    mesh.CreateDisplayOpacityPrimvar(UsdGeom.Tokens.constant).Set(
+        Vt.FloatArray([float(opacity)])
+    )
+
+
+def _normalised(vector: np.ndarray) -> np.ndarray:
+    length = float(np.linalg.norm(vector))
+    if not math.isfinite(length) or length <= 1.0e-9:
+        raise ValueError("Cannot create a direction marker from a zero-length vector")
+    return vector / length
+
+
+def _author_direction_arrow(
+    stage: Any,
+    path: str,
+    origin: np.ndarray,
+    forward: np.ndarray,
+    horizontal_axis: np.ndarray,
+    vertical_axis: np.ndarray,
+    color: tuple[float, float, float],
+) -> None:
+    """Create a solid triangular-pyramid arrowhead along the camera forward axis."""
+    direction = _normalised(forward - origin)
+    horizontal = _normalised(horizontal_axis)
+    vertical = _normalised(vertical_axis)
+    length = float(np.linalg.norm(forward - origin))
+    head_length = max(length * 0.16, 0.22)
+    head_half_width = head_length * 0.42
+    base_centre = forward - direction * head_length
+    base = (
+        base_centre - horizontal * head_half_width - vertical * head_half_width,
+        base_centre + horizontal * head_half_width - vertical * head_half_width,
+        base_centre + horizontal * head_half_width + vertical * head_half_width,
+        base_centre - horizontal * head_half_width + vertical * head_half_width,
+    )
+    _author_colored_mesh(
+        stage,
+        path,
+        (forward, *base),
+        (3, 3, 3, 3, 4),
+        (0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2),
+        color,
+    )
+
+
+def _author_usd_camera(
+    stage: Any,
+    path: str,
+    camera: dict[str, Any],
+    image_size: tuple[int, int],
+) -> None:
+    """Author a native USD camera with the calibrated OpenCV pose and FOV."""
+    from pxr import Gf, UsdGeom
+
+    intrinsic = _matrix(camera.get("camera_matrix"), (3, 3), "camera.camera_matrix")
+    camera_to_world = _matrix(
+        camera.get("camera_to_world"), (4, 4), "camera.camera_to_world"
+    )
+    width, height = image_size
+    usd_camera = UsdGeom.Camera.Define(stage, path)
+    # USD cameras look down -Z with +Y up. OpenCV uses +Z forward and +Y down.
+    usd_to_opencv = np.diag((1.0, -1.0, -1.0, 1.0))
+    transform = camera_to_world @ usd_to_opencv
+    usd_camera.AddTransformOp().Set(Gf.Matrix4d(transform.tolist()))
+
+    horizontal_aperture_mm = 20.955
+    focal_length_mm = float(intrinsic[0, 0] / width * horizontal_aperture_mm)
+    vertical_aperture_mm = float(focal_length_mm * height / intrinsic[1, 1])
+    usd_camera.CreateHorizontalApertureAttr(horizontal_aperture_mm)
+    usd_camera.CreateVerticalApertureAttr(vertical_aperture_mm)
+    usd_camera.CreateFocalLengthAttr(focal_length_mm)
+    usd_camera.CreateClippingRangeAttr((0.01, 1_000_000.0))
+
+
 def _author_world_axes(stage: Any, root_path: str, length_m: float, width_m: float) -> None:
     origin = np.zeros(3, dtype=np.float64)
     axes = (
@@ -249,14 +350,43 @@ def export_camera_frustums(
         ]
         _author_linear_curves(
             stage,
-            f"{camera_path}/Frustum",
+            f"{camera_path}/WireframeFrustum",
             curves,
             color,
             line_width_m,
         )
 
+        # The filled frustum remains legible against dense USD map geometry,
+        # unlike a thin wireframe alone. Points are already in world space.
+        _author_colored_mesh(
+            stage,
+            f"{camera_path}/SolidFrustum",
+            (origin, *corners),
+            (3, 3, 3, 3, 4),
+            (0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2),
+            color,
+            opacity=0.22,
+        )
+        _author_direction_arrow(
+            stage,
+            f"{camera_path}/DirectionArrow",
+            origin,
+            forward,
+            corners[1] - corners[0],
+            corners[3] - corners[0],
+            color,
+        )
+        _author_usd_camera(
+            stage,
+            f"{camera_path}/UsdCamera",
+            camera,
+            image_size,
+        )
+
         origin_marker = UsdGeom.Sphere.Define(stage, f"{camera_path}/Origin")
-        origin_marker.CreateRadiusAttr(max(line_width_m * 2.25, 0.04))
+        origin_marker.CreateRadiusAttr(
+            max(line_width_m * 4.0, frustum_depth_m * 0.08, 0.12)
+        )
         origin_marker.AddTranslateOp().Set(Gf.Vec3d(*origin))
         origin_marker.CreateDisplayColorPrimvar(UsdGeom.Tokens.constant).Set(
             Vt.Vec3fArray([Gf.Vec3f(*color)])

@@ -1,0 +1,15 @@
+/* SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/* Both comparison panels preserve the selected video's aspect, not a GUI FOV. */
+#map { height: auto; aspect-ratio: 16 / 9; min-height: 0; }
+#map canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+#overlay canvas { display: block; width: 100%; height: 100%; }
+.map-panel .panel-title, .map-panel .panel-title > div { flex-wrap: wrap; }
+.map-panel .panel-title label { font-size: .875rem; }
+#lens-info { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.pixel-guide-layer { position:absolute; inset:0; z-index:3; pointer-events:none; overflow:hidden; }
+.pixel-guide { position:absolute; width:14px; height:14px; padding:0; border:0; transform:translate(-50%,-50%); pointer-events:auto; background:transparent; border-radius:50%; }
+.pixel-guide:hover { background:transparent; }
+.pixel-guide::before { content:''; position:absolute; width:6px; height:6px; left:4px; top:4px; background:#ff2020; border-radius:50%; }
+.pixel-guide-controls { display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:10px 12px 0; }
+#pixel-guide-info { font-size:.875rem; color:var(--muted); font-variant-numeric:tabular-nums; }

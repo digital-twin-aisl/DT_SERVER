@@ -1,5 +1,9 @@
 # Calibration Worker
 
+카메라 pose를 영상·3D 맵과 비교하며 직접 보정하려면
+[로컬 Camera Pose Workbench](manual_editor.md)를 사용합니다.
+원본/운영 설정을 바꾸지 않고 수정 JSON을 따로 다운로드하는 영어 UI입니다.
+
 VGGT-Omega가 복원한 임의 좌표계를 Isaac Sim ArUco marker tree의 미터 단위
 좌표계에 정합하고 CCTV 카메라 extrinsics를 계산합니다.
 
@@ -7,6 +11,7 @@ VGGT-Omega가 복원한 임의 좌표계를 Isaac Sim ArUco marker tree의 미�
 
 - CUDA GPU와 CUDA 지원 PyTorch
 - VGGT-Omega 체크포인트 (`VGGT-Omega-1B-512`)
+- 선택 사항: sparse SfM backend용 `colmap` CLI (COLMAP backend 사용 시)
 - `opencv-contrib-python`의 `cv2.aruco`
 - marker tree를 읽기 위한 Pixar USD Python 모듈 (`pxr`)
 - CCTV 및 스마트폰 카메라의 OpenCV camera matrix와 distortion coefficients
@@ -106,15 +111,22 @@ distortion을 가정하고 터미널에 표시합니다. 이 값은 실행 편�
 렌즈 왜곡을 보정할 수 없으므로 정밀 pose 결과로 취급하면 안 됩니다. reference
 영상도 실제 카메라 촬영물이라면 같은 sidecar 규칙으로 intrinsic/distortion을
 제공해야 합니다. 중간 이미지와 검출 artifact는 임시 디렉터리에서 처리 후
-삭제하며, 최종 JSON만 남깁니다. `--json-output`을 생략하면 현재 디렉터리에
+삭제하며, 최종 JSON과 로컬 VGGT 실행의 컬러 포인트클라우드 NPZ를 남깁니다.
+NPZ에는 최종 포즈와 동일한 월드 좌표의 XYZ/RGB/신뢰도/원본 뷰 인덱스가 들어갑니다.
+JSON의 `point_cloud` 필드가 파일명·SHA-256·생성 방법을 연결합니다.
+`--point-cloud-max-points` 기본값은 1,000,000점이며 최대 2,000,000점입니다.
+`--max-images`는 CCTV와 reference를 합한 입력 수 상한이며 GPU 메모리 검사를 우회하지 않습니다.
+`--json-output`과 `--output-dir`을 모두 생략하면 현재 디렉터리에
 `calibration_result_<시각>.json`으로 저장합니다. 오프라인 모드는
 `edges.json`이나 edge의 `cameras.local.yaml`을 수정하지 않습니다.
 
 ### 결과 카메라 pose USD 시각화
 
 결과 JSON의 `camera_to_world`와 intrinsic으로 OpenCV 카메라의 +Z 전방을 나타내는
-wireframe 사각뿔을 생성할 수 있습니다. 출력 Stage는 Z-up·미터 단위이며 결과에
-기록된 ArUco marker tree도 함께 reference합니다.
+시각화 USD를 생성할 수 있습니다. 출력 Stage는 Z-up·미터 단위이며 결과에 기록된
+ArUco marker tree도 함께 reference합니다. 각 카메라는 wireframe, 맵에 묻히지 않는
+반투명 사각뿔 mesh, 전방 방향 화살표, 그리고 실제 `UsdGeom.Camera` prim으로 함께
+생성됩니다.
 
 ```bash
 python apps/calibration_worker/export_camera_frustums.py \
@@ -166,13 +178,100 @@ python apps/calibration_worker/inference.py \
   --config apps/calibration_worker/calibration_input.json \
   --checkpoint /models/VGGT-Omega-1B-512/model.pt \
   --marker-tree apps/isaac_sim_client/aruco_boards/aruco_marker_tree.usd \
-  --output-dir results/calibration_001 \
-  --max-images 48
+  --output-dir results/calibration_001
 ```
 
-`--max-images`는 CCTV 이미지와 스마트폰 샘플 프레임을 합친 개수입니다. 생략하면
-현재 GPU 여유 메모리와 공개된 512px 메모리 측정값으로 상한을 추정합니다. 실제
-GPU에서 OOM이 발생하면 값을 낮춰 다시 실행합니다.
+입력 장수는 manifest의 `reference_video.sample_count` 하나로 결정합니다. 전체 VGGT
+입력은 CCTV 수와 reference frame 수를 더해 자동 계산합니다. 예상 GPU 한도를 넘으면
+`sample_count`를 줄이라는 오류를 출력합니다.
+
+### Bundle Adjustment (선택)
+
+`--use_ba`를 추가하면 VGGT-Omega의 초기 pose와 depth를 사용해 SIFT 특징점 track을
+만들고, 카메라 pose와 track의 3D 점을 함께 재투영 오차가 작아지도록 보정합니다.
+로컬 실행에서는 `--camera-config`와 reference sidecar의 보정 K를 VGGT의 crop·resize·padding
+좌표계로 변환해 고정 사용합니다. ArUco marker와 USD marker 위치는 BA residual이나
+pose 초기화에 사용하지 않습니다. BA가 완료된 뒤에만 VGGT reconstruction 전체를 USD
+맵 좌표계로 옮기는 similarity transform의 계산에 사용합니다.
+기본 실행은 기존과 동일하게 BA를 수행하지 않습니다.
+
+```bash
+python apps/calibration_worker/inference.py \
+  --mode offline \
+  --images /data/cctv_photos \
+  --reference-video /data/reference.mp4 \
+  --checkpoint /models/VGGT-Omega-1B-512/model.pt \
+  --use_ba
+```
+
+BA는 기본적으로 CCTV와 reference **입력 전체**를 특징점 매칭 대상으로 사용합니다.
+90개 reference + 8개 CCTV라면 98장 모두 포함하며 32장으로 몰래 줄이지 않습니다.
+트랙 한도는 `max(300, ceil(300 × 선택 장수 / 32))`로 늘어납니다(98장: 919개).
+sparse Jacobian solver를 사용하며 기본 평가 횟수 한도는 300회입니다.
+필요할 때만 `--ba-max-images`, `--ba-max-tracks`, `--ba-max-iterations`로 제한합니다.
+이미지 수를 제한하더라도 CCTV는 전부 유지하고 reference만 균등 샘플링합니다.
+모든 입력을 사용한다는 것이 모든 포즈의 보정을 보장하지는 않습니다. 관측 부족 뷰와
+좌표계 고정용 앵커는 고정됩니다. 결과 JSON에는 실제 변수/고정/관측 없음 이미지 인덱스,
+계산 예산, `solver_converged`를 기록합니다. 인덱스는 CCTV 다음 reference 순서입니다.
+
+```bash
+python apps/calibration_worker/inference.py \
+  --mode offline \
+  --images /data/cctv_photos \
+  --camera-config apps/edge_client/config/cameras.local.yaml \
+  --reference-video /data/reference.mp4 \
+  --checkpoint /models/VGGT-Omega-1B-512/model.pt \
+  --reference-sample-count 32 \
+  --use_ba
+```
+
+BA는 원본 CCTV 이미지와 reference 이미지의 공통 특징점을 찾아야 하므로 로컬
+manifest/오프라인 실행에서만 사용할 수 있습니다. `--feature-bundle` 기반의 온라인
+분산 실행은 CCTV 원본 대신 patch token만 전송하므로 `--use_ba`를 함께 지정할 수
+없습니다. BA가 적용되면 결과 JSON의 `input.bundle_adjustment`에 사용한 카메라·track
+수와 SIFT track의 보정 전후 reprojection RMSE(px)가 기록됩니다. 결과의
+`alignment.method`가 `vggt_ba_then_aruco_depth_corners`이면 feature BA가 끝난 뒤 ArUco를
+좌표계 정합에만 사용한 것입니다.
+`cctv_observation_counts`가 20 미만인 CCTV는 불안정한 이동을 막기 위해 pose를 고정하며,
+그 목록은 `fixed_weak_cctv`에 기록됩니다. 이 카메라는 입력 수를 무작정 늘리기보다 해당
+CCTV 화면과 겹치는 reference 경로를 추가 촬영해야 합니다.
+공통 장면이 적거나 특징점이 거의 없고, reference 영상에 USD marker가 보이지 않는 경우에는
+BA를 해제하거나 CCTV와 reference 영상의 시야가 더 겹치도록 촬영해야 합니다.
+
+### COLMAP sparse SfM backend (선택)
+
+VGGT 대신 COLMAP의 SIFT·sparse SfM·bundle adjustment로 pose를 계산하려면
+`--backend colmap`을 사용합니다. 이 경로는 VGGT checkpoint가 필요 없고,
+`--camera-config` 또는 사진 sidecar가 제공한 CCTV별 intrinsic을 사용합니다. 모든
+입력은 먼저 OpenCV로 undistort한 뒤 이미지마다 별도 `PINHOLE` 카메라로 COLMAP DB에
+등록하며, mapper가 focal length나 principal point를 다시 보정하지 못하게 고정합니다.
+
+```bash
+python apps/calibration_worker/inference.py \
+  --mode offline \
+  --backend colmap \
+  --images /data/cctv_photos \
+  --camera-config apps/edge_client/config/cameras.local.yaml \
+  --reference-video /data/reference.mp4 \
+  --marker-tree apps/isaac_sim_client/aruco_boards/aruco_marker_tree.usd \
+  --colmap-max-image-size 1600
+```
+
+COLMAP은 원본 이미지가 필요하므로 `--feature-bundle` 기반 온라인 분산 모드에서는
+사용할 수 없으며, `--use_ba`와도 함께 사용할 수 없습니다. reference 영상에서
+검출한 ArUco corner와 known intrinsic으로 PnP pose를 구한 뒤, COLMAP의 임의 좌표계와
+스케일을 marker-tree USD 미터 좌표계에 정합합니다. 결과 JSON의
+`input.reconstruction_backend`, `input.colmap`, `alignment.method`에서 등록 이미지 수,
+sparse point 수, PnP pose 수와 정합 방법을 확인할 수 있습니다.
+
+현재 COLMAP 실행은 CPU SIFT를 사용해 CUDA 빌드 여부와 관계없이 동작합니다. 실행이
+느리면 `--colmap-max-image-size`를 낮추고, registered CCTV count가 전체보다 작으면
+CCTV와 reference 영상의 공통 시야·정적 texture를 늘려야 합니다. 매칭은 모든 쌍을
+무차별 비교하지 않고 CCTV-reference 전체 쌍, CCTV-CCTV 쌍, 시간상 인접한 reference
+프레임 쌍만 사용합니다. 따라서 reference 프레임을 더 촘촘히 뽑아도 연산량이 제곱으로
+급증하지 않으며, `input.colmap.matched_pair_count`에서 실제 비교한 쌍 수를 확인할 수
+있습니다. 공통 특징이 부족한 CCTV는 부정확한 pose를 억지로 만들지 않고 결과의
+`cameras`에서 제외하며, `input.colmap.complete`와 `unregistered_cctv`에 명시합니다.
 
 ## 엣지 patch token 입력
 
