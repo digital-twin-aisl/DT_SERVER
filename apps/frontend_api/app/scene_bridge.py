@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Bounded, read-only Zenoh SceneOutput -> browser WebSocket fan-out."""
 from __future__ import annotations
 

@@ -1,8 +1,11 @@
+// SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+// SPDX-License-Identifier: LGPL-2.1-or-later
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { PeopleRenderer } from './scene.js';
+import { RecordingControls } from './recording_controls.js';
 
 const $ = id => document.getElementById(id);
 const toView = p => new THREE.Vector3(p[0], p[2], -p[1]);
@@ -10,7 +13,10 @@ const showError = message => { $('error').textContent = message; $('error').hidd
 async function json(url) { const r = await fetch(url); if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`); return r.json(); }
 
 async function main() {
+  const params = new URLSearchParams(location.search), region = params.get('region');
+  // File playback needs no manager/Zenoh connection. Resolve the regional topic only when connecting live.
   const config = await json('/api/v1/viewer/config');
+  if (region) config.websocket_path += '?region=' + encodeURIComponent(region);
   const metadata = await json(config.metadata_url);
   const scene = new THREE.Scene(); scene.background = new THREE.Color('#a7bdc8');
   const camera = new THREE.PerspectiveCamera(50, 1, .1, 4000);
@@ -69,38 +75,54 @@ async function main() {
     }));
   }
   function connect() {
+    if (closed || playback.mode !== 'live') return;
     const url = new URL(config.websocket_path, location.href); url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     socket = new WebSocket(url);
     socket.onopen = () => { retry = 1000; status('서버 장면 대기 중'); };
     socket.onmessage = e => {
       try {
         const data = JSON.parse(e.data);
-        if (data.schema_version === 1 && Array.isArray(data.people)) { latest = data; lastScene = performance.now(); status('실시간 수신 중', true); }
+        if (data.schema_version === 1 && Array.isArray(data.people)) { latest = data; lastScene = performance.now(); status(data.runtime?.playback ? '기록 재생 중' : '실시간 수신 중', true); }
         else if (data.type === 'status' && data.status !== 'live') { status(data.subscriber_ready ? '서버 장면 대기 중' : '추론 연결 대기 중'); }
       } catch { showError('서버 장면 형식을 읽을 수 없습니다.'); }
     };
-    socket.onclose = () => { if (closed) return; status('연결 재시도 중'); retryTimer = setTimeout(connect, retry); retry = Math.min(retry * 2, 15000); };
+    socket.onclose = () => { if (closed || playback.mode !== 'live') return; status('연결 재시도 중'); retryTimer = setTimeout(connect, retry); retry = Math.min(retry * 2, 15000); };
     socket.onerror = () => socket.close();
   }
-  connect();
+  function disconnect() {
+    clearTimeout(retryTimer);
+    if (socket) { socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null; socket.close(); socket = null; }
+  }
+  const playback = new RecordingControls({
+    onMode(mode) {
+      disconnect(); latest = null; lastScene = 0; people.clear(); parsed = []; counts(); renderDirty = true;
+      // Recordings declare absolute USD world coordinates, like the Isaac Scene Player.
+      // Keep the existing live parent transform for compatibility with deployed live viewers.
+      if (mode === 'file') people.group.matrix.identity(); else people.group.matrix.fromArray(metadata.people_matrix);
+      people.group.matrixWorldNeedsUpdate = true;
+      $('source-status').textContent = mode === 'file' ? '기록 파일을 불러옵니다.' : '서버의 첫 장면을 기다립니다.';
+      if (mode === 'live') { status('연결 준비 중'); connect(); }
+    },
+    onScene: data => { latest = data; }, onStatus: status,
+  });
+  playback.start(params);
   const loader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
   loader.load(config.map_url, gltf => {
     scene.add(gltf.scene); renderDirty = true;
     $('map-status').textContent = `세종대학교 · 캠퍼스 맵 준비됨`;
-    // Expose read-only diagnostics for deployment smoke tests, no fake scene injection.
-    document.body.dataset.mapReady = 'true';
   }, event => {
     $('map-status').textContent = event.total ? `캠퍼스 맵 ${Math.round(event.loaded / event.total * 100)}%` : `캠퍼스 맵 ${(event.loaded / 1048576).toFixed(1)} MB`;
   }, error => { $('map-status').textContent = '맵 로딩 실패'; showError(`맵을 불러오지 못했습니다. 새로고침해 다시 시도하세요. ${error.message}`); });
 
   renderer.setAnimationLoop(now => {
+    playback.tick(Math.max(0, (now - lastFrame) / 1000));
     if (latest) { renderDirty = true; const result = people.apply(latest); if (result) { parsed = result; counts(); } latest = null; }
     const age = lastScene ? (now - lastScene) / 1000 : null;
-    if (age !== null && age > config.stale_seconds) {
+    if (playback.mode === 'live' && age !== null && age > config.stale_seconds) {
       if (parsed.length) { people.clear(); parsed = []; counts(); renderDirty = true; }
       status('장면 수신 지연');
     }
-    $('source-status').textContent = age === null ? '서버의 첫 장면을 기다립니다.' : `마지막 수신 ${age.toFixed(1)}초 전`;
+    if (playback.mode === 'live') $('source-status').textContent = age === null ? '서버의 첫 장면을 기다립니다.' : `마지막 수신 ${age.toFixed(1)}초 전`;
     if (following && parsed.length) {
       const point = people.group.localToWorld(new THREE.Vector3(...parsed[0].root));
       const delta = point.clone().sub(controls.target).multiplyScalar(1 - Math.exp(-Math.min(now-lastFrame, 100) / 200));
@@ -111,6 +133,6 @@ async function main() {
     if (now - fpsTime > 1000) { $('fps').textContent = frames ? Math.round(frames * 1000 / (now - fpsTime)) : '대기'; frames = 0; fpsTime = now; }
     lastFrame = now;
   });
-  addEventListener('pagehide', () => { closed = true; clearTimeout(retryTimer); socket?.close(); renderer.setAnimationLoop(null); people.dispose(); controls.dispose(); renderer.dispose(); });
+  addEventListener('pagehide', () => { closed = true; playback.close(); disconnect(); renderer.setAnimationLoop(null); people.dispose(); controls.dispose(); renderer.dispose(); });
 }
 main().catch(error => { $('connection').textContent = '뷰어 시작 실패'; showError(`뷰어를 시작할 수 없습니다. ${error.message}`); });

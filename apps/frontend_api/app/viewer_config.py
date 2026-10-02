@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Browser URLs are same-origin so one HTTP(S) tunnel also carries WebSockets."""
 import os
 from pathlib import Path

@@ -1,6 +1,9 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 import asyncio
 import os
 import httpx
+from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -11,28 +14,60 @@ import json
 
 from .viewer_config import assets_dir, viewer_config
 from .scene_bridge import SceneBridge
+from .control_proxy import router as control_router, manager_url
 
 @asynccontextmanager
 async def lifespan(app):
     bridge = SceneBridge(
-        os.getenv("SCENE_ZENOH_ENDPOINT", "tcp/127.0.0.1:10020"),
+        os.getenv("SCENE_ZENOH_ENDPOINT", "tcp/127.0.0.1:7447"),
         os.getenv("SCENE_ZENOH_TOPIC", "meta-sejong/scene/v1"),
         viewer_config()["stale_seconds"],
     )
     app.state.scene_bridge = bridge
+    app.state.region_bridges = {}
+    app.state.bridge_lock = asyncio.Lock()
     await bridge.start()
     try:
         yield
     finally:
         await bridge.close()
+        for regional in app.state.region_bridges.values():
+            await regional.close()
+
+
+async def region_bridge(region=None):
+    if region is None:
+        return app.state.scene_bridge
+    headers = {}
+    if os.getenv('DT_MANAGER_TOKEN'):
+        headers['authorization'] = 'Bearer ' + os.environ['DT_MANAGER_TOKEN']
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(f'{manager_url()}/regions/{quote(region, safe="")}', headers=headers)
+            response.raise_for_status()
+            topic = response.json()['scene_topic']
+    except (httpx.HTTPError, KeyError, ValueError) as exc:
+        raise HTTPException(503, '구역의 장면 설정을 가져올 수 없습니다.') from exc
+    async with app.state.bridge_lock:
+        current = app.state.region_bridges.get(region)
+        if current is not None and current.topic != topic:
+            await current.close()
+            current = None
+        if current is None:
+            current = SceneBridge(os.getenv('SCENE_ZENOH_ENDPOINT', 'tcp/127.0.0.1:7447'), topic,
+                                  viewer_config()['stale_seconds'])
+            await current.start()
+            app.state.region_bridges[region] = current
+        return current
 
 
 app = FastAPI(title="Frontend API Gateway", lifespan=lifespan)
+app.include_router(control_router)
 
-# 프론트엔드(React, Vue 등) 브라우저에서 직접 API를 찌를 수 있도록 CORS 허용 세팅
+# 관리 기능과 뷰어는 같은 origin에서 제공한다.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # 배포 환경에서는 실제 도메인으로 대체 요망
+    allow_origins=[],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -42,11 +77,6 @@ app.add_middleware(
 static_dir = pathlib.Path(__file__).parent / "static"
 static_dir.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-# 내부 Docker 컨테이너 주소 (docker-compose의 서비스명 기준, 기본 컨테이너 포트 80 사용)
-CAMERA_MANAGER_URL = os.getenv("CAMERA_MANAGER_URL", "http://camera_manager:80")
-EDGE_MANAGER_URL = os.getenv("EDGE_MANAGER_URL", "http://edge_manager:80")
-
 
 @app.get("/")
 def read_root():
@@ -59,22 +89,14 @@ def read_root():
         "docs": "Access /docs for Swagger UI"
     }
 
-@app.get("/api/v1/system/status")
-async def get_system_status():
-    """간단한 시스템 헬스체크 및 통합 상태 정보"""
-    # 실제로는 Redis에 각 모듈의 상태를 핑 쳐서 취합하거나, 각 모듈의 루트("/")를 찔러서 확인합니다.
-    return {
-        "edge_manager": "online",
-        "dl_worker": "online",
-        "camera_manager": "online",
-        "sim_backend": "online"
-    }
-
-
 @app.get("/api/v1/viewer/config")
-async def get_viewer_config():
+async def get_viewer_config(region: str | None = None):
     """Same-origin browser renderer configuration."""
-    return viewer_config()
+    config = viewer_config()
+    if region:
+        await region_bridge(region)
+        config['websocket_path'] += '?region=' + quote(region, safe='')
+    return config
 
 
 @app.get("/viewer")
@@ -88,8 +110,8 @@ async def health():
 
 
 @app.get("/api/v1/viewer/status")
-async def get_viewer_status():
-    return {**app.state.scene_bridge.status(),
+async def get_viewer_status(region: str | None = None):
+    return {**(await region_bridge(region)).status(),
             "renderer": "threejs", "map_ready": (assets_dir() / "map.glb").is_file()}
 
 
@@ -104,7 +126,7 @@ async def get_map_asset(name: str):
 
 
 @app.websocket("/ws/scene")
-async def scene_socket(websocket: WebSocket):
+async def scene_socket(websocket: WebSocket, region: str | None = None):
     # Viewer streams are read-only. Reject cross-origin browser subscriptions.
     origin = websocket.headers.get("origin")
     if origin:
@@ -112,8 +134,12 @@ async def scene_socket(websocket: WebSocket):
         if urlsplit(origin).netloc != websocket.headers.get("host"):
             await websocket.close(code=1008)
             return
+    try:
+        bridge = await region_bridge(region)
+    except HTTPException:
+        await websocket.close(code=1013)
+        return
     await websocket.accept()
-    bridge = app.state.scene_bridge
     queue = bridge.subscribe()
 
     async def send():
@@ -138,34 +164,3 @@ async def scene_socket(websocket: WebSocket):
         bridge.clients.discard(queue)
         with suppress(RuntimeError, OSError):
             await websocket.close()
-
-@app.get("/api/v1/edges")
-async def get_edges_list():
-    """Camera Manager로부터 엣지 및 카메라 메타데이터 데이터베이스 목록을 가져옵니다."""
-    async with httpx.AsyncClient() as client:
-        try:
-            # camera_manager 컨테이너의 내부망 포트 80으로 요청
-            response = await client.get(f"{CAMERA_MANAGER_URL}/api/edges", timeout=5.0)
-            response.raise_for_status()
-            return response.json()
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=503, detail=f"Camera Manager 연동 에러: {e}")
-
-@app.post("/api/v1/control/calibration")
-async def request_calibration_trigger(edge_id: str, camera_id: int):
-    """
-    Frontend 사용자가 '캘리브레이션 시작' 버튼을 눌렀을 때, 
-    요청을 일관된 포멧으로 래핑하여 Camera Manager 쪽으로 푸시 (Proxy) 합니다.
-    """
-    async with httpx.AsyncClient() as client:
-        try:
-            # camera_manager 컨테이너로 파라미터 전달 및 Proxy 호출
-            response = await client.post(
-                f"{CAMERA_MANAGER_URL}/api/calibration/request",
-                params={"edge_id": edge_id, "camera_id": camera_id},
-                timeout=5.0
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=503, detail=f"Camera Manager 제어 에러: {e}")

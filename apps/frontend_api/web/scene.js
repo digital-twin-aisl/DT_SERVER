@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+// SPDX-License-Identifier: LGPL-2.1-or-later
 import * as THREE from 'three';
 
 export const LIMBS = [[0,1],[0,2],[0,3],[3,4],[4,5],[0,9],[9,10],[10,11],[2,6],[2,12],[6,7],[7,8],[12,13],[13,14]];
