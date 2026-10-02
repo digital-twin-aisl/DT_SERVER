@@ -1,6 +1,8 @@
 # ------------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
+# Derived from microsoft/voxelpose-pytorch; modified for DT_SERVER.
+# SPDX-License-Identifier: MIT
 # ------------------------------------------------------------------------------
 
 import torch
@@ -8,10 +10,6 @@ import torch.nn as nn
 from .v2v_net import V2VNet
 from .project_layer import ProjectLayer
 from ..core.proposal import nms
-import numpy as np
-from copy import deepcopy
-from ..utils import cameras
-import cv2
 
 class ProposalLayerSoft(nn.Module):
     def __init__(self, cfg):

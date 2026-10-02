@@ -1,15 +1,18 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # ruff: noqa: E402
 
 import argparse
 from collections import Counter
-from dataclasses import dataclass, replace
+import csv
+from dataclasses import replace
 import json
 import logging
 import math
 from pathlib import Path
 import sys
 import time
-from typing import Any, Callable, Literal
+from typing import Any
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -21,19 +24,21 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import apps  # noqa: E402,F401
 from dt_common.spatial.workspace import build_edge_workspace, load_spatial_context
-from dt_common.runtime_config import parse_runtime_args
+from dt_common.runtime_config import parse_runtime_args, configure_profile_paths
+from apps.server_worker.config.runtime import PROFILE_PATH_OPTIONS
 from dt_common.calibration.identity import calibration_digest
-from apps.server_worker.lod_scheduler import LodScheduler
-from apps.server_worker.scene_state import SceneState
-from apps.server_worker.root_tracks import RootTracks, TEMPORARY_ID_START
+from apps.server_worker.domain.lod_scheduler import LodScheduler
+from apps.server_worker.domain.scene_state import SceneState
+from apps.server_worker.domain.ground_filter import add_ground_filter_arguments, make_ground_filter
+from apps.server_worker.domain.root_tracks import RootTracks, TEMPORARY_ID_START
 from apps.server_worker.config.config import config as focus_config
 from apps.server_worker.config.config import update_config as update_focus_config
-from apps.server_worker.priority_engine import PriorityConfig, PriorityEngine
-from apps.server_worker.src.pose.core.config import config as sp3d_config
+from apps.server_worker.domain.priority_engine import PriorityConfig, PriorityEngine
+from apps.server_worker.src.pose.core.config import config as pose_config
 from apps.server_worker.src.pose.core.config import (
-    update_config as update_sp3d_config,
+    update_config as update_pose_config,
 )
-from apps.server_worker.src.pose.models.multi_person_posenet_ssv import (
+from apps.server_worker.src.pose.models.multi_person_posenet import (
     get_multi_person_pose_net,
 )
 from apps.server_worker.src.pose.utils import cameras
@@ -42,6 +47,7 @@ from apps.server_worker.src.protocol.scene_zenoh import (
     ZenohScenePublisher,
     encode_scene,
 )
+from apps.server_worker.src.utils.scene_recording import SceneOutputRecorder, SceneRecordingError
 from apps.server_worker.src.protocol.zenoh import ZenohDataLoader
 from apps.server_worker.src.protocol.replay import ReplayDataLoader
 from apps.server_worker.src.protocol.zmq import Protocol
@@ -56,17 +62,15 @@ from apps.server_worker.src.utils.telemetry import (
 )
 
 
+from dt_common.contracts.scene import (  # noqa: F401 - preserve inference imports during migration
+    LodLevel, RootOutput, PoseOutput, PersonEntity, SceneOutput,
+    OUTPUT_SCHEMA_VERSION, OUTPUT_COORDINATE_SYSTEM,
+)
+from apps.server_worker.domain.observations import RootCandidate
+
 logger = logging.getLogger(__name__)
 
-LodLevel = Literal[0, 1, 2]
 LodAssignments = dict[int, LodLevel]
-LodAssignCallback = Callable[[list[int]], LodAssignments]
-OUTPUT_SCHEMA_VERSION = 1
-OUTPUT_COORDINATE_SYSTEM = {
-    "frame": "USD world",
-    "up_axis": "Z",
-    "unit": "millimetre",
-}
 DEFAULT_MAX_OUTPUT_PEOPLE = 10
 DEFAULT_LOD2_PEOPLE = 1
 MAX_ROOT_REPROJECTION_ERROR_PX = 250.0
@@ -94,91 +98,36 @@ def save_scene_for_viser(
         output_file.write(serialized + "\n")
 
 
-@dataclass(frozen=True, slots=True)
-class RootCandidate:
-    """한 Edge 안에서 Global ID와 연결된 root 후보."""
-
-    global_id: int
-    edge_id: str
-    edge_index: int
-    root_index: int
-    confidence: float
-    reprojection_error: float
-    observation_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class RootOutput:
-    """USD world 좌표계의 millimetre 단위 사람 root."""
-
-    edge_id: str
-    candidate_index: int
-    position: list[float]
-    confidence: float
-    timestamp: float
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "edge_id": self.edge_id,
-            "candidate_index": self.candidate_index,
-            "position": self.position,
-            "confidence": self.confidence,
-            "timestamp": self.timestamp,
-        }
+def save_root_trajectories(
+    scene: "SceneOutput",
+    output_path: Path,
+) -> None:
+    """Append GlobalID root XY positions as one CSV row per person."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not output_path.exists() or output_path.stat().st_size == 0
+    with output_path.open("a", encoding="utf-8", newline="") as output_file:
+        writer = csv.writer(output_file)
+        if write_header:
+            writer.writerow(("timestamp_s", "global_id", "x_mm", "y_mm"))
+        for person in scene.people:
+            writer.writerow(
+                (
+                    person.root.timestamp,
+                    person.global_id,
+                    person.root.position[0],
+                    person.root.position[1],
+                )
+            )
 
 
-@dataclass(frozen=True, slots=True)
-class PoseOutput:
-    """root와 동일한 USD world millimetre 단위 3D joint 좌표."""
-
-    joint_format: str
-    joints: list[list[float]]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "joint_format": self.joint_format,
-            "joints": self.joints,
-        }
 
 
-@dataclass(frozen=True, slots=True)
-class PersonEntity:
-    """서버 파이프라인이 출력하는 사람 단위 entity."""
-
-    global_id: int
-    lod: LodLevel
-    root: RootOutput
-    pose: PoseOutput | None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "global_id": self.global_id,
-            "lod": self.lod,
-            "root": self.root.to_dict(),
-            "pose": self.pose.to_dict() if self.pose is not None else None,
-        }
 
 
-@dataclass(frozen=True, slots=True)
-class SceneOutput:
-    """동기화된 한 시점의 전체 사람 entity 출력."""
 
-    timestamp: float
-    sync_spread_seconds: float
-    people: list[PersonEntity]
-    runtime: dict | None = None
 
-    def to_dict(self) -> dict[str, Any]:
-        output = {
-            "schema_version": OUTPUT_SCHEMA_VERSION,
-            "coordinate_system": OUTPUT_COORDINATE_SYSTEM,
-            "timestamp": self.timestamp,
-            "sync_spread_seconds": self.sync_spread_seconds,
-            "people": [person.to_dict() for person in self.people],
-        }
-        if self.runtime is not None:
-            output["runtime"] = self.runtime
-        return output
+
+
 
 
 def setup_cuda() -> torch.device:
@@ -188,9 +137,9 @@ def setup_cuda() -> torch.device:
         raise RuntimeError("CUDA is required for server inference")
 
     torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.enabled = sp3d_config.CUDNN.ENABLED
-    torch.backends.cudnn.benchmark = sp3d_config.CUDNN.BENCHMARK
-    torch.backends.cudnn.deterministic = sp3d_config.CUDNN.DETERMINISTIC
+    torch.backends.cudnn.enabled = pose_config.CUDNN.ENABLED
+    torch.backends.cudnn.benchmark = pose_config.CUDNN.BENCHMARK
+    torch.backends.cudnn.deterministic = pose_config.CUDNN.DETERMINISTIC
     device = torch.device("cuda")
     logger.info("CUDA is ready: device=%s", device)
     return device
@@ -198,6 +147,7 @@ def setup_cuda() -> torch.device:
 
 def get_parser():
     parser = argparse.ArgumentParser(description="PyTorch AISL Inference")
+    add_ground_filter_arguments(parser)
     parser.add_argument("--runtime-config", help="Portable JSON profile; explicit CLI options override it")
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--input-mode", choices=("independent", "strict"), default="independent")
@@ -213,6 +163,11 @@ def get_parser():
     parser.add_argument("--lod-edge-zones", type=json.loads, default={})
     parser.add_argument("--root-fallback", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--decision-output", help="Record per-batch decisions and pose timings as JSONL")
+    parser.add_argument(
+        "--scene-recording",
+        metavar="PATH",
+        help="Save final SceneOutput JSONL for Isaac offline playback; refuses existing files",
+    )
     parser.add_argument(
         "--cfg-focus",
         dest="cfg_focus",
@@ -320,6 +275,15 @@ def get_parser():
         help="Enable synchronous Viser JSONL debug output (disabled by default)",
     )
     parser.add_argument(
+        "--root-trajectory-output",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Append timestamp_s, global_id, x_mm, and y_mm from SceneOutput "
+            "to a CSV file"
+        ),
+    )
+    parser.add_argument(
         "--max-output-people",
         type=int,
         default=DEFAULT_MAX_OUTPUT_PEOPLE,
@@ -373,7 +337,7 @@ def get_parser():
         action="store_true",
         help="Disable SceneOutput publishing over Zenoh",
     )
-    return parser
+    return configure_profile_paths(parser, PROFILE_PATH_OPTIONS)
 
 
 def parse_metrics_tags(values: list[str]) -> dict[str, str]:
@@ -881,41 +845,6 @@ def assign_global_ids(
     )
 
 
-def assign_all_lod2(global_ids: list[int]) -> LodAssignments:
-    """현재 기본 정책: 매핑된 모든 global ID를 LOD 2로 배정한다."""
-    return {global_id: 2 for global_id in global_ids}
-
-
-def lod_assign(
-    ids: list[list[int | None]],
-    callback: LodAssignCallback,
-) -> LodAssignments:
-    """root에 매핑된 global ID를 callback 정책으로 LOD에 배정한다.
-
-    callback은 정렬된 고유 global ID 목록을 받고, 각 ID에 대한 LOD
-    0, 1, 2를 모두 포함하는 mapping을 반환해야 한다.
-    """
-    global_ids = sorted(
-        {
-            global_id
-            for edge_ids in ids
-            for global_id in edge_ids
-            if global_id is not None
-        }
-    )
-    assignments = callback(global_ids)
-
-    if set(assignments) != set(global_ids):
-        raise ValueError("LOD callback must assign every global ID exactly once")
-    invalid_assignments = {
-        global_id: lod for global_id, lod in assignments.items() if lod not in (0, 1, 2)
-    }
-    if invalid_assignments:
-        raise ValueError(f"LOD values must be 0, 1, or 2: {invalid_assignments}")
-
-    return assignments
-
-
 def build_priority_input(
     ids: list[list[int | None]],
     roots: torch.Tensor,
@@ -954,39 +883,6 @@ def build_priority_input(
             )
 
     return {"persons": persons}
-
-
-def assign_priority_lods(
-    ids: list[list[int | None]],
-    roots: torch.Tensor,
-    timestamps: list[float],
-    engine: PriorityEngine,
-    lod2_count: int,
-) -> LodAssignments:
-    """PriorityEngine rank 상위 인원을 LOD 2, 나머지를 LOD 1로 배정한다."""
-    if isinstance(lod2_count, bool) or not isinstance(lod2_count, int):
-        raise TypeError("lod2_count must be an integer")
-    if lod2_count < 0:
-        raise ValueError("lod2_count must not be negative")
-    if len(timestamps) != roots.shape[0] or not timestamps:
-        raise ValueError("timestamps must contain one value per Edge")
-
-    timestamp_values = [float(timestamp) for timestamp in timestamps]
-    if not all(math.isfinite(timestamp) for timestamp in timestamp_values):
-        raise ValueError("timestamps must be finite")
-    scene_timestamp = sum(timestamp_values) / len(timestamp_values)
-    ranked_result = engine.assign_priority(
-        build_priority_input(ids, roots),
-        timestamp=scene_timestamp,
-        selected_count=lod2_count,
-    )
-    assignments = {
-        int(person["track_id"]): 2 if int(person["rank"]) <= lod2_count else 1
-        for person in ranked_result["persons"]
-    }
-
-    # 기존 lod_assign의 ID 완전성 및 LOD 범위 검증을 그대로 적용한다.
-    return lod_assign(ids, lambda _global_ids: assignments)
 
 
 def select_lod2_roots(
@@ -1078,6 +974,7 @@ def build_scene_output(
     edge_ids: list[str],
     sync_spread: float,
     max_people: int = DEFAULT_MAX_OUTPUT_PEOPLE,
+    ground_filter=None,
 ) -> SceneOutput:
     """Tensor 결과를 다른 프로세스가 소비할 수 있는 사람 entity로 변환한다."""
     if max_people < 1:
@@ -1144,6 +1041,9 @@ def build_scene_output(
                 )
             )
 
+    ground_report = None
+    if ground_filter is not None:
+        people, ground_report = ground_filter.filter_people(people)
     people.sort(
         key=lambda person: (
             -person.lod,
@@ -1166,6 +1066,7 @@ def build_scene_output(
         timestamp=scene_timestamp,
         sync_spread_seconds=float(sync_spread),
         people=people,
+        runtime={"ground_filter": ground_report} if ground_report is not None else None,
     )
 
 
@@ -1175,7 +1076,7 @@ def validate_pose_model_inputs(
     heatmaps: list[torch.Tensor],
     roots: torch.Tensor,
 ) -> None:
-    """MultiPersonPoseNetSSV가 요구하는 입력 계약을 검증한다."""
+    """MultiPersonPoseNet가 요구하는 입력 계약을 검증한다."""
     expected_views = len(model.pose_net.project_layer.cams)
     expected_joints = int(model.num_joints)
     expected_candidates = int(model.num_cand)
@@ -1253,6 +1154,11 @@ def main() -> None:
     if args.status_log_every < 1:
         raise ValueError("--status-log-every must be at least 1")
     metrics_tags = parse_metrics_tags(args.metrics_tag)
+    scene_recording_path = (
+        Path(args.scene_recording).expanduser().resolve() if args.scene_recording else None
+    )
+    if scene_recording_path is not None and scene_recording_path.exists():
+        raise FileExistsError(f"Choose a new scene recording path: {scene_recording_path}")
 
     if args.cfg_focus:
         logger.info("Loading focus config: %s", args.cfg_focus)
@@ -1262,10 +1168,12 @@ def main() -> None:
         if args.pose_config
         else resolve_server_worker_path(focus_config.POSENET.CONFIG)
     )
-    update_sp3d_config(str(pose_config_path))
+    update_pose_config(str(pose_config_path))
     edge_metadata_path = Path(args.deployment).expanduser().resolve()
     spatial_context = load_spatial_context(edge_metadata_path)
-    sp3d_config.SPATIAL_CONTEXT = spatial_context
+    ground_filter = make_ground_filter(args, None if spatial_context is None else spatial_context.ground_surface)
+    logger.info("Final output ground filter: %s", ground_filter.config)
+    pose_config.SPATIAL_CONTEXT = spatial_context
     logger.info("Pose config is ready: %s", pose_config_path)
 
     use_tensorrt = (
@@ -1290,7 +1198,7 @@ def main() -> None:
         args.edge_ids or "all enabled",
     )
     edge_metadata = EdgeMetadataLoader(
-        sp3d_config,
+        pose_config,
         args.edge_ids,
         edge_metadata_path,
     )
@@ -1304,9 +1212,9 @@ def main() -> None:
                 spatial_context,
                 edge_id,
                 edge_metadata[edge_id].cams,
-                sp3d_config.NETWORK.IMAGE_SIZE_ORIG,
-                sp3d_config.MULTI_PERSON.SPACE_SIZE,
-                sp3d_config.MULTI_PERSON.INITIAL_CUBE_SIZE,
+                pose_config.NETWORK.IMAGE_SIZE_ORIG,
+                pose_config.MULTI_PERSON.SPACE_SIZE,
+                pose_config.MULTI_PERSON.INITIAL_CUBE_SIZE,
             )
             expected_workspace_ids[edge_id] = workspace.workspace_id
             logger.info(
@@ -1359,7 +1267,7 @@ def main() -> None:
     for edge_id in edge_ids:
         metadata = edge_metadata[edge_id]
         pose_models[edge_id] = load_pose_model(
-            sp3d_config,
+            pose_config,
             str(checkpoint_path),
             metadata.transform,
             metadata.cams,
@@ -1392,9 +1300,9 @@ def main() -> None:
         input_mode=args.input_mode, input_clock=args.input_clock,
         max_input_age=args.max_input_age, future_tolerance=args.future_tolerance,
         expected_calibration_digests={edge: calibration_digest(edge_metadata[edge].cams) for edge in edge_ids},
-        expected_heatmap_shape=(sp3d_config.NETWORK.NUM_JOINTS,
-                               sp3d_config.NETWORK.HEATMAP_SIZE[1], sp3d_config.NETWORK.HEATMAP_SIZE[0]),
-        expected_root_count=sp3d_config.MULTI_PERSON.MAX_PEOPLE_NUM,
+        expected_heatmap_shape=(pose_config.NETWORK.NUM_JOINTS,
+                               pose_config.NETWORK.HEATMAP_SIZE[1], pose_config.NETWORK.HEATMAP_SIZE[0]),
+        expected_root_count=pose_config.MULTI_PERSON.MAX_PEOPLE_NUM,
     )
     logger.info("Zenoh data loader is ready; waiting for synchronized batches")
     zmq_output = None
@@ -1503,10 +1411,14 @@ def main() -> None:
         raise
 
     decision_stream = None
+    scene_recorder = None
     batch_count = 0
     previous_transport_counters = {}
     seen_global_ids = set()
     try:
+        if scene_recording_path is not None:
+            scene_recorder = SceneOutputRecorder(scene_recording_path)
+            logger.info("Final scene recording enabled: %s", scene_recorder.path)
         if args.decision_output:
             decision_path = Path(args.decision_output).expanduser().resolve()
             decision_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1536,6 +1448,16 @@ def main() -> None:
                 "Synchronous Viser debug output is enabled: %s",
                 viser_debug_output_path,
             )
+        root_trajectory_output_path = (
+            None
+            if args.root_trajectory_output is None
+            else Path(args.root_trajectory_output).expanduser().resolve()
+        )
+        if root_trajectory_output_path is not None:
+            logger.info(
+                "Root trajectory CSV output is enabled: %s",
+                root_trajectory_output_path,
+            )
         with torch.inference_mode():
             while True:
                 receive_started_at = time.perf_counter()
@@ -1550,8 +1472,11 @@ def main() -> None:
                             time.time(), scheduler.assignments, args.max_output_people)
                         idle_scene = replace(idle_scene, runtime={"input_status": loader.edge_status(),
                             "timestamp_kind": "receive_unix", "status": "waiting_for_input"})
+                        idle_payload = encode_scene(idle_scene.to_dict())
+                        if scene_recorder is not None:
+                            scene_recorder.write_payload(idle_payload)
                         if scene_publisher is not None:
-                            scene_publisher.send_scene(idle_scene.to_dict())
+                            scene_publisher.send_payload(idle_payload)
                         if zmq_output is not None:
                             zmq_output.send_scene(idle_scene.to_dict())
                     now = time.monotonic()
@@ -1767,11 +1692,13 @@ def main() -> None:
                         batch_edge_ids,
                         sync_spread,
                         max_people=args.max_output_people,
+                        ground_filter=ground_filter,
                     )
                     scene_output = scene_state.update(scene_output, batch_edge_ids,
                         time.time() if args.input_clock == "live" else prepared.timestamp,
                         scheduler.assignments, args.max_output_people)
                     scene_output = replace(scene_output, runtime={
+                        **(scene_output.runtime or {}),
                         "input_status": loader.edge_status(),
                         "active_edges": batch_edge_ids,
                         "timestamp_kind": next(iter(prepared.frames.values()))["timestamp_kind"],
@@ -1812,11 +1739,26 @@ def main() -> None:
                     ) * 1000.0
 
                     stage_started_at = time.perf_counter()
+                    if root_trajectory_output_path is not None:
+                        save_root_trajectories(
+                            scene_output,
+                            root_trajectory_output_path,
+                        )
+                    timings_ms["root_trajectory_output"] = (
+                        time.perf_counter() - stage_started_at
+                    ) * 1000.0
+
+                    stage_started_at = time.perf_counter()
                     scene_payload = scene_output.to_dict()
                     encoded_scene = encode_scene(scene_payload)
                     timings_ms["scene_serialization"] = (
                         time.perf_counter() - stage_started_at
                     ) * 1000.0
+
+                    stage_started_at = time.perf_counter()
+                    if scene_recorder is not None:
+                        scene_recorder.write_payload(encoded_scene)
+                    timings_ms["scene_recording"] = (time.perf_counter() - stage_started_at) * 1000.0
 
                     stage_started_at = time.perf_counter()
                     zmq_enqueued = None
@@ -1918,6 +1860,8 @@ def main() -> None:
                         "message": str(exc)[:2000],
                     }
                     logger.exception("Failed to process synchronized batch")
+                    if isinstance(exc, SceneRecordingError):
+                        raise
                 finally:
                     elapsed = (time.perf_counter() - started_at) * 1000.0
                     timings_ms["processing_total"] = elapsed
@@ -1939,7 +1883,9 @@ def main() -> None:
                             "pose_inference",
                             "scene_build",
                             "viser_debug_output",
+                            "root_trajectory_output",
                             "scene_serialization",
+                            "scene_recording",
                             "transport_enqueue",
                         )
                         pipeline_stages_total = sum(
@@ -2029,6 +1975,13 @@ def main() -> None:
         logger.info("[8/8] Closing inference resources")
         if decision_stream is not None:
             decision_stream.close()
+        if scene_recorder is not None:
+            try:
+                scene_recorder.close()
+                logger.info("Scene recording closed: %s frames=%d bytes=%d",
+                            scene_recorder.path, scene_recorder.frames, scene_recorder.bytes)
+            except OSError:
+                logger.exception("Could not finalize scene recording")
         loader.close()
         if zmq_output is not None:
             zmq_output.close()

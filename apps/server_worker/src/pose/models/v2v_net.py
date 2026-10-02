@@ -1,6 +1,8 @@
 # ------------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
+# Derived from microsoft/voxelpose-pytorch; modified for DT_SERVER.
+# SPDX-License-Identifier: MIT
 # ------------------------------------------------------------------------------
 
 import torch

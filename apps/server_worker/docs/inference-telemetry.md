@@ -38,6 +38,20 @@ Isaac Sim streaming. Synchronous Viser scene recording is also disabled by
 default; enable it explicitly with `--viser-debug-output` or
 `--viser-debug-output PATH` only when capturing a debug sequence.
 
+To record only the time-varying XY root trajectory for each GlobalID, pass a
+CSV path with `--root-trajectory-output`. The server appends one row per person
+with `timestamp_s`, `global_id`, `x_mm`, and `y_mm`; Z and pose joints are not
+written. Dataset timestamps are relative seconds from the start of the video,
+and positions use the SceneOutput USD-world millimetre coordinate system.
+
+```bash
+python apps/server_worker/inference.py \
+  --deployment apps/deployments/scene_0812_1.json \
+  --zenoh-endpoint 127.0.0.1:7447 \
+  --root-trajectory-output \
+    apps/server_worker/data/scene_0812_1_root_xy.csv
+```
+
 Each run directory contains:
 
 - `run.json`: command/configuration, Edge and camera topology, model paths,

@@ -1,6 +1,8 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 import json
 import logging
-from dt_common.zenoh_transport import LatestPublisher
+from dt_common.infrastructure.zenoh import LatestPublisher
 
 
 logger = logging.getLogger(__name__)

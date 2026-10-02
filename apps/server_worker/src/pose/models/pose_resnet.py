@@ -1,16 +1,16 @@
 # ------------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
+# Derived from microsoft/voxelpose-pytorch; modified for DT_SERVER.
+# SPDX-License-Identifier: MIT
 # ------------------------------------------------------------------------------
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os
 import logging
 
-import torch
 import torch.nn as nn
 
 def deep_getattr(obj, attr_path, default):
@@ -253,54 +253,5 @@ def get_pose_net(cfg=None, is_train=False, **kwargs):
 
     if is_train:
         model.init_weights()
-
-    return model
-
-
-class PoseResAttnNet(nn.Module):
-    def __init__(self, block, layers, cfg, **kwargs):
-        super(PoseResAttnNet, self).__init__()
-        self.backbone = PoseResNet(block, layers, cfg, **kwargs)
-        self.sigmoid = nn.Sigmoid()
-    
-    def forward(self, x):
-        out = self.backbone(x)
-        out = self.sigmoid(out)
-        return out
-    
-    def init_weights(self, pretrained="", mapping=None):
-        self.backbone.init_weights(pretrained, mapping)
-
-class PoseResAttnSharedNet(nn.Module):
-    def __init__(self, block, layers, cfg, **kwargs):
-        super(PoseResAttnSharedNet, self).__init__()
-
-        # self.sigmoid = nn.Sigmoid()
-        self.relu = nn.ReLU(inplace=True)
-
-        self.final_layer = nn.Conv2d(
-            in_channels=cfg.POSE_RESNET.NUM_DECONV_FILTERS[-1],
-            out_channels=cfg.NETWORK.NUM_JOINTS,
-            kernel_size=cfg.POSE_RESNET.FINAL_CONV_KERNEL,
-            stride=1,
-            padding=1 if cfg.POSE_RESNET.FINAL_CONV_KERNEL == 3 else 0,
-        )
-    
-    def forward(self, x):
-        out = self.final_layer(x)
-        # out = self.sigmoid(out)
-        out = self.relu(out)
-        return out
-    
-
-def get_pose_attn_net(cfg, is_train, **kwargs):
-    num_layers = cfg.ATTN_NUM_LAYERS
-
-    block_class, layers = resnet_spec[num_layers]
-
-    model = PoseResAttnNet(block_class, layers, cfg, **kwargs)
-
-    if is_train:
-        model.init_weights(cfg.NETWORK.PRETRAINED, mapping=cfg.COCO_TO_PANOPTIC_MAPPING)
 
     return model

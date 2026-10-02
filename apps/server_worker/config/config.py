@@ -1,16 +1,12 @@
-import os
-import sys
-sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
-
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 from easydict import EasyDict as edict
 import numpy as np
 import yaml
 
-# from SelfPose3d.lib.core.config import config as cfg
 
 config = edict()
 config.NUM_VIEWS = 4
-config.BATCHSIZE = 1
 
 # POSENET
 config.POSENET = edict()
@@ -18,30 +14,8 @@ config.POSENET.CKPT = "models/POC_posenet.pth.tar"
 config.POSENET.CONFIG = "config/cam4_posenet.yaml"
 config.POSENET.TENSORRT = False
 config.POSENET.INPUT_SHAPE = None
-
-# Example
-config.EXAMPLE = edict()
-config.EXAMPLE.SOURCES = None
-config.EXAMPLE.START_FRAME = 0
-config.EXAMPLE.END_FRAME = None
-config.CALIBRATION_PATH = '/home/min4090/Server_DT/data'
-# lod
-config.DISTANCE = 1500
-config.LOD=[2,1,0]
-
-config.ZONE=[0,1]
-config.SERVER='192.168.0.73:20522'
 config.ZMQ_SERVER = 'localhost'
 config.ZMQ_PORT = 5555
-config.ReidDataPATH = "/home/min4090/Server_DT/"
-config.time_diff = 0.15
-config.MESH=edict()
-config.MESH.CKPT = "/home/min4090/Server_DT/models/mesh.pth.tar"
-config.GRAPH_JOINT_NUM = 17
-config.GRAPH_SKELETON = (
-        (0, 7), (7, 8), (8, 9), (9, 10), (8, 11), (11, 12), (12, 13), (8, 14), (14, 15), (15, 16), (0, 1), (1, 2),
-        (2, 3), (0, 4), (4, 5), (5, 6))
-config.GRAPH_FLIP_PAIRS = ((1, 4), (2, 5), (3, 6), (14, 11), (15, 12), (16, 13))
 def _update_dict(k, v):
     if k == 'DATASET':
         if 'MEAN' in v and v['MEAN']:

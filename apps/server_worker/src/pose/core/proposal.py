@@ -1,18 +1,16 @@
-'''
-Project: SelfPose3d
------
-Copyright (c) University of Strasbourg, All Rights Reserved.
-'''
-
+# ------------------------------------------------------------------------------
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License.
+# SPDX-License-Identifier: MIT
+# Derived from microsoft/voxelpose-pytorch; modified for DT_SERVER.
+# ------------------------------------------------------------------------------
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy.ndimage import maximum_filter
 
 
 def get_index(indices, shape):

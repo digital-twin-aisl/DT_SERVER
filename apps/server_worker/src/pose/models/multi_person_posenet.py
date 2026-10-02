@@ -1,6 +1,8 @@
 # ------------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
+# Derived from microsoft/voxelpose-pytorch; modified for DT_SERVER.
+# SPDX-License-Identifier: MIT
 # ------------------------------------------------------------------------------
 
 from __future__ import absolute_import
@@ -14,17 +16,9 @@ from . import pose_resnet
 from .cuboid_proposal_net_soft import CuboidProposalNetSoft
 from .pose_regression_net import PoseRegressionNet
 
-from torch.utils.flop_counter import FlopCounterMode
-
-def get_flops(model, inp):
-    flop_counter = FlopCounterMode(mods=model, display=False, depth=None)
-    with flop_counter:
-        model(inp)
-    return flop_counter.get_total_flops()
-
-class MultiPersonPoseNetSSV(nn.Module):
+class MultiPersonPoseNet(nn.Module):
     def __init__(self, backbone, cfg, transform=None, cams=None, inference_mode="posenet"):
-        super(MultiPersonPoseNetSSV, self).__init__()
+        super(MultiPersonPoseNet, self).__init__()
         if cams is not None and len(cams) != cfg.NUM_VIEWS:
             raise ValueError(
                 f"Expected {cfg.NUM_VIEWS} calibrated cameras, got {len(cams)}"
@@ -140,5 +134,5 @@ class MultiPersonPoseNetSSV(nn.Module):
 
 def  get_multi_person_pose_net(cfg, transform=None, cams=None, inference_mode="posenet"):
     backbone = pose_resnet.get_pose_net(cfg)
-    model = MultiPersonPoseNetSSV(backbone, cfg, transform, cams, inference_mode)
+    model = MultiPersonPoseNet(backbone, cfg, transform, cams, inference_mode)
     return model

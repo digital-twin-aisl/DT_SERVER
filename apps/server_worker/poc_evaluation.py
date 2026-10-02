@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Compare held LOD decisions against future ground-truth trajectories.
 
 The oracle is the same spatial urgency kernel as the online engine, evaluated
@@ -14,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from apps.server_worker.priority_engine import PriorityConfig, PriorityEngine
+from apps.server_worker.domain.priority_engine import PriorityConfig, PriorityEngine
 
 
 class Trajectories:

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 import torch
 from torch2trt import torch2trt, TRTModule
 import os
@@ -14,7 +16,6 @@ import os
 def export_tensorrt(model, output_dir, cfg, mode="fp16"):
     print("Exporting Model to TensorRT engine...")
     batch_size = cfg.BATCH_SIZE
-    num_views = cfg.NUM_VIEWS
 
     backbone = model.backbone
     root_v2v_net = model.root_net.v2v_net

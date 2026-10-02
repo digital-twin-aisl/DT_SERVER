@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -204,10 +206,10 @@ if __name__ == "__main__":
     # 사용 예시:
     # 프로젝트 루트에서 아래 명령으로 실행한다.
     # python -m apps.server_worker.src.utils.edgemetadata
-    from apps.server_worker.src.pose.core.config import config as sp3d_config
+    from apps.server_worker.src.pose.core.config import config as pose_config
 
     metadata_loader = EdgeMetadataLoader(
-        cfg=sp3d_config,
+        cfg=pose_config,
         edge_ids=["0_edge", "1_edge"],
     )
 
