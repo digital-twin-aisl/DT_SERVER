@@ -1,100 +1,52 @@
-# Zenoh Edge Manager CLI
+# 구역·장치 관리자
 
-엣지의 첫 `status` 메시지를 등록 요청으로 취급하는 최소 CLI 관리자입니다.
-별도 HTTP, gRPC, Redis 서비스는 사용하지 않습니다.
+`python -m apps.edge_manager`는 GUI와 동일한 관리 API를 호출하는 CLI입니다. GPU 라이브러리는 관리 프로세스에 import하지 않으며, 준비된 Python 환경의 worker를 자식 프로세스로 감독합니다.
 
-## 실행
-
-인증서 없이 reliable QUIC을 사용하는 가장 단순한 구성은 저장소의 router 설정을
-사용합니다. 이 모드는 신뢰 네트워크 또는 VPN 안에서만 사용해야 합니다.
+최초 설치와 구역 시작은 [루트 README](../../README.md)를 참고하세요.
 
 ```bash
-zenohd -c apps/edge_manager/config/zenoh-router-quic.json5
-```
-
-다른 터미널에서 manager를 같은 router에 연결해 엣지를 감시합니다.
-
-```bash
-python -m apps.edge_manager \
-  --endpoint 'udp/127.0.0.1:10020?rel=1' \
-  serve
-```
-
-Manager는 기본 5초마다 online edge에 Zenoh `ping` heartbeat를 보내고, edge는
-응답과 함께 최신 카메라 상태를 다시 발행합니다. 주기는
-`serve --heartbeat-interval 10`처럼 변경할 수 있습니다.
-
-다른 터미널에서 발견된 엣지를 관리합니다.
-
-```bash
+python -m apps.edge_manager serve
 python -m apps.edge_manager list
-python -m apps.edge_manager \
-  --endpoint 'udp/127.0.0.1:10020?rel=1' \
-  approve edge_1 --name dt_jetson_1
-python -m apps.edge_manager command EDGE_ID ping
-python -m apps.edge_manager revoke EDGE_ID
-python -m apps.edge_manager remove EDGE_ID
+python -m apps.edge_manager approve edge_1
+python -m apps.edge_manager region list
+python -m apps.edge_manager region start center-b1-corridor
+python -m apps.edge_manager region status center-b1-corridor
+python -m apps.edge_manager region logs center-b1-corridor --edge-id edge_1
+python -m apps.edge_manager region stop center-b1-corridor
 ```
 
-카메라 캘리브레이션의 표준 진입점은 calibration worker입니다.
+서버가 상시 실행된 이후 CLI에 Zenoh 주소와 registry 경로를 매번 전달하지 않습니다. `DT_MANAGER_URL`은 기본 `http://127.0.0.1:8001`이며 토큰이 있으면 `DT_MANAGER_TOKEN`을 사용합니다. `--endpoint`, `--registry`, `--catalog`는 **serve의 설정**입니다. 기존 `list/approve/revoke/remove/command`의 이름은 유지하지만 이제 같은 관리 API를 거칩니다.
 
-```bash
-python apps/calibration_worker/inference.py
-```
+## 관리 API
 
-worker는 이 registry에서 edge ID와 등록 카메라 수를 읽고, 캘리브레이션 완료 후
-카메라별 intrinsic/distortion/extrinsic과 정합 품질을 다시 저장합니다. 엣지 agent도
-같은 checkpoint로 `--calibration-checkpoint` 옵션을 주어 실행해야 합니다. 카메라
-intrinsic은 먼저 `python apps/edge_client/camera_setup.py intrinsic`으로 등록합니다.
+| 요청 | 의미 |
+| --- | --- |
+| GET /regions | 구역 → 엣지 → 카메라와 실제 실행 상태 |
+| GET /regions/{id} | 특정 구역 상태 |
+| PUT /regions/{id} | 중지된 구역 등록/구성. name, deployment, server_profile, scene_topic |
+| DELETE /regions/{id} | 중지된 구역 등록 해제 |
+| POST /regions/{id}/start | 구역 실시간 실행. 선택적 `{"record": true}` |
+| POST /regions/{id}/stop | 구역 작업 종료 |
+| GET /regions/{id}/logs?edge_id=... | 서버 또는 엣지 로그 끝부분 |
+| GET /regions/{id}/recordings | 작업·기록 목록 |
+| GET /regions/{id}/recordings/{run_id}/download | SceneOutput JSONL 다운로드 |
+| POST /regions/{id}/replay | `{"recording_id": "..."}` 출력 장면 재생 |
+| POST /regions/{id}/calibrate | edge_id, reference_video, marker_tree, checkpoint |
+| GET /edges | 발견된 장치·승인·연결 상태 |
+| POST /edges/{id}/approve | 장치 승인. 선택적 name, endpoint |
+| POST /edges/{id}/revoke | 승인 해제와 lease 갱신 중단 |
+| POST /edges/{id}/ping, info, shutdown | 기존 agent 명령 |
 
-Docker Compose로 manager를 실행 중이라면 같은 컨테이너의 registry를 사용하는
-CLI를 다음처럼 호출합니다.
+GET `/docs`는 OpenAPI 문서입니다. frontend는 `/api/v1/control/...`로 그대로 중계합니다. 외부 바인딩은 관리 토큰이 있어야 하며 cross-origin 요청은 허용하지 않습니다.
 
-```bash
-docker compose exec edge_manager python -m app list
-```
+## 모듈 경계
 
-`--endpoint`, `--topic-root`, `--registry`는 subcommand 앞에 둡니다. 환경 변수
-`ZENOH_ENDPOINT`, `EDGE_TOPIC_ROOT`, `EDGE_REGISTRY_PATH`로도 지정할 수 있습니다.
+- `topology.py`: 구역 소속 검증과 배포 참조
+- `registry.py`: 기존 장치 발견·승인·카메라 상태 영속화
+- `control.py`: CLI/GUI에 공통인 작업 수명주기
+- `transport.py`: edge 명령과 ACK 상관관계, 타임아웃
+- `service.py`: Zenoh 구독, HTTP 서비스, 상태 갱신
+- `recording.py`, `scene_replay.py`: 추론과 독립된 출력 기록·재생
+- `dt_common.process`: 서버·엣지 공통 프로세스 감독
 
-Registry 기본 위치는 `apps/edge_manager/data/edges.json`입니다. 엣지는 처음
-발견되면 `approved=false`로 저장되며 heartbeat가 15초 동안
-없으면 offline 처리됩니다. 각 edge의 `cameras`에는 카메라 ID별 `exists`,
-`ping`, `calibration`을 저장합니다. 일반 camera status는 intrinsic, extrinsic,
-distortion coefficients로 제한됩니다. 캘리브레이션 작업이 명시적으로 실행될 때만
-서비스 매핑에 필요한 이름, 위치, Twin ID가 결과와 함께 저장됩니다. RTSP URL,
-인증정보, 원본 프레임은 어떤 경우에도 서버로 전송하지 않습니다.
-
-## 토픽
-
-```text
-dt/edges/{edge_id}/status
-dt/edges/{edge_id}/inference
-dt/edges/{edge_id}/command
-dt/edges/{edge_id}/ack
-dt/edges/{edge_id}/cameras
-dt/edges/{edge_id}/calibration
-dt/edges/{edge_id}/calibration/{request_id}/chunks/{index}
-```
-
-현재 agent 명령은 `ping`, `info`, `shutdown`, `capture_calibration_features`,
-`apply_calibration_result`를 지원합니다. `shutdown`은 Jetson을
-종료하는 명령이 아니라 edge agent 프로세스만 정상 종료합니다.
-
-`approve`는 `dt/edges/{edge_id}/config`로 설정을 발행하고, 엣지가
-`edge.local.json` 저장을 완료했다는 ACK를 보낸 뒤에만 registry를 승인 상태로
-변경합니다. 엣지가 보고한 endpoint 대신 다른 외부 주소를 저장해야 한다면
-`approve EDGE_ID --edge-endpoint 'udp/PUBLIC_IP:10020?rel=1'`을 사용합니다.
-
-권장 등록 순서는 다음과 같습니다.
-
-1. Edge에서 `agent.py init`으로 `edge_id=edge_1`, 표시 이름, QUIC endpoint와
-   카메라 파일을 한 번 저장합니다.
-2. Edge에서 `agent.py run`을 실행합니다.
-3. 서버에서 `list`로 `edge_1`을 확인하고 `approve edge_1`을 실행합니다.
-4. 필요하면 calibration worker를 실행해 YAML의 extrinsic을 완성합니다.
-5. Edge에서 인자 없이 `inference.py`를 실행합니다.
-
-현재 최소 구현에서는 registry와 `server_worker`의 승인 엣지 목록을 자동으로
-동기화하지 않습니다. 서버 추론을 붙일 때는 승인된 엣지의 ID와
-`dt/edges/{edge_id}/inference` 토픽을 server worker 설정에 사용해야 합니다.
+Registry의 기본 위치는 `apps/edge_manager/data/edges.json`입니다. 기존 v1 파일을 그대로 읽습니다. 구역 정보는 배포 manifest를 참조하므로 기존 카메라/승인 레코드를 삭제하거나 재번호 매기지 않습니다. 모니터링은 5초 heartbeat, 15초 offline 판정을 기본으로 사용합니다.
