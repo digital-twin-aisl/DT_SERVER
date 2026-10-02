@@ -1,0 +1,16 @@
+# Paths removed from the dev tree when exporting the public release.
+# One glob per line, matched against repository-relative paths
+# (a trailing "/" excludes the whole directory). Everything else is published.
+
+# Dev-only tooling and assistant notes
+release/
+CLAUDE.md
+.claude/
+AGENTS.md
+
+# Local working data (also git-ignored; listed here as a second guard)
+data/
+temp_data/
+
+# Internal experiment logs that reference unpublished recordings
+apps/deployments/rootnet_v2/recordings_*.md
