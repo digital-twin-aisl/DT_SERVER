@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install CPU PyTorch and dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -r apps/edge_manager/requirements.txt -r apps/frontend_api/requirements.txt
+      - name: Lint
+        run: ruff check apps packages examples tools
+      - name: Tests
+        run: |
+          python -m pytest apps/server_worker/tests apps/frontend_api/tests \
+            apps/calibration_worker/tests apps/deployments/rootnet_v2/tests \
+            "apps/isaac_sim_client/exts/meta_sejong.scene_player/tests" examples
+
+  web:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/frontend_api/web/package-lock.json
+      - run: npm ci --prefix apps/frontend_api/web
+      - run: npm test --prefix apps/frontend_api/web
+      - run: npm run build --prefix apps/frontend_api/web
+      - name: Manual calibration editor geometry tests
+        run: |
+          ln -s ../../frontend_api/web/node_modules apps/calibration_worker/manual_web/node_modules
+          node --test apps/calibration_worker/manual_web/geometry.test.js
+
+  compliance:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install "reuse>=4,<7"
+      - name: REUSE (license headers)
+        run: reuse lint
+      - name: Sensitive data scan
+        run: python tools/scan_sensitive.py .

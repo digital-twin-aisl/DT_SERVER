@@ -1,0 +1,44 @@
+name: 버그 보고
+description: 문서대로 했는데 동작이 다를 때
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **RTSP 주소, 카메라 계정, 내부 IP, 사람이 보이는 이미지는 반드시 지우고 올려 주세요.**
+        보안 문제는 공개 이슈 대신 SECURITY.md의 비공개 채널을 사용해 주세요.
+  - type: input
+    id: version
+    attributes:
+      label: DT_SERVER 버전 (태그 또는 커밋)
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: 구성요소
+      options: [edge_manager, edge_client, server_worker, frontend_api, calibration_worker, isaac_sim_client, dt_common, 문서, 기타]
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 환경
+      description: OS, Python, GPU/드라이버/CUDA, Jetson JetPack 버전 등
+  - type: textarea
+    id: steps
+    attributes:
+      label: 재현 방법과 실행한 명령
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 기대한 동작과 실제 동작
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 로그 (region status --json, run 로그 끝부분)
+      render: text
