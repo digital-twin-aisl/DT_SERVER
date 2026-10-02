@@ -1,0 +1,5 @@
+# run.sh fixes the working directory to the repository root.
+POSENET:
+  CKPT: apps/edge_client/models/POC_posenet.pth.tar
+  CONFIG: apps/edge_client/config/cam4_posenet.yaml
+  TENSORRT: false

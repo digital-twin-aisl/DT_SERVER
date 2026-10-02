@@ -5,7 +5,7 @@
     "camera": "OpenCV: +X right, +Y down, +Z forward",
     "extrinsic": "world_to_camera maps homogeneous world points to camera points"
   },
-  "marker_tree": "/home/dojan/DT_SERVER/apps/isaac_sim_client/aruco_boards/aruco_marker_tree.usd",
+  "marker_tree": "apps/isaac_sim_client/aruco_boards/aruco_marker_tree.usd",
   "input": {
     "mode": "offline_images",
     "edge_id": null,
@@ -59,7 +59,7 @@
     ],
     "image_resolution": 512,
     "resize_mode": "balanced",
-    "offline_image_source": "/home/dojan/DT_SERVER/apps/calibration_worker/temp_Capture"
+    "offline_image_source": "temp_Capture"
   },
   "alignment": {
     "scale": 17.010799746970214,
@@ -146,7 +146,7 @@
   "cameras": [
     {
       "camera_id": "camera/1",
-      "source_image": "/home/dojan/DT_SERVER/apps/calibration_worker/temp_Capture/camera_1_20260812-085652.jpg",
+      "source_image": "camera_1_20260812-085652.jpg",
       "camera_matrix": [
         [
           1084.319215,
@@ -248,7 +248,7 @@
     },
     {
       "camera_id": "camera/2",
-      "source_image": "/home/dojan/DT_SERVER/apps/calibration_worker/temp_Capture/camera_2_20260812-085646.jpg",
+      "source_image": "camera_2_20260812-085646.jpg",
       "camera_matrix": [
         [
           1062.382134,
@@ -350,7 +350,7 @@
     },
     {
       "camera_id": "camera/3",
-      "source_image": "/home/dojan/DT_SERVER/apps/calibration_worker/temp_Capture/camera_3_20260812-085652.jpg",
+      "source_image": "camera_3_20260812-085652.jpg",
       "camera_matrix": [
         [
           1056.852075,
@@ -452,7 +452,7 @@
     },
     {
       "camera_id": "camera/4",
-      "source_image": "/home/dojan/DT_SERVER/apps/calibration_worker/temp_Capture/camera_4_20260812-085646.jpg",
+      "source_image": "camera_4_20260812-085646.jpg",
       "camera_matrix": [
         [
           1085.155271,
@@ -554,7 +554,7 @@
     },
     {
       "camera_id": "camera/5",
-      "source_image": "/home/dojan/DT_SERVER/apps/calibration_worker/temp_Capture/camera_5_20260812-085652.jpg",
+      "source_image": "camera_5_20260812-085652.jpg",
       "camera_matrix": [
         [
           1095.257192,
@@ -656,7 +656,7 @@
     },
     {
       "camera_id": "camera/6",
-      "source_image": "/home/dojan/DT_SERVER/apps/calibration_worker/temp_Capture/camera_6_20260812-085646.png",
+      "source_image": "camera_6_20260812-085646.png",
       "camera_matrix": [
         [
           949.1181864083335,
@@ -758,7 +758,7 @@
     },
     {
       "camera_id": "camera/7",
-      "source_image": "/home/dojan/DT_SERVER/apps/calibration_worker/temp_Capture/camera_7_20260812-085652.jpg",
+      "source_image": "camera_7_20260812-085652.jpg",
       "camera_matrix": [
         [
           1075.983623,
@@ -860,7 +860,7 @@
     },
     {
       "camera_id": "camera/8",
-      "source_image": "/home/dojan/DT_SERVER/apps/calibration_worker/temp_Capture/camera_8_20260812-085646.jpg",
+      "source_image": "camera_8_20260812-085646.jpg",
       "camera_matrix": [
         [
           1070.814071,

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "regions": {
+    "center-b1-corridor": {
+      "name": "센터지하1층복도",
+      "deployment": "scene_0812_poc.json",
+      "server_profile": "poc/server.online.json",
+      "scene_topic": "meta-sejong/scene/v1"
+    }
+  }
+}

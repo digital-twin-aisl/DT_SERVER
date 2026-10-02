@@ -1,0 +1,6 @@
+# Server focus paths resolve against apps/server_worker (not the process cwd).
+# This is the exact same full exported checkpoint as the edges.
+POSENET:
+  CKPT: ../edge_client/models/POC_posenet.pth.tar
+  CONFIG: config/cam4_posenet.yaml
+  TENSORRT: false

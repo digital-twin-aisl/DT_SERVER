@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "arguments": {
+    "deployment": "deployment.json",
+    "cfg_focus": "server.focus.yaml",
+    "tensorrt": false,
+    "input_mode": "independent",
+    "input_clock": "dataset",
+    "max_input_age": 0.75,
+    "buffer_size": 4,
+    "receive_timeout": 0.1,
+    "lod_policy": "all",
+    "priority_hazard": [[90.76, 6.82]],
+    "root_fallback": true,
+    "no_zmq": true,
+    "scene_zenoh_topic": "meta-sejong/rootnet-v2/scene/v1",
+    "metrics_run_label": "rootnet-B-v2-dataset-calibration-override"
+  }
+}
