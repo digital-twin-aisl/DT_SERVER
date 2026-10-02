@@ -1,0 +1,17 @@
+name: 사용 질문
+description: 설치·구성·운영 방법 문의
+labels: [question]
+body:
+  - type: markdown
+    attributes:
+      value: 먼저 docs/guide/ 와 문제 해결 문서를 확인해 주세요.
+  - type: textarea
+    id: question
+    attributes:
+      label: 질문
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: 시도한 것과 환경

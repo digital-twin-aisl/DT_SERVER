@@ -1,0 +1,32 @@
+<!doctype html>
+<!-- SPDX-FileCopyrightText: 2025-2026 Electronics and Telecommunications Research Institute (ETRI) and Sejong University -->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
+<html lang="ko">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Meta Sejong · 구역 관리</title>
+<link rel="stylesheet" href="/static/control.css">
+</head>
+<body>
+<header><div><span class="eyebrow">META SEJONG</span><h1>캠퍼스 운영</h1></div><span id="connection" role="status">관리 서비스 연결 중</span></header>
+<main>
+<aside><div class="section-title"><h2>구역</h2><button id="register-region" class="subtle">등록</button></div><nav id="regions" aria-label="구역 선택"></nav><section><h2>발견된 장치</h2><div id="discovered"></div></section></aside>
+<div class="content">
+<div id="error" role="alert" hidden></div>
+<section class="panel">
+<div class="section-title"><div><span id="region-id" class="eyebrow"></span><h2 id="region-name">구역을 불러오는 중…</h2></div><span id="region-state" class="badge">—</span></div>
+<p id="region-detail" class="muted">실제 연결과 관측 상태를 확인합니다.</p>
+<div class="toolbar"><button id="start" disabled>구역 시작</button><button id="stop" class="secondary" disabled>중지</button><label><input type="checkbox" id="record"> 장면 기록</label><button id="view" class="secondary" disabled>3D 보기</button><button id="logs" class="subtle" disabled>서버 로그</button><button id="settings" class="subtle" disabled>구역 설정</button></div>
+<p class="hint">장면 기록에는 사람의 ID·위치·자세가 포함됩니다. 기록 여부는 시작할 때 적용됩니다.</p>
+<p id="runtime-error" class="error-text"></p>
+</section>
+<section><div class="section-title"><h2>엣지와 카메라</h2><span class="muted">장치 연결과 데이터 수신을 각각 표시합니다.</span></div><div id="edges" class="edge-grid"></div></section>
+<section class="panel"><div class="section-title"><h2>작업과 기록</h2><div class="toolbar"><a href="/viewer" target="_blank" rel="noopener">JSONL 파일 뷰어</a><button id="refresh-recordings" class="subtle">새로고침</button></div></div><p class="hint">뷰어 재생은 새 브라우저에서만 재생합니다. 구역 재생은 기존 관리 서비스의 공유 토픽 재생입니다.</p><div id="recordings" class="recordings">선택된 구역이 없습니다.</div></section>
+<section id="viewer-panel" class="panel" hidden><div class="section-title"><h2>실시간 / 재생 장면</h2><button id="close-view" class="subtle">닫기</button></div><iframe id="viewer" title="캠퍼스 3D 뷰어"></iframe></section>
+</div>
+</main>
+<dialog id="log-dialog"><div class="section-title"><h2>실행 로그</h2><button data-close class="subtle">닫기</button></div><pre id="log-text"></pre></dialog>
+<dialog id="calibration-dialog"><form id="calibration-form"><h2>카메라 보정</h2><p>구역을 중지한 상태에서 실행합니다. 아래 파일은 서버에 준비되어 있어야 합니다.</p><label>엣지<input name="edge_id" readonly></label><label>참조 영상 경로<input name="reference_video" required></label><label>기준 마커 USD 경로<input name="marker_tree" required></label><label>모델 체크포인트 경로<input name="checkpoint" required></label><div class="toolbar"><button type="submit">보정 시작</button><button type="button" data-close class="secondary">취소</button></div></form></dialog>
+<dialog id="region-dialog"><form id="region-form"><h2>구역 구성</h2><p>카메라 배치와 순서는 배포 설정에서 가져옵니다. 설정 경로는 관리 서버 기준입니다.</p><label>구역 ID<input name="region_id" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"></label><label>이름<input name="name" required></label><label>배포 설정 경로<input name="deployment" required></label><label>서버 실행 프로파일 경로<input name="server_profile" required></label><label>장면 토픽<input name="scene_topic" placeholder="자동 생성"></label><div class="toolbar"><button type="submit">저장</button><button type="button" id="remove-region" class="danger">구역 삭제</button><button type="button" data-close class="secondary">취소</button></div></form></dialog>
+<script type="module" src="/static/control.js"></script>
+</body></html>

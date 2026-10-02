@@ -1,0 +1,25 @@
+# GPU workers and manager use prepared host environments; see README.md.
+# This optional Linux stack supplies the router and browser frontend only.
+services:
+  router:
+    image: eclipse/zenoh:1.9.0
+    profiles: [router]
+    network_mode: host
+    command: ["-c", "/config/router.json5"]
+    volumes:
+      - ./apps/edge_manager/config/zenoh-router-poc.json5:/config/router.json5:ro
+    restart: unless-stopped
+  frontend_api:
+    build:
+      context: ./apps/frontend_api
+    network_mode: host
+    command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8005"]
+    environment:
+      DT_MANAGER_URL: ${DT_MANAGER_URL:-http://127.0.0.1:8001}
+      DT_MANAGER_TOKEN: ${DT_MANAGER_TOKEN:-}
+      SCENE_ZENOH_ENDPOINT: ${ZENOH_ENDPOINT:-tcp/127.0.0.1:7447}
+    volumes:
+      - ./apps/frontend_api/assets:/app/assets:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/healthz', timeout=2)"]
+    restart: unless-stopped

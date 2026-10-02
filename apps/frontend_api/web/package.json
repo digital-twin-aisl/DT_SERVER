@@ -1,0 +1,17 @@
+{
+  "name": "meta-sejong-browser-viewer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test playback.test.js recording_controls.test.js",
+    "test:browser": "node playback.smoke.mjs",
+    "build": "esbuild viewer.js --bundle --minify --format=esm --outfile=../app/static/dist/viewer.js"
+  },
+  "dependencies": {
+    "three": "0.184.0"
+  },
+  "devDependencies": {
+    "@gltf-transform/cli": "4.3.0",
+    "esbuild": "0.25.12"
+  }
+}

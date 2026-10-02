@@ -1,0 +1,3 @@
+usd-core==26.8
+numpy==2.4.6
+pillow==12.3.0

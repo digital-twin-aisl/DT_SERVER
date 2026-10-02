@@ -1,0 +1,34 @@
+# Core inference
+# Ultralytics YOLO (AGPL-3.0) is optional and only needed for ReID; see
+# requirements-reid-ultralytics.txt.
+numpy==1.24.4
+opencv-python>=4.6,<5
+Pillow
+PyYAML
+easydict
+scipy
+zstandard
+
+# ReID
+tabulate==0.9.0
+termcolor==3.1.0
+tqdm
+yacs==0.1.8
+
+# ONNX / TensorRT integration
+# PyTorch, torchvision, and TensorRT must match JetPack.
+# install_edge.sh validates them and installs torch2trt separately.
+onnx==1.17.0
+onnx-graphsurgeon==0.5.8
+onnxscript==0.7.1
+onnx-ir==0.2.1
+ml-dtypes==0.5.1
+onnxoptimizer
+onnxsim
+
+# Utilities
+gdown
+matplotlib
+
+# Protocols
+eclipse-zenoh==1.9.0

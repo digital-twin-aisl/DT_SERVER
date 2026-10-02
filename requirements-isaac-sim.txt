@@ -1,0 +1,10 @@
+# Install ONLY with <ISAAC_SIM_DIR>/python.sh. Do not install omni or pxr from
+# PyPI: they are supplied and version-locked by Isaac Sim.
+
+eclipse-zenoh==1.9.0
+websockets>=11,<16
+
+# The meta_sejong.aruco_board extension also needs cv2.aruco. Isaac Sim often
+# already provides OpenCV, so the compatible contrib wheel is deliberately not
+# installed unconditionally here. Check and install it only if needed, as shown
+# in SERVER_SETUP.md.

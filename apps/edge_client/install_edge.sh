@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2025-2026 Electronics and Telecommunications Research Institute (ETRI) and Sejong University
+# SPDX-License-Identifier: LGPL-2.1-or-later
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+VENV_PATH="${SCRIPT_DIR}/.venv"
+PYTORCH_INDEX="https://pypi.jetson-ai-lab.io/jp6/cu126"
+# Optional third-party components with licenses other than LGPL-2.1:
+#   DT_WITH_VGGT=1         VGGT-Omega (FAIR Noncommercial Research License),
+#                          used only for manager-driven calibration capture.
+#   DT_WITH_ULTRALYTICS=1  Ultralytics YOLO (AGPL-3.0), used only for ReID.
+# See docs/guide/09-license-compliance.md before enabling either.
+DT_WITH_VGGT="${DT_WITH_VGGT:-1}"
+DT_WITH_ULTRALYTICS="${DT_WITH_ULTRALYTICS:-0}"
+
+die() { echo "[ERROR] $*" >&2; exit 1; }
+log() { echo "[INFO] $*"; }
+
+log "Installing system dependencies"
+sudo apt-get update
+sudo apt-get install -y \
+    build-essential cmake git python3-dev python3-pip python3-venv \
+    libavcodec-dev libavformat-dev libglib2.0-0 libgl1 \
+    libjpeg-dev libopenblas-dev libswscale-dev zlib1g-dev
+
+if [[ ! -x "${VENV_PATH}/bin/python" ]]; then
+    log "Creating ${VENV_PATH}"
+    python3 -m venv --system-site-packages "$VENV_PATH"
+fi
+
+source "${VENV_PATH}/bin/activate"
+python -m pip install --upgrade pip "setuptools<82" wheel packaging
+
+FASTREID_PATH="${SCRIPT_DIR}/src/reid/fast-reid"
+if [[ ! -f "${FASTREID_PATH}/fastreid/__init__.py" ]]; then
+    if [[ ! -f "${REPOSITORY_ROOT}/.gitmodules" ]]; then
+        die "fast-reid is missing and this checkout has no submodule metadata"
+    fi
+    log "Initializing fast-reid submodule"
+    git -C "${REPOSITORY_ROOT}" submodule update --init --depth 1 -- \
+        apps/edge_client/src/reid/fast-reid
+fi
+
+VGGT_SOURCE="${REPOSITORY_ROOT}/apps/calibration_worker/vggt-omega"
+if [[ "$DT_WITH_VGGT" == 1 && ! -f "${VGGT_SOURCE}/pyproject.toml" ]]; then
+    log "Initializing vggt-omega submodule"
+    git -C "${REPOSITORY_ROOT}" submodule update --init --depth 1 -- \
+        apps/calibration_worker/vggt-omega
+fi
+
+shopt -s nullglob
+COMMON_WHEELS=("${SCRIPT_DIR}"/wheels/dt_common-*.whl)
+if (( ${#COMMON_WHEELS[@]} > 1 )); then
+    die "multiple dt-common wheels found under ${SCRIPT_DIR}/wheels"
+elif (( ${#COMMON_WHEELS[@]} == 1 )); then
+    log "Installing bundled dt-common wheel"
+    python -m pip install --no-deps "${COMMON_WHEELS[0]}"
+elif [[ -f "${REPOSITORY_ROOT}/packages/dt_common/pyproject.toml" ]]; then
+    log "Installing dt-common from the source checkout"
+    python -m pip install --no-deps "${REPOSITORY_ROOT}/packages/dt_common"
+else
+    die "dt-common is missing; bundle edge dependencies with tools/vendor_dependencies.sh"
+fi
+
+VGGT_WHEELS=("${SCRIPT_DIR}"/wheels/vggt_omega-*.whl)
+if [[ "$DT_WITH_VGGT" != 1 ]]; then
+    log "Skipping vggt-omega (DT_WITH_VGGT=0); calibration capture is disabled"
+elif (( ${#VGGT_WHEELS[@]} > 1 )); then
+    die "multiple vggt-omega wheels found under ${SCRIPT_DIR}/wheels"
+elif (( ${#VGGT_WHEELS[@]} == 1 )); then
+    log "Installing bundled vggt-omega wheel"
+    python -m pip install --no-deps "${VGGT_WHEELS[0]}"
+elif [[ -f "${REPOSITORY_ROOT}/apps/calibration_worker/vggt-omega/pyproject.toml" ]]; then
+    log "Installing vggt-omega from the source checkout"
+    python -m pip install --no-deps --no-build-isolation \
+        "${REPOSITORY_ROOT}/apps/calibration_worker/vggt-omega"
+else
+    die "vggt-omega is missing; bundle edge dependencies with tools/vendor_dependencies.sh"
+fi
+if [[ "$DT_WITH_VGGT" == 1 ]]; then
+    log "NOTICE: vggt-omega is under the FAIR Noncommercial Research License"
+fi
+
+log "Installing PyTorch from Jetson AI Lab"
+# Keep PyPI out of this resolution.  With --extra-index-url, pip may choose the
+# public aarch64 wheel for the same version (currently built for CUDA 13), which
+# cannot run on JetPack 6 / CUDA 12.6.
+python -m pip install --no-cache-dir --index-url "$PYTORCH_INDEX" \
+    torch==2.11.0 torchvision==0.26.0
+
+log "Installing the cuDSS runtime required by the Jetson PyTorch wheel"
+# Install only cuDSS: its declared dependencies would otherwise add a second
+# CUDA toolkit from PyPI instead of using the CUDA 12.6 libraries from JetPack.
+python -m pip install --no-cache-dir --no-deps nvidia-cudss-cu12==0.8.0.10
+SITE_PACKAGES="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+ln -sfn ../../nvidia/cu12/lib/libcudss.so.0 \
+    "${SITE_PACKAGES}/torch/lib/libcudss.so.0"
+
+log "Installing edge client dependencies"
+python -m pip install --no-cache-dir -r "${SCRIPT_DIR}/requirements.txt"
+if [[ "$DT_WITH_ULTRALYTICS" == 1 ]]; then
+    log "Installing optional Ultralytics YOLO for ReID (AGPL-3.0)"
+    python -m pip install --no-cache-dir \
+        -r "${SCRIPT_DIR}/requirements-reid-ultralytics.txt"
+else
+    log "Skipping Ultralytics (DT_WITH_ULTRALYTICS=0); run the edge with --no-reid"
+fi
+
+log "Installing torch2trt"
+python -m pip install --no-deps --no-build-isolation \
+    git+https://github.com/NVIDIA-AI-IOT/torch2trt.git
+
+log "Downloading model files"
+python "${SCRIPT_DIR}/src/utils/download_from_drive.py"
+
+log "Verifying installation"
+DT_WITH_VGGT="$DT_WITH_VGGT" DT_WITH_ULTRALYTICS="$DT_WITH_ULTRALYTICS" \
+PYTHONPATH="${FASTREID_PATH}${PYTHONPATH:+:${PYTHONPATH}}" python - <<'PY'
+import os
+import cv2
+import onnx
+import onnxoptimizer
+import tensorrt
+import torch
+import torchvision
+import zenoh
+import zstandard
+import fastreid
+from torch2trt import TRTModule, torch2trt
+
+if os.environ["DT_WITH_VGGT"] == "1":
+    import vggt_omega  # noqa: F401
+if os.environ["DT_WITH_ULTRALYTICS"] == "1":
+    import ultralytics  # noqa: F401
+
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA-enabled PyTorch is required")
+
+x = torch.ones((128, 128), device="cuda")
+torch.cuda.synchronize()
+print("torch:", torch.__version__)
+print("torchvision:", torchvision.__version__)
+print("TensorRT:", tensorrt.__version__)
+print("CUDA device:", torch.cuda.get_device_name(0))
+print("Installation complete")
+PY
+
+echo
+echo "Activate later with: source ${VENV_PATH}/bin/activate"

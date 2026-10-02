@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "arguments": {
+    "deployment": "deployment.json",
+    "cfg_focus": "edge.focus.yaml",
+    "edge_id": "edge_1",
+    "edge_id_file": "edge_1.identity.json",
+    "require_identity": true,
+    "dataset": true,
+    "example_folder": "../../edge_client/data/data_0812_1_edge_1",
+    "allow_dataset_calibration_override": true,
+    "topic_root": "dt/rootnet-v2/edges",
+    "tensorrt": false,
+    "no_reid": true
+  }
+}

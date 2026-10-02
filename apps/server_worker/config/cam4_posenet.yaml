@@ -1,0 +1,39 @@
+# Server 3D pose model (four views per edge). Runtime keys only; see
+# src/pose/core/config.py for the accepted options and their defaults.
+BATCH_SIZE: 1
+NUM_VIEWS: 4
+
+CUDNN:
+  BENCHMARK: false
+  DETERMINISTIC: false
+  ENABLED: true
+
+NETWORK:
+  IMAGE_SIZE_ORIG: [1920, 1080]
+  IMAGE_SIZE: [960, 512]
+  HEATMAP_SIZE: [240, 128]
+  NUM_JOINTS: 15
+  ROOTNET_ROOTHM: true
+  ROOTNET_TRAIN_SYNTH: true
+
+POSE_RESNET:
+  NUM_LAYERS: 50
+  DECONV_WITH_BIAS: false
+  NUM_DECONV_LAYERS: 3
+  NUM_DECONV_FILTERS: [256, 256, 256]
+  NUM_DECONV_KERNELS: [4, 4, 4]
+  FINAL_CONV_KERNEL: 1
+
+DATASET:
+  ROOTIDX: 2
+
+MULTI_PERSON:
+  SPACE_SIZE: [4000.0, 5000.0, 2000.0]
+  SPACE_CENTER: [0.0, 0.0, 900.0]
+  INITIAL_CUBE_SIZE: [80, 80, 20]
+  MAX_PEOPLE_NUM: 10
+  THRESHOLD: 0.2
+
+PICT_STRUCT:
+  GRID_SIZE: [2000.0, 2000.0, 2000.0]
+  CUBE_SIZE: [64, 64, 64]

@@ -1,0 +1,16 @@
+[package]
+version = "0.1.0"
+title = "ArUco Marker Tree Generator"
+description = "Build reusable USD trees containing multiple OpenCV ArUco marker boards."
+category = "Meta Sejong"
+authors = ["Meta Sejong"]
+keywords = ["aruco", "fiducial", "usd", "isaac sim"]
+readme = "docs/README.md"
+
+[dependencies]
+"omni.kit.uiapp" = {}
+"omni.kit.viewport.utility" = {}
+"omni.usd" = {}
+
+[[python.module]]
+name = "meta_sejong.aruco_board"

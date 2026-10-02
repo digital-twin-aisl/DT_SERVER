@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "arguments": {
+    "deployment": "../scene_0812_poc.json",
+    "priority_interval": 0.5,
+    "lambda_aoi": 0.0,
+    "lod2_count": 1,
+    "root_fallback": true,
+    "max_input_age": 0.75,
+    "no_zmq": true,
+    "input_mode": "independent",
+    "input_clock": "live",
+    "zenoh_endpoint": "tcp/127.0.0.1:7447",
+    "sync_tolerance": 0.03,
+    "receive_timeout": 0.1,
+    "future_tolerance": 0.1,
+    "buffer_size": 4,
+    "lod_policy": "rank",
+    "no_metrics": true
+  }
+}

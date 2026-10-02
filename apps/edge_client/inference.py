@@ -1,0 +1,857 @@
+# SPDX-FileCopyrightText: 2025-2026 Electronics and Telecommunications Research Institute (ETRI) and Sejong University
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# ruff: noqa: E402
+
+import argparse
+import json
+import hashlib
+import math
+import multiprocessing as mp
+from multiprocessing import shared_memory
+from pathlib import Path
+import sys
+import time
+import traceback
+from uuid import uuid4
+
+import cv2
+import numpy as np
+import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+EDGE_CLIENT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from dt_common.infrastructure.zenoh import LatestPublisher
+from dt_common.contracts.edge import (
+    DEFAULT_TOPIC_ROOT,
+    EdgeTopics,
+)
+from apps.edge_client.infrastructure.identity import (
+    DEFAULT_IDENTITY_PATH,
+    load_edge_metadata,
+    load_or_create_edge_id,
+)
+from apps.edge_client.src.reid.yolopose import extract_poses_from_frames
+from apps.edge_client.src.root.core.config import config as pose_config
+from apps.edge_client.src.root.core.config import update_config as update_pose_config
+from apps.edge_client.src.root.models.multi_person_posenet import (
+    get_multi_person_pose_net,
+)
+from apps.edge_client.src.utils.calibration import CalibrationData
+from apps.edge_client.src.utils.input import (
+    ExampleDataset,
+    FrameUnavailableError,
+    IPCamera,
+    find_dataset_calibration,
+    load_camera_sources,
+    select_dataset_camera_ids,
+    select_live_cameras,
+    snapshot_shared_frames,
+    snapshot_live_bundle,
+)
+from apps.edge_client.src.utils.pre_process import PREPROCESS
+from apps.edge_client.src.utils.tensorrt import load_tensorrt_model
+from apps.edge_client.config.config import config as focus_config
+from apps.edge_client.config.config import update_config as update_focus_config
+from dt_common.spatial.workspace import build_edge_workspace, load_spatial_context
+from dt_common.inference_codec import encode_frame
+from dt_common.runtime_config import parse_runtime_args, configure_profile_paths
+from apps.edge_client.config.runtime import PROFILE_PATH_OPTIONS
+from dt_common.calibration.identity import calibration_digest
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Edge inference with Zenoh")
+    parser.add_argument("--runtime-config", help="Portable JSON launch profile; CLI overrides it")
+    parser.add_argument("--validate-only", action="store_true", help="Validate configuration without opening cameras or loading GPU models")
+    parser.add_argument("--record-output", help="Record ZNH2 packets under PATH/edge_id for offline replay")
+    parser.add_argument("--require-identity", action=argparse.BooleanOptionalAction, default=False,
+                        help="Require an initialized edge identity and explicit router settings")
+    parser.add_argument("--cfg-focus", "--cfg_focus", dest="cfg_focus")
+    parser.add_argument(
+        "--deployment",
+        help="Shared scene, calibration, edge assignment, and workspace manifest",
+    )
+    parser.add_argument("--example-folder", "--example_folder", dest="example_folder")
+    parser.add_argument(
+        "--tensorrt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--rebuild-tensorrt",
+        action="store_true",
+        help="Force regeneration of the configuration-specific pose engines",
+    )
+    parser.add_argument("--dataset", action="store_true")
+    parser.add_argument(
+        "--allow-dataset-calibration-override",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Explicitly use deployment calibration despite different dataset calibration (experimental)",
+    )
+    parser.add_argument(
+        "--camera-config",
+        help="Edge-private YAML containing live RTSP camera sources",
+    )
+    parser.add_argument(
+        "--rtsp-transport",
+        choices=("tcp", "udp"),
+        default="tcp",
+    )
+    parser.add_argument("--rtsp-open-timeout-ms", type=int, default=8000)
+    parser.add_argument("--rtsp-read-timeout-ms", type=int, default=3000)
+    parser.add_argument("--rtsp-reconnect-delay", type=float, default=0.5)
+    parser.add_argument("--rtsp-max-frame-age", type=float, default=0.75)
+    parser.add_argument("--rtsp-max-skew", type=float, default=0.03)
+    parser.add_argument("--rtsp-buffer-frames", type=int, default=4)
+    parser.add_argument("--zenoh-endpoint", type=str)
+    parser.add_argument("--zenoh-config", type=str)
+    parser.add_argument("--zenoh-topic", type=str, help=argparse.SUPPRESS)
+    parser.add_argument("--edge-id", type=str)
+    parser.add_argument("--edge-id-file", default=str(DEFAULT_IDENTITY_PATH))
+    parser.add_argument("--topic-root")
+    parser.add_argument(
+        "--no-zenoh",
+        action="store_true",
+        help="Run inference without publishing results to Zenoh",
+    )
+    parser.add_argument(
+        "--no-reid",
+        action="store_true",
+        help="Skip YOLO/ReID extraction and run only multi-view 3D inference",
+    )
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        help="Stop after this many frames for a bounded dataset run",
+    )
+    configure_profile_paths(parser, PROFILE_PATH_OPTIONS)
+    args = parse_runtime_args(parser, argv)
+    if not 1 <= args.rtsp_buffer_frames <= 32:
+        parser.error("--rtsp-buffer-frames must be between 1 and 32")
+    if args.dataset and not args.example_folder:
+        parser.error("--dataset requires --example-folder")
+    if args.allow_dataset_calibration_override and not args.dataset:
+        parser.error("--allow-dataset-calibration-override requires --dataset")
+    if args.max_frames is not None and args.max_frames < 1:
+        parser.error("--max-frames must be at least 1")
+    if min(args.rtsp_open_timeout_ms, args.rtsp_read_timeout_ms) < 1:
+        parser.error("RTSP timeouts must be positive")
+    if not all(math.isfinite(value) and value > 0 for value in (
+        args.rtsp_reconnect_delay,
+        args.rtsp_max_frame_age,
+        args.rtsp_max_skew,
+    )):
+        parser.error("RTSP reconnect/freshness values must be finite and positive")
+    return args
+
+
+def resolve_edge_path(value, *, must_exist=True):
+    """Resolve app-relative defaults while preserving explicit cwd-relative paths."""
+    path = Path(value).expanduser()
+    candidates = (
+        [path]
+        if path.is_absolute()
+        else [Path.cwd() / path, EDGE_CLIENT_ROOT / path]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    resolved = candidates[-1].resolve()
+    if must_exist:
+        raise FileNotFoundError(f"required path does not exist: {resolved}")
+    return resolved
+
+
+def resolve_identity_setting(value, identity_path, *, must_exist=True):
+    """Resolve a path persisted relative to the edge identity file."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path(identity_path).resolve().parent / path
+    path = path.resolve()
+    if must_exist and not path.exists():
+        raise FileNotFoundError(f"required path does not exist: {path}")
+    return path
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_dataset_spatial_context(
+    dataset_path, spatial_context, *, allow_calibration_override=False,
+):
+    """Require matching geometry unless a calibration experiment opts in."""
+    calibration_path = find_dataset_calibration(dataset_path)
+    if calibration_path is None:
+        return
+    if spatial_context is None:
+        raise ValueError(
+            "a dataset with calibration_result*.json requires --deployment; "
+            "the deployment builds its Ground/AOI workspace instead of using "
+            "the legacy 80x80x20 cube"
+        )
+    calibration_sha256 = file_sha256(calibration_path)
+    if calibration_sha256 != spatial_context.calibration_sha256:
+        if allow_calibration_override:
+            print(
+                "WARNING: explicit dataset calibration override; "
+                f"dataset={calibration_path} dataset_sha256={calibration_sha256}; "
+                f"applied={spatial_context.calibration_path} "
+                f"applied_sha256={spatial_context.calibration_sha256}. "
+                "Geometry accuracy is not validated by this experiment.",
+                flush=True,
+            )
+            return
+        raise ValueError(
+            "dataset calibration does not match the deployment calibration: "
+            f"{calibration_path}"
+        )
+
+
+def resolve_live_cameras(args, edge_metadata, spatial_context, edge_id):
+    """Resolve one ordered RTSP source for every edge camera ID."""
+    identity_camera_ids = edge_metadata.get("camera_ids")
+    deployment_camera_ids = (
+        None
+        if spatial_context is None
+        else list(spatial_context.edge_camera_ids[edge_id])
+    )
+    if identity_camera_ids is not None:
+        identity_camera_ids = [int(value) for value in identity_camera_ids]
+        if (
+            deployment_camera_ids is not None
+            and identity_camera_ids != deployment_camera_ids
+        ):
+            raise ValueError(
+                f"identity camera_ids {identity_camera_ids} do not match "
+                f"deployment camera_ids {deployment_camera_ids} for {edge_id}"
+            )
+    required_camera_ids = deployment_camera_ids or identity_camera_ids
+
+    camera_config_value = args.camera_config or edge_metadata.get("camera_config")
+    if camera_config_value:
+        camera_config_path = Path(camera_config_value).expanduser()
+        if not camera_config_path.is_absolute():
+            if args.camera_config:
+                camera_config_path = resolve_edge_path(camera_config_path)
+            else:
+                camera_config_path = (
+                    Path(args.edge_id_file).parent / camera_config_path
+                ).resolve()
+        if not camera_config_path.is_file():
+            raise FileNotFoundError(
+                f"camera config not found: {camera_config_path}"
+            )
+        cameras = load_camera_sources(camera_config_path)
+    else:
+        cameras = focus_config.CAMERAS
+    selected = select_live_cameras(
+        cameras,
+        required_camera_ids,
+        pose_config.NUM_VIEWS,
+    )
+    print(
+        "Selected live RTSP cameras: "
+        + ", ".join(str(camera["id"]) for camera in selected)
+    )
+    return selected
+
+
+def load_models(use_tensorrt, use_reid, rebuild_tensorrt=False):
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.enabled = pose_config.CUDNN.ENABLED
+    torch.backends.cudnn.benchmark = pose_config.CUDNN.BENCHMARK
+    torch.backends.cudnn.deterministic = pose_config.CUDNN.DETERMINISTIC
+
+    device = torch.device("cuda")
+    torch.tensor([1], device=device)  # CUDA 메모리 할당 확인
+
+    # ProjectLayer copies cfg.TRANSFORM while the pose model is constructed.
+    # Build preprocessing first so that the affine transform is available.
+    pose_preprocess = PREPROCESS(pose_config)
+    checkpoint = resolve_edge_path(focus_config.POSENET.CKPT)
+    pose_model = get_multi_person_pose_net(pose_config)
+    checkpoint_state = torch.load(
+        checkpoint,
+        map_location=device,
+        weights_only=False,
+    )
+    checkpoint_state = {
+        name: value
+        for name, value in checkpoint_state.items()
+        if not name.startswith("pose_net.")
+    }
+    pose_model.load_state_dict(checkpoint_state)
+    del checkpoint_state
+    pose_model = pose_model.eval().to(device)
+    if use_tensorrt:
+        pose_model = load_tensorrt_model(
+            pose_model,
+            checkpoint,
+            pose_config,
+            mode="fp16",
+            force_rebuild=rebuild_tensorrt,
+        )
+
+    reid_engine = None
+    yolo_model = None
+    if use_reid:
+        require_ultralytics()
+        from apps.edge_client.src.reid.feature_extract import (
+            build_feature_extractor,
+            build_trt_feature_extractor,
+        )
+
+        if use_tensorrt:
+            reid_engine = (
+                "tensorrt",
+                build_trt_feature_extractor(
+                    force_rebuild=rebuild_tensorrt,
+                ),
+            )
+        else:
+            reid_engine = ("pytorch", build_feature_extractor())
+        yolo_checkpoint = resolve_edge_path(focus_config.YOLO.MODEL)
+        if use_tensorrt:
+            from apps.edge_client.src.reid.yolo_tensorrt import build_trt_yolo
+
+            yolo_model = build_trt_yolo(
+                yolo_checkpoint,
+                batch_size=pose_config.NUM_VIEWS,
+                image_size=int(focus_config.YOLO.IMAGE_SIZE),
+                force_rebuild=rebuild_tensorrt,
+            )
+        else:
+            from ultralytics import YOLO
+
+            yolo_model = YOLO(str(yolo_checkpoint))
+
+    return pose_preprocess, pose_model, reid_engine, yolo_model
+
+
+def serialize_output(
+    timestamp,
+    reid,
+    roots,
+    heatmaps,
+    camera_ids,
+    spatial_identity=None,
+    *,
+    edge_id=None,
+    session_id="manual",
+    sequence=0,
+    timestamp_kind="dataset_relative",
+    frame_timestamps=None,
+    frame_ids=None,
+    effective_calibration=None,
+    inference_started_at=None,
+    inference_finished_at=None,
+):
+    output = {
+        "time": timestamp,
+        "reid": reid,
+        "roots": roots,
+        "allheatmaps": heatmaps,
+        "camera_ids": list(camera_ids),
+        "edge_id": edge_id or (spatial_identity or {}).get("edge_id"),
+        "session_id": session_id,
+        "sequence": sequence,
+        "timestamp_kind": timestamp_kind,
+        "frame_timestamps": frame_timestamps or [timestamp] * len(camera_ids),
+        "frame_ids": frame_ids or [sequence] * len(camera_ids),
+        "calibration_digest": effective_calibration,
+        "inference_started_at": inference_started_at,
+        "inference_finished_at": inference_finished_at,
+    }
+    if spatial_identity is not None:
+        output["spatial_context"] = dict(spatial_identity)
+    return encode_frame(output)
+
+
+def print_startup_metadata(*, edge_id, edge_metadata, args, spatial_context,
+                           live_cameras, use_tensorrt, zenoh_endpoint, inference_topic):
+    metadata = {
+        "edge_id": edge_id, "display_name": edge_metadata.get("display_name"),
+        "approved": bool(edge_metadata.get("approved")),
+        "camera_ids": (list(spatial_context.edge_camera_ids[edge_id]) if spatial_context else
+                       [int(camera["id"]) for camera in live_cameras or []]),
+        "tensorrt": use_tensorrt, "dataset": args.dataset,
+        "example_folder": args.example_folder if args.dataset else None,
+        "allow_dataset_calibration_override": args.allow_dataset_calibration_override,
+        "deployment": args.deployment,
+        "timestamp_kind": "dataset_relative" if args.dataset else "receive_unix",
+        "server_router": {"endpoint": zenoh_endpoint, "topic": inference_topic,
+                          "status": "disabled" if args.no_zenoh else "connecting"},
+    }
+    print("Edge startup configuration:\n" + json.dumps(metadata, indent=2), flush=True)
+
+
+def attach_input_buffers(parent, process):
+    buffers = [None] * len(process.paths)
+
+    for _ in buffers:
+        if not parent.poll(15):
+            if not process.is_alive():
+                raise RuntimeError(
+                    "input process exited during camera initialization"
+                )
+            raise TimeoutError("카메라 공유 메모리 초기화 시간 초과")
+
+        message = parent.recv()
+        if message[0] != "OK":
+            _, index, *details = message
+            camera_id = details[0] if details else index
+            reason = details[1] if len(details) > 1 else "unknown error"
+            raise RuntimeError(
+                f"camera {camera_id} initialization failed: {reason}"
+            )
+
+        _, index, name, shape, dtype = message
+        buffers[index] = (
+            shared_memory.SharedMemory(name=name),
+            shape,
+            np.dtype(dtype),
+        )
+
+    if not process.is_alive():
+        raise RuntimeError("입력 프로세스가 초기화 중 종료되었습니다")
+    return buffers
+
+
+def stop_process(process, timeout=3):
+    if process is None or process.pid is None:
+        return
+    process.join(timeout=timeout)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=timeout)
+
+
+def create_input_process(
+    args,
+    stop_event,
+    child,
+    input_flag,
+    edge_id,
+    spatial_context,
+    live_cameras=None,
+):
+    if args.dataset:
+        print("Starting synchronized dataset input")
+        camera_ids = (
+            list(spatial_context.edge_camera_ids[edge_id])
+            if spatial_context is not None
+            else select_dataset_camera_ids(
+                args.example_folder,
+                edge_id,
+                pose_config.NUM_VIEWS,
+            )
+        )
+        process = ExampleDataset(
+            args.example_folder,
+            stop_event,
+            child,
+            input_flag,
+            camera_ids=camera_ids,
+        )
+        if spatial_context is None:
+            CalibrationData(
+                pose_config,
+                example_path=args.example_folder,
+                camera_ids=camera_ids,
+            )
+        else:
+            expected_ids = list(spatial_context.edge_camera_ids[edge_id])
+            if process.camera_ids != expected_ids:
+                raise ValueError(
+                    f"dataset camera order mismatch for {edge_id}: "
+                    f"expected {expected_ids}, got {process.camera_ids}"
+                )
+            CalibrationData(
+                pose_config,
+                calibration_path=spatial_context.calibration_path,
+                camera_ids=expected_ids,
+                world_origin_m=spatial_context.world_origin_m,
+            )
+        return process
+
+    print("Starting live RTSP camera input")
+    if not live_cameras:
+        raise ValueError("live RTSP input requires configured camera sources")
+    camera_ids = (
+        spatial_context.edge_camera_ids[edge_id]
+        if spatial_context is not None
+        else [camera["id"] for camera in live_cameras]
+    )
+    CalibrationData(
+        pose_config,
+        cameras=live_cameras if spatial_context is None else None,
+        calibration_path=spatial_context.calibration_path if spatial_context else None,
+        camera_ids=camera_ids,
+        world_origin_m=(
+            spatial_context.world_origin_m
+            if spatial_context is not None
+            else (0.0, 0.0, 0.0)
+        ),
+    )
+    return IPCamera(
+        live_cameras,
+        stop_event,
+        child,
+        input_flag,
+        transport=args.rtsp_transport,
+        open_timeout_ms=args.rtsp_open_timeout_ms,
+        read_timeout_ms=args.rtsp_read_timeout_ms,
+        reconnect_delay=args.rtsp_reconnect_delay,
+        expected_size=pose_config.NETWORK.IMAGE_SIZE_ORIG,
+        buffer_depth=args.rtsp_buffer_frames,
+    )
+
+
+def require_ultralytics():
+    """ReID person detection uses Ultralytics YOLO, an optional AGPL-3.0 add-on."""
+    import importlib.util
+
+    if importlib.util.find_spec("ultralytics") is None:
+        raise RuntimeError(
+            "Edge ReID needs the optional 'ultralytics' package (AGPL-3.0), "
+            "which is not installed. Run with --no-reid, or install it with "
+            "apps/edge_client/requirements-reid-ultralytics.txt after reviewing "
+            "its license (see docs/guide/09-license-compliance.md)."
+        )
+
+
+def extract_reid(
+    reid_engine,
+    yolo_model,
+    images,
+    frame_num,
+    edge_id,
+    camera_ids,
+):
+    if reid_engine is None or yolo_model is None:
+        return []
+    from apps.edge_client.src.reid.feature_extract import (
+        extract_features_from_persons,
+        extract_features_from_persons_trt,
+    )
+
+    try:
+        persons_by_camera = extract_poses_from_frames(
+            yolo_model,
+            images,
+            edge_id=edge_id,
+            camera_ids=camera_ids,
+            frame_num=frame_num,
+        )
+        persons = [
+            person
+            for camera_persons in persons_by_camera
+            for person in camera_persons
+        ]
+        if not persons:
+            return []
+        backend, extractor = reid_engine
+        if backend == "tensorrt":
+            return extract_features_from_persons_trt(*extractor, persons)
+        return extract_features_from_persons(*extractor, persons)
+    except Exception:
+        print(f"ReID error: frame={frame_num}")
+        traceback.print_exc()
+        return []
+
+
+def main():
+    args = parse_args()
+    args.edge_id_file = str(
+        resolve_edge_path(args.edge_id_file, must_exist=False)
+    )
+    if args.require_identity:
+        identity = load_edge_metadata(args.edge_id_file) if Path(args.edge_id_file).is_file() else {}
+        if not identity or (args.edge_id and identity.get("edge_id") != args.edge_id):
+            raise ValueError("Initialize this edge profile with agent.py init before starting inference")
+        if not any((args.zenoh_endpoint, args.zenoh_config, identity.get("zenoh_endpoint"), identity.get("zenoh_config"))):
+            raise ValueError("Configure the server router endpoint with agent.py init --endpoint")
+    edge_id = load_or_create_edge_id(args.edge_id_file, args.edge_id)
+    edge_metadata = load_edge_metadata(args.edge_id_file)
+    inference_defaults = edge_metadata.get("inference") or {}
+    if not isinstance(inference_defaults, dict):
+        raise ValueError("edge identity inference settings must be an object")
+
+    cfg_focus = args.cfg_focus or inference_defaults.get("cfg_focus")
+    if cfg_focus:
+        update_focus_config(resolve_edge_path(cfg_focus) if args.cfg_focus else
+                            resolve_identity_setting(cfg_focus, args.edge_id_file))
+    update_pose_config(resolve_edge_path(focus_config.POSENET.CONFIG))
+    use_tensorrt = (
+        bool(inference_defaults.get("tensorrt", focus_config.POSENET.TENSORRT))
+        if args.tensorrt is None
+        else args.tensorrt
+    )
+    if args.dataset:
+        args.example_folder = str(resolve_edge_path(args.example_folder))
+    deployment = args.deployment or inference_defaults.get("deployment")
+    args.deployment = (
+        str(resolve_edge_path(deployment) if args.deployment else
+            resolve_identity_setting(deployment, args.edge_id_file))
+        if deployment
+        else None
+    )
+    zenoh_config = args.zenoh_config or edge_metadata.get("zenoh_config")
+    args.zenoh_config = (
+        str(resolve_edge_path(zenoh_config) if args.zenoh_config else
+            resolve_identity_setting(zenoh_config, args.edge_id_file))
+        if zenoh_config
+        else None
+    )
+    spatial_context = (
+        load_spatial_context(args.deployment) if args.deployment else None
+    )
+    if spatial_context is not None and edge_id not in spatial_context.edge_camera_ids:
+        raise ValueError(f"edge {edge_id!r} is not enabled in the deployment")
+    if args.dataset:
+        validate_dataset_spatial_context(
+            args.example_folder, spatial_context,
+            allow_calibration_override=args.allow_dataset_calibration_override,
+        )
+    pose_config.SPATIAL_CONTEXT = spatial_context
+    live_cameras = (
+        None
+        if args.dataset
+        else resolve_live_cameras(
+            args,
+            edge_metadata,
+            spatial_context,
+            edge_id,
+        )
+    )
+    topic_root = args.topic_root or edge_metadata.get("topic_root") or DEFAULT_TOPIC_ROOT
+    zenoh_endpoint = (
+        args.zenoh_endpoint
+        or edge_metadata.get("zenoh_endpoint")
+        or focus_config.SERVER
+    )
+    inference_topic = args.zenoh_topic or EdgeTopics(
+        edge_id,
+        topic_root,
+    ).inference
+    print_startup_metadata(edge_id=edge_id, edge_metadata=edge_metadata, args=args,
+                           spatial_context=spatial_context, live_cameras=live_cameras,
+                           use_tensorrt=use_tensorrt, zenoh_endpoint=zenoh_endpoint,
+                           inference_topic=inference_topic)
+
+    stop_event = mp.Event()
+    input_flag = mp.Value("b", not args.dataset)
+    parent, child = mp.Pipe(duplex=False)
+    input_process = None
+    sender = None
+    buffers = []
+
+    try:
+        input_process = create_input_process(
+            args,
+            stop_event,
+            child,
+            input_flag,
+            edge_id,
+            spatial_context,
+            live_cameras,
+        )
+        if spatial_context is not None:
+            expected_ids = list(spatial_context.edge_camera_ids[edge_id])
+            if input_process.camera_ids != expected_ids:
+                raise ValueError(
+                    f"input camera order mismatch for {edge_id}: "
+                    f"expected {expected_ids}, got {input_process.camera_ids}"
+                )
+            workspace = build_edge_workspace(
+                spatial_context,
+                edge_id,
+                pose_config.CAMS,
+                pose_config.NETWORK.IMAGE_SIZE_ORIG,
+                pose_config.MULTI_PERSON.SPACE_SIZE,
+                pose_config.MULTI_PERSON.INITIAL_CUBE_SIZE,
+            )
+            pose_config.EDGE_WORKSPACE = workspace
+            spatial_identity = {
+                **spatial_context.identity(),
+                "edge_id": edge_id,
+                "workspace_id": workspace.workspace_id,
+            }
+            print(
+                f"Workspace ready: source={workspace.source} "
+                f"size_m={(workspace.size_mm / 1000.0).round(3).tolist()} "
+                f"cube={workspace.cube_size.tolist()} "
+                f"valid={int(workspace.valid_mask.sum())}/"
+                f"{workspace.valid_mask.size}"
+            )
+        else:
+            pose_config.EDGE_WORKSPACE = None
+            spatial_identity = None
+        effective_calibration = calibration_digest(pose_config.CAMS)
+        if args.validate_only:
+            resolve_edge_path(focus_config.POSENET.CKPT)
+            print("Configuration validation passed (camera/network/GPU readiness not probed)")
+            return
+        record_dir = None
+        if args.record_output:
+            record_dir = Path(args.record_output).expanduser().resolve() / edge_id
+            record_dir.mkdir(parents=True, exist_ok=True)
+            if any(record_dir.glob("*.dtframe")):
+                raise ValueError(f"recording directory is not empty: {record_dir}")
+        input_process.start()
+        child.close()
+
+        buffers = attach_input_buffers(parent, input_process)
+        camera_ids = input_process.camera_ids
+
+        if not args.no_zenoh:
+            sender = LatestPublisher(
+                topic=inference_topic,
+                endpoint=zenoh_endpoint,
+                config_path=args.zenoh_config,
+                queue_size=2,
+            )
+        pose_preprocess, pose_model, reid_engine, yolo_model = load_models(
+            use_tensorrt,
+            not args.no_reid,
+            args.rebuild_tensorrt,
+        )
+        # TensorRT synchronizes around enqueueV3 when invoked on CUDA's
+        # default stream.  Keep the whole inference chain on one dedicated
+        # stream so dependencies remain ordered without those global syncs.
+        inference_stream = torch.cuda.Stream()
+        inference_stream.wait_stream(torch.cuda.current_stream())
+        torch.cuda.set_stream(inference_stream)
+        reid_stream = torch.cuda.Stream()
+        reid_stream.wait_stream(inference_stream)
+        if args.no_reid:
+            print("ReID output disabled")
+
+        if args.no_zenoh:
+            print("Zenoh output disabled")
+        frame_num = 0
+        session_id = uuid4().hex
+        previous_sequences = None
+        last_input_warning = 0.0
+        with torch.inference_mode():
+            while not stop_event.is_set():
+                if not input_process.is_alive():
+                    raise RuntimeError("camera input process exited")
+                started_at = time.time()
+                frame_timestamp = (
+                    frame_num / input_process.fps if args.dataset else started_at
+                )
+                try:
+                    if args.dataset:
+                        image_batches = snapshot_shared_frames(buffers, input_process.frame_locks)
+                        frame_timestamps = [frame_timestamp] * len(camera_ids)
+                        frame_ids = [frame_num] * len(camera_ids)
+                    else:
+                        bundle = snapshot_live_bundle(buffers, input_process,
+                            max_age=args.rtsp_max_frame_age, max_skew=args.rtsp_max_skew,
+                            previous_sequences=previous_sequences)
+                        image_batches = bundle.frames
+                        frame_timestamps, frame_ids = bundle.timestamps, bundle.sequences
+                        frame_timestamp = min(frame_timestamps)
+                        previous_sequences = frame_ids
+                except FrameUnavailableError as exc:
+                    now = time.monotonic()
+                    if now - last_input_warning >= 2.0:
+                        print(f"Live input waiting: {exc}")
+                        last_input_warning = now
+                    time.sleep(0.01)
+                    continue
+                if args.dataset:
+                    # The snapshot above owns copies, so decode the next
+                    # synchronized frame while this one is on the GPU.
+                    input_flag.value = True
+
+                views = pose_preprocess(image_batches)
+                _, all_heatmaps, roots = pose_model(views=views)
+                with torch.cuda.stream(reid_stream):
+                    frame_outputs = extract_reid(
+                        reid_engine,
+                        yolo_model,
+                        image_batches,
+                        frame_num,
+                        edge_id,
+                        camera_ids,
+                    )
+
+                heatmap_batch = (
+                    torch.cat(all_heatmaps, dim=0)
+                    .clamp(0, 1)
+                    .mul(255)
+                    .round()
+                    .to(torch.uint8)
+                    .cpu()
+                    .numpy()
+                )
+                all_heatmaps = [
+                    heatmap_batch[index : index + 1]
+                    for index in range(len(camera_ids))
+                ]
+                roots = roots.detach().cpu().numpy()
+
+                payload = serialize_output(
+                    frame_timestamp,
+                    frame_outputs,
+                    roots,
+                    all_heatmaps,
+                    camera_ids,
+                    spatial_identity,
+                    edge_id=edge_id, session_id=session_id, sequence=frame_num,
+                    timestamp_kind="dataset_relative" if args.dataset else "receive_unix",
+                    frame_timestamps=frame_timestamps, frame_ids=frame_ids,
+                    effective_calibration=effective_calibration,
+                    inference_started_at=started_at, inference_finished_at=time.time(),
+                )
+                if record_dir is not None:
+                    with (record_dir / f"{frame_num:09d}.dtframe").open("xb") as stream:
+                        stream.write(payload)
+                if sender is not None:
+                    sender.send(payload)
+
+                elapsed = time.time() - started_at
+                print(
+                    f"frame={frame_num} infer={elapsed:.3f}s "
+                    f"payload={len(payload) / 1024**2:.2f}MB "
+                    f"dropped={sender.dropped if sender is not None else 0}"
+                )
+                frame_num += 1
+                if args.max_frames is not None and frame_num >= args.max_frames:
+                    break
+                if args.dataset:
+                    while input_flag.value and input_process.is_alive():
+                        time.sleep(0.001)
+                    if not input_process.is_alive():
+                        break
+
+    except KeyboardInterrupt:
+        print("Stopping inference...")
+    finally:
+        stop_event.set()
+
+        if sender is not None:
+            sender.close()
+        for shm, _, _ in buffers:
+            shm.close()
+
+        parent.close()
+        child.close()
+        stop_process(input_process)
+        cv2.destroyAllWindows()
+        print("All processes terminated")
+
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+    main()

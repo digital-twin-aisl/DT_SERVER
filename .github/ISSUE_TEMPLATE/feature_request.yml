@@ -1,0 +1,20 @@
+name: 기능 제안
+description: 새 기능이나 개선 아이디어
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 해결하려는 문제
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 제안하는 방법
+  - type: checkboxes
+    id: contract
+    attributes:
+      label: 호환성
+      options:
+        - label: Zenoh 키, ZNH2, SceneOutput, 배포 manifest 형식 변경이 필요합니다

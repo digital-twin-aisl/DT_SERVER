@@ -1,0 +1,655 @@
+#usda 1.0
+(
+    defaultPrim = "CalibrationVisualization"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "CalibrationVisualization" (
+    customData = {
+        dictionary calibration = {
+            double frustumDepthM = 0.5
+            string sourceResult = "apps/calibration_worker/calibration_result_20260814-123941.json"
+        }
+    }
+)
+{
+    def Xform "MarkerTree" (
+        prepend references = @../isaac_sim_client/aruco_boards/aruco_marker_tree.usd@
+    )
+    {
+    }
+
+    def Xform "Cameras"
+    {
+        def Xform "camera_1" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/1"
+                    int[] imageSize = [2009, 1124]
+                    double[] positionM = [95.1463620791792, 11.902003414315796, 17.93938459641992]
+                }
+            }
+        )
+        {
+            def BasisCurves "WireframeFrustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(95.14636, 11.902003, 17.939384), (94.79819, 11.262296, 17.905018), (95.14636, 11.902003, 17.939384), (94.45409, 12.121889, 17.875147), (95.14636, 11.902003, 17.939384), (94.71715, 12.212002, 17.438074), (95.14636, 11.902003, 17.939384), (95.06124, 11.352408, 17.467945), (94.79819, 11.262296, 17.905018), (94.45409, 12.121889, 17.875147), (94.71715, 12.212002, 17.438074), (95.06124, 11.352408, 17.467945), (94.79819, 11.262296, 17.905018), (95.14636, 11.902003, 17.939384), (94.699425, 11.712388, 17.631298)]
+                color3f[] primvars:displayColor = [(0.16, 0.62, 1)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Mesh "SolidFrustum"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(95.14636, 11.902003, 17.939384), (94.79819, 11.262296, 17.905018), (94.45409, 12.121889, 17.875147), (94.71715, 12.212002, 17.438074), (95.06124, 11.352408, 17.467945)]
+                color3f[] primvars:displayColor = [(0.16, 0.62, 1)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [0.22] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Mesh "DirectionArrow"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(94.699425, 11.712388, 17.631298), (94.85783, 11.6831255, 17.830114), (94.789185, 11.854601, 17.824156), (94.883026, 11.886747, 17.668234), (94.95167, 11.715272, 17.674194)]
+                color3f[] primvars:displayColor = [(0.16, 0.62, 1)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [1] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Camera "UsdCamera"
+            {
+                float2 clippingRange = (0.01, 1000000)
+                float focalLength = 11.31006
+                float horizontalAperture = 20.955
+                float verticalAperture = 11.717825
+                matrix4d xformOp:transform = ( (-0.371437050010139, -0.5078045464022022, 0.7772831205119703, 95.1463620791792), (0.9278980315954676, -0.1739533016261343, 0.32976583587232383, 11.902003414315796), (-0.03224562654550238, 0.8437267142470082, 0.535803537688168, 17.93938459641992), (0, 0, 0, 1) )
+                uniform token[] xformOpOrder = ["xformOp:transform"]
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(0.16, 0.62, 1)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.14
+                double3 xformOp:translate = (95.1463620791792, 11.902003414315796, 17.93938459641992)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_2" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/2"
+                    int[] imageSize = [1970, 1091]
+                    double[] positionM = [87.96380999510313, 4.572397051814354, 18.331585308263065]
+                }
+            }
+        )
+        {
+            def BasisCurves "WireframeFrustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(87.96381, 4.572397, 18.331585), (87.36734, 4.166711, 18.229298), (87.96381, 4.572397, 18.331585), (87.45398, 5.0889907, 18.268326), (87.96381, 4.572397, 18.331585), (87.753525, 5.0784864, 17.851578), (87.96381, 4.572397, 18.331585), (87.666885, 4.156207, 17.81255), (87.36734, 4.166711, 18.229298), (87.45398, 5.0889907, 18.268326), (87.753525, 5.0784864, 17.851578), (87.666885, 4.156207, 17.81255), (87.36734, 4.166711, 18.229298), (87.96381, 4.572397, 18.331585), (87.499954, 4.630141, 17.996725)]
+                color3f[] primvars:displayColor = [(1, 0.46, 0.22)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Mesh "SolidFrustum"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(87.96381, 4.572397, 18.331585), (87.36734, 4.166711, 18.229298), (87.45398, 5.0889907, 18.268326), (87.753525, 5.0784864, 17.851578), (87.666885, 4.156207, 17.81255)]
+                color3f[] primvars:displayColor = [(1, 0.46, 0.22)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [0.22] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Mesh "DirectionArrow"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(87.499954, 4.630141, 17.996725), (87.614876, 4.518025, 18.195969), (87.63215, 4.701852, 18.203749), (87.73998, 4.69807, 18.05372), (87.72272, 4.5142436, 18.045942)]
+                color3f[] primvars:displayColor = [(1, 0.46, 0.22)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [1] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Camera "UsdCamera"
+            {
+                float2 clippingRange = (0.01, 1000000)
+                float focalLength = 11.300618
+                float horizontalAperture = 20.955
+                float verticalAperture = 11.602107
+                matrix4d xformOp:transform = ( (0.09344430594339304, -0.5835270836663197, 0.806699650825367, 87.96380999510313), (0.994734321574476, 0.020462332066286712, -0.10042390510876469, 4.572397051814354), (0.04209311002727585, 0.8118358287826712, 0.5823665137966749, 18.331585308263065), (0, 0, 0, 1) )
+                uniform token[] xformOpOrder = ["xformOp:transform"]
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(1, 0.46, 0.22)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.14
+                double3 xformOp:translate = (87.96380999510313, 4.572397051814354, 18.331585308263065)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_3" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/3"
+                    int[] imageSize = [1901, 1122]
+                    double[] positionM = [85.04657439657854, 0.8953949518379465, 18.654805588769435]
+                }
+            }
+        )
+        {
+            def BasisCurves "WireframeFrustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(85.04658, 0.895395, 18.654806), (84.600235, 1.4140501, 18.421057), (85.04658, 0.895395, 18.654806), (85.49441, 1.4449503, 18.512505), (85.04658, 0.895395, 18.654806), (85.544426, 1.0547074, 18.15527), (85.04658, 0.895395, 18.654806), (84.65025, 1.0238072, 18.063822), (84.600235, 1.4140501, 18.421057), (85.49441, 1.4449503, 18.512505), (85.544426, 1.0547074, 18.15527), (84.65025, 1.0238072, 18.063822), (84.600235, 1.4140501, 18.421057), (85.04658, 0.895395, 18.654806), (85.076225, 1.2851955, 18.23314)]
+                color3f[] primvars:displayColor = [(0.35, 0.8, 0.42)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Mesh "SolidFrustum"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(85.04658, 0.895395, 18.654806), (84.600235, 1.4140501, 18.421057), (85.49441, 1.4449503, 18.512505), (85.544426, 1.0547074, 18.15527), (84.65025, 1.0238072, 18.063822)]
+                color3f[] primvars:displayColor = [(0.35, 0.8, 0.42)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [0.22] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Mesh "DirectionArrow"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(85.076225, 1.2851955, 18.23314), (84.96432, 1.2007326, 18.447191), (85.14805, 1.2070819, 18.465982), (85.16544, 1.0713762, 18.341755), (84.98171, 1.0650269, 18.322964)]
+                color3f[] primvars:displayColor = [(0.35, 0.8, 0.42)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [1] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Camera "UsdCamera"
+            {
+                float2 clippingRange = (0.01, 1000000)
+                float focalLength = 11.649835
+                float horizontalAperture = 20.955
+                float verticalAperture = 12.381942
+                matrix4d xformOp:transform = ( (0.9942237131563773, -0.09412606702649745, -0.05157159467445976, 85.04657439657854), (0.034357754992141984, 0.7343380689428767, -0.6779139696582899, 0.8953949518379465), (0.10168035069482842, 0.672226076662244, 0.7333302029787597, 18.654805588769435), (0, 0, 0, 1) )
+                uniform token[] xformOpOrder = ["xformOp:transform"]
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(0.35, 0.8, 0.42)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.14
+                double3 xformOp:translate = (85.04657439657854, 0.8953949518379465, 18.654805588769435)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_4" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/4"
+                    int[] imageSize = [1925, 1022]
+                    double[] positionM = [76.69943890692215, -7.423195771438736, 18.72447133657255]
+                }
+            }
+        )
+        {
+            def BasisCurves "WireframeFrustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(76.69944, -7.423196, 18.724472), (76.43344, -6.7792053, 18.59561), (76.69944, -7.423196, 18.724472), (77.28299, -7.0283637, 18.649506), (76.69944, -7.423196, 18.724472), (77.22763, -7.2995214, 18.268574), (76.69944, -7.423196, 18.724472), (76.37808, -7.050363, 18.21468), (76.43344, -6.7792053, 18.59561), (77.28299, -7.0283637, 18.649506), (77.22763, -7.2995214, 18.268574), (76.37808, -7.050363, 18.21468), (76.43344, -6.7792053, 18.59561), (76.69944, -7.423196, 18.724472), (76.850235, -6.9817395, 18.388315)]
+                color3f[] primvars:displayColor = [(0.75, 0.42, 1)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Mesh "SolidFrustum"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(76.69944, -7.423196, 18.724472), (76.43344, -6.7792053, 18.59561), (77.28299, -7.0283637, 18.649506), (77.22763, -7.2995214, 18.268574), (76.37808, -7.050363, 18.21468)]
+                color3f[] primvars:displayColor = [(0.75, 0.42, 1)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [0.22] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Mesh "DirectionArrow"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(76.850235, -6.9817395, 18.388315), (76.714905, -7.0714765, 18.586071), (76.89191, -7.1233883, 18.5973), (76.87018, -7.229813, 18.447792), (76.69318, -7.177901, 18.436562)]
+                color3f[] primvars:displayColor = [(0.75, 0.42, 1)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [1] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Camera "UsdCamera"
+            {
+                float2 clippingRange = (0.01, 1000000)
+                float focalLength = 11.81269
+                float horizontalAperture = 20.955
+                float verticalAperture = 11.123999
+                matrix4d xformOp:transform = ( (0.9578086453127708, 0.11757429784049936, -0.2622568922221206, 76.69943890692215), (-0.28090951599194813, 0.5758904740308722, -0.7677497862100623, -7.423195771438736), (0.06076350768351047, 0.8090280538685997, 0.5846207185678977, 18.72447133657255), (0, 0, 0, 1) )
+                uniform token[] xformOpOrder = ["xformOp:transform"]
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(0.75, 0.42, 1)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.14
+                double3 xformOp:translate = (76.69943890692215, -7.423195771438736, 18.72447133657255)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_5" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/5"
+                    int[] imageSize = [1963, 1024]
+                    double[] positionM = [90.32172238242572, 15.938798427371779, 17.80443462412862]
+                }
+            }
+        )
+        {
+            def BasisCurves "WireframeFrustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(90.321724, 15.938798, 17.804434), (90.679016, 15.3340025, 17.695301), (90.321724, 15.938798, 17.804434), (89.79371, 15.471549, 17.714397), (90.321724, 15.938798, 17.804434), (89.82725, 15.740244, 17.334078), (90.321724, 15.938798, 17.804434), (90.71256, 15.602697, 17.314981), (90.679016, 15.3340025, 17.695301), (89.79371, 15.471549, 17.714397), (89.82725, 15.740244, 17.334078), (90.71256, 15.602697, 17.314981), (90.679016, 15.3340025, 17.695301), (90.321724, 15.938798, 17.804434), (90.242775, 15.47693, 17.471163)]
+                color3f[] primvars:displayColor = [(1, 0.78, 0.2)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Mesh "SolidFrustum"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(90.321724, 15.938798, 17.804434), (90.679016, 15.3340025, 17.695301), (89.79371, 15.471549, 17.714397), (89.82725, 15.740244, 17.334078), (90.71256, 15.602697, 17.314981)]
+                color3f[] primvars:displayColor = [(1, 0.78, 0.2)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [0.22] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Mesh "DirectionArrow"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(90.242775, 15.47693, 17.471163), (90.35763, 15.586284, 17.671978), (90.17506, 15.614649, 17.675915), (90.18834, 15.721006, 17.525373), (90.3709, 15.692641, 17.521435)]
+                color3f[] primvars:displayColor = [(1, 0.78, 0.2)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [1] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Camera "UsdCamera"
+            {
+                float2 clippingRange = (0.01, 1000000)
+                float focalLength = 11.691856
+                float horizontalAperture = 20.955
+                float verticalAperture = 10.917102
+                matrix4d xformOp:transform = ( (-0.9879207018121395, -0.07184409370003864, 0.1372997264546309, 90.32172238242572), (0.1534882156911524, -0.5755276256844142, 0.8032492547543194, 15.938798427371779), (0.021311096107462665, 0.8146204295357599, 0.5796028100370759, 17.80443462412862), (0, 0, 0, 1) )
+                uniform token[] xformOpOrder = ["xformOp:transform"]
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(1, 0.78, 0.2)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.14
+                double3 xformOp:translate = (90.32172238242572, 15.938798427371779, 17.80443462412862)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_6" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/6"
+                    int[] imageSize = [1705, 931]
+                    double[] positionM = [82.65864132105217, 7.999023415358104, 18.619125319485114]
+                }
+            }
+        )
+        {
+            def BasisCurves "WireframeFrustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(82.65864, 7.9990234, 18.619125), (82.94917, 7.3571258, 18.495613), (82.65864, 7.9990234, 18.619125), (82.081314, 7.582402, 18.54884), (82.65864, 7.9990234, 18.619125), (82.13127, 7.8682427, 18.153675), (82.65864, 7.9990234, 18.619125), (82.99914, 7.6429667, 18.100449), (82.94917, 7.3571258, 18.495613), (82.081314, 7.582402, 18.54884), (82.13127, 7.8682427, 18.153675), (82.99914, 7.6429667, 18.100449), (82.94917, 7.3571258, 18.495613), (82.65864, 7.9990234, 18.619125), (82.52254, 7.5546846, 18.280506)]
+                color3f[] primvars:displayColor = [(0.12, 0.82, 0.78)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Mesh "SolidFrustum"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(82.65864, 7.9990234, 18.619125), (82.94917, 7.3571258, 18.495613), (82.081314, 7.582402, 18.54884), (82.13127, 7.8682427, 18.153675), (82.99914, 7.6429667, 18.100449)]
+                color3f[] primvars:displayColor = [(0.12, 0.82, 0.78)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [0.22] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Mesh "DirectionArrow"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(82.52254, 7.5546846, 18.280506), (82.65447, 7.6476455, 18.479067), (82.475914, 7.6939945, 18.490017), (82.49475, 7.8017397, 18.341063), (82.6733, 7.7553906, 18.330112)]
+                color3f[] primvars:displayColor = [(0.12, 0.82, 0.78)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [1] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Camera "UsdCamera"
+            {
+                float2 clippingRange = (0.01, 1000000)
+                float focalLength = 11.6649685
+                float horizontalAperture = 20.955
+                float verticalAperture = 11.437764
+                matrix4d xformOp:transform = ( (-0.9662214343759505, -0.10190854082924393, 0.2367083582649197, 82.65864132105217), (0.25080785782284565, -0.5830376350474685, 0.772762938706836, 7.999023415358104), (0.0592587171786456, 0.8060284300550958, 0.5889029165225272, 18.619125319485114), (0, 0, 0, 1) )
+                uniform token[] xformOpOrder = ["xformOp:transform"]
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(0.12, 0.82, 0.78)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.14
+                double3 xformOp:translate = (82.65864132105217, 7.999023415358104, 18.619125319485114)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_7" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/7"
+                    int[] imageSize = [1978, 1139]
+                    double[] positionM = [80.15553943366142, 5.214113088055539, 18.294534321259345]
+                }
+            }
+        )
+        {
+            def BasisCurves "WireframeFrustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(80.15554, 5.214113, 18.294535), (80.61305, 5.7725697, 18.194384), (80.15554, 5.214113, 18.294535), (80.783165, 4.87005, 18.157337), (80.15554, 5.214113, 18.294535), (80.44609, 4.823131, 17.752539), (80.15554, 5.214113, 18.294535), (80.27598, 5.725651, 17.789587), (80.61305, 5.7725697, 18.194384), (80.783165, 4.87005, 18.157337), (80.44609, 4.823131, 17.752539), (80.27598, 5.725651, 17.789587), (80.61305, 5.7725697, 18.194384), (80.15554, 5.214113, 18.294535), (80.58564, 5.310341, 17.925236)]
+                color3f[] primvars:displayColor = [(1, 0.38, 0.62)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Mesh "SolidFrustum"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(80.15554, 5.214113, 18.294535), (80.61305, 5.7725697, 18.194384), (80.783165, 4.87005, 18.157337), (80.44609, 4.823131, 17.752539), (80.27598, 5.725651, 17.789587)]
+                color3f[] primvars:displayColor = [(1, 0.38, 0.62)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [0.22] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Mesh "DirectionArrow"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(80.58564, 5.310341, 17.925236), (80.46287, 5.372448, 18.140982), (80.49707, 5.1909933, 18.133533), (80.37929, 5.174598, 17.992083), (80.345085, 5.356053, 17.99953)]
+                color3f[] primvars:displayColor = [(1, 0.38, 0.62)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [1] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Camera "UsdCamera"
+            {
+                float2 clippingRange = (0.01, 1000000)
+                float focalLength = 11.399008
+                float horizontalAperture = 20.955
+                float verticalAperture = 12.056791
+                matrix4d xformOp:transform = ( (0.1850763404010905, 0.6373782980355528, -0.7479944625795611, 80.15553943366142), (-0.9818973535051698, 0.0887183201190405, -0.1673525306556229, 5.214113088055539), (-0.040306032686707675, 0.7654266134320858, 0.6422596667426442, 18.294534321259345), (0, 0, 0, 1) )
+                uniform token[] xformOpOrder = ["xformOp:transform"]
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(1, 0.38, 0.62)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.14
+                double3 xformOp:translate = (80.15553943366142, 5.214113088055539, 18.294534321259345)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "camera_8" (
+            customData = {
+                dictionary calibration = {
+                    string cameraId = "camera/8"
+                    int[] imageSize = [1909, 1085]
+                    double[] positionM = [72.0069480262324, -2.781099359561564, 18.414605928306088]
+                }
+            }
+        )
+        {
+            def BasisCurves "WireframeFrustum"
+            {
+                int[] curveVertexCounts = [2, 2, 2, 2, 5, 2]
+                point3f[] points = [(72.00695, -2.7810993, 18.414606), (72.5661, -2.3610427, 18.261307), (72.00695, -2.7810993, 18.414606), (72.53784, -3.2505364, 18.311872), (72.00695, -2.7810993, 18.414606), (72.21139, -3.2621548, 17.92509), (72.00695, -2.7810993, 18.414606), (72.23964, -2.3726609, 17.874523), (72.5661, -2.3610427, 18.261307), (72.53784, -3.2505364, 18.311872), (72.21139, -3.2621548, 17.92509), (72.23964, -2.3726609, 17.874523), (72.5661, -2.3610427, 18.261307), (72.00695, -2.7810993, 18.414606), (72.44606, -2.8160577, 18.045034)]
+                color3f[] primvars:displayColor = [(0.62, 0.72, 0.18)] (
+                    interpolation = "constant"
+                )
+                uniform token type = "linear"
+                float[] widths = [0.035] (
+                    interpolation = "constant"
+                )
+                uniform token wrap = "nonperiodic"
+            }
+
+            def Mesh "SolidFrustum"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(72.00695, -2.7810993, 18.414606), (72.5661, -2.3610427, 18.261307), (72.53784, -3.2505364, 18.311872), (72.21139, -3.2621548, 17.92509), (72.23964, -2.3726609, 17.874523)]
+                color3f[] primvars:displayColor = [(0.62, 0.72, 0.18)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [0.22] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Mesh "DirectionArrow"
+            {
+                uniform bool doubleSided = 1
+                int[] faceVertexCounts = [3, 3, 3, 3, 4]
+                int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 4, 3, 2]
+                point3f[] points = [(72.44606, -2.8160577, 18.045034), (72.34056, -2.708357, 18.251785), (72.3347, -2.8927665, 18.26227), (72.21554, -2.8970075, 18.121084), (72.2214, -2.712598, 18.110601)]
+                color3f[] primvars:displayColor = [(0.62, 0.72, 0.18)] (
+                    interpolation = "constant"
+                )
+                float[] primvars:displayOpacity = [1] (
+                    interpolation = "constant"
+                )
+            }
+
+            def Camera "UsdCamera"
+            {
+                float2 clippingRange = (0.01, 1000000)
+                float focalLength = 11.754273
+                float horizontalAperture = 20.955
+                float verticalAperture = 11.901665
+                matrix4d xformOp:transform = ( (-0.03169815414408619, 0.6448242050689098, -0.7636732892470067, 72.0069480262324), (-0.9978862895027608, 0.022948732331193673, 0.060797012249149206, -2.781099359561564), (0.05672870886685138, 0.7639863421756397, 0.6427338547194601, 18.414605928306088), (0, 0, 0, 1) )
+                uniform token[] xformOpOrder = ["xformOp:transform"]
+            }
+
+            def Sphere "Origin"
+            {
+                color3f[] primvars:displayColor = [(0.62, 0.72, 0.18)] (
+                    interpolation = "constant"
+                )
+                double radius = 0.14
+                double3 xformOp:translate = (72.0069480262324, -2.781099359561564, 18.414605928306088)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+    }
+
+    def "WorldAxes"
+    {
+        def BasisCurves "X"
+        {
+            int[] curveVertexCounts = [2]
+            point3f[] points = [(0, 0, 0), (1, 0, 0)]
+            color3f[] primvars:displayColor = [(1, 0.1, 0.1)] (
+                interpolation = "constant"
+            )
+            uniform token type = "linear"
+            float[] widths = [0.035] (
+                interpolation = "constant"
+            )
+            uniform token wrap = "nonperiodic"
+        }
+
+        def BasisCurves "Y"
+        {
+            int[] curveVertexCounts = [2]
+            point3f[] points = [(0, 0, 0), (0, 1, 0)]
+            color3f[] primvars:displayColor = [(0.1, 1, 0.1)] (
+                interpolation = "constant"
+            )
+            uniform token type = "linear"
+            float[] widths = [0.035] (
+                interpolation = "constant"
+            )
+            uniform token wrap = "nonperiodic"
+        }
+
+        def BasisCurves "Z"
+        {
+            int[] curveVertexCounts = [2]
+            point3f[] points = [(0, 0, 0), (0, 0, 1)]
+            color3f[] primvars:displayColor = [(0.1, 0.3, 1)] (
+                interpolation = "constant"
+            )
+            uniform token type = "linear"
+            float[] widths = [0.035] (
+                interpolation = "constant"
+            )
+            uniform token wrap = "nonperiodic"
+        }
+    }
+}
+

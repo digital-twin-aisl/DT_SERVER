@@ -1,0 +1,43 @@
+<!doctype html>
+<!-- SPDX-FileCopyrightText: 2025-2026 Electronics and Telecommunications Research Institute (ETRI) and Sejong University -->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
+<html lang="ko">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Meta Sejong · Live Twin</title>
+<link rel="stylesheet" href="/static/viewer.css">
+</head>
+<body>
+<main id="viewport" aria-label="세종대학교 실시간 3D 지도"></main>
+<header class="panel brand"><span class="mark">M</span><div><strong>META SEJONG</strong><small>DIGITAL TWIN / 세종대학교</small></div></header>
+<section class="panel controls" aria-label="뷰어 제어">
+  <button id="focus">관측 구역</button><button id="campus">캠퍼스 전체</button><button id="follow">사람 따라가기</button>
+  <label><input id="show-zones" type="checkbox" checked> 관측 영역</label>
+  <label><input id="xray" type="checkbox" checked> 가려진 사람 표시</label>
+</section>
+<aside class="panel info">
+  <div class="status-line"><span id="dot" class="dot"></span><strong id="connection">연결 준비 중</strong><span id="mode-tag" class="tag">LIVE</span></div>
+  <p id="map-status">캠퍼스 맵을 불러오는 중…</p>
+  <div class="metrics"><div><b id="people-count">—</b><small>추적 인원</small></div><div><b id="pose-count">—</b><small>관절 추적</small></div><div><b id="fps">—</b><small>FPS</small></div></div>
+  <div id="people-list"></div>
+  <p id="source-status" class="muted">서버의 첫 장면을 기다립니다.</p>
+</aside>
+<section class="panel recording" aria-label="실시간 및 기록 재생">
+  <div class="recording-row"><button id="mode-live" class="active">실시간</button><label class="file-button">JSONL 파일 열기<input id="recording-file" type="file" accept=".jsonl,.ndjson,application/x-ndjson"></label></div>
+  <p id="recording-name" class="muted">JSONL 파일은 브라우저에서만 열며 업로드하지 않습니다.</p>
+  <div id="playback-panel" hidden>
+    <fieldset id="playback-controls" disabled>
+      <div class="recording-row"><button id="frame-first" title="처음 장면">처음</button><button id="frame-prev" title="이전 장면">이전</button><button id="play-pause">재생</button><button id="frame-next" title="다음 장면">다음</button>
+        <label>배속 <select id="play-speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option></select></label>
+        <label><input id="play-loop" type="checkbox"> 반복</label>
+      </div>
+      <input id="frame-seek" type="range" min="0" max="0" value="0" step="1" aria-label="기록 장면 이동">
+    </fieldset>
+    <p id="playback-time" class="muted">—</p>
+  </div>
+  <p id="recording-warning" role="status"></p>
+</section>
+<footer class="panel help">드래그 회전 <span>·</span> 우클릭 이동 <span>·</span> 스크롤 확대 <span class="engine">Three.js / 브라우저 렌더링</span></footer>
+<div id="error" role="alert" hidden></div>
+<script type="module" src="/static/dist/viewer.js"></script>
+</body></html>

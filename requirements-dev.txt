@@ -1,0 +1,4 @@
+# Development and CI tools (install after requirements.txt).
+pytest>=8,<9
+ruff>=0.6
+reuse>=4,<7
