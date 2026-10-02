@@ -1,133 +1,96 @@
-# DT_SERVER
+# DT_SERVER: 디지털 트윈 동기화 엔진
 
-Jetson 엣지에서 멀티 카메라 영상을 처리하고, ReID 및 3D pose 중간 결과를 Zenoh로 서버에 전달하는 디지털 트윈 백엔드입니다. 전체 서비스 구성은 [ARCHITECTURE.md](ARCHITECTURE.md)를 참고하세요.
+여러 대의 CCTV/RTSP 카메라 관측을 **엣지(Jetson)** 와 **GPU 서버**에서 나누어 처리하고,
+사람의 **전역 ID·3D 위치·15관절 자세**를 하나의 3D 장면(`SceneOutput`)으로 동기화하는
+분산 디지털 트윈 엔진입니다. 장면은 브라우저 뷰어(Three.js)와 NVIDIA Isaac Sim으로
+실시간 전달되고, 필요하면 JSONL로 기록해 재생할 수 있습니다.
 
-## 구성
+- **라이선스**: [LGPL-2.1-or-later](LICENSE). 제3자 구성요소는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)를 참고합니다.
+- **버전**: [CHANGELOG.md](CHANGELOG.md) (Semantic Versioning, `dt-common` 패키지 버전과 동일)
+- **문서**: [활용 가이드](docs/guide/README.md) · [아키텍처](ARCHITECTURE.md)
 
-- `apps/edge_client`: Jetson 카메라 입력, YOLO pose/ReID, 3D pose 전처리 및 Zenoh 송신
-- `apps/edge_manager`: 엣지 연결과 데이터 수집
-- `apps/dl_worker`: 서버 측 딥러닝 처리
-- `apps/camera_manager`: 카메라 및 캘리브레이션 관리
-- `apps/sim_backend`: Isaac Sim/프론트엔드용 WebSocket 송신
-- `apps/frontend_api`: 대시보드 API
-
-## 서버 실행
-
-`server_worker`, `edge_manager`, `calibration_worker`, `isaac_sim_client`의 Python
-가상환경과 GPU/Isaac Sim 준비 절차는 [SERVER_SETUP.md](SERVER_SETUP.md)를 먼저
-확인하세요.
-
-Docker와 Docker Compose를 설치한 서버에서 다음을 실행합니다.
-
-```bash
-docker compose up --build -d
-docker compose ps
+```mermaid
+flowchart LR
+  CAM[RTSP 카메라] --> E1[엣지 agent + 2D 추론<br/>heatmap · root · ReID]
+  E1 -->|Zenoh · ZNH2 패킷| S[GPU 서버<br/>전역 ID · Rank/LOD · 3D 자세]
+  S -->|Zenoh · SceneOutput v1| V[브라우저 뷰어]
+  S -->|SceneOutput v1| I[Isaac Sim]
+  S -->|선택| R[(scenes.jsonl 기록)]
+  M[edge_manager<br/>CLI · REST API] -.구역 시작/중지·승인·보정.-> E1
+  M -.-> S
+  G[frontend_api GUI] --> M
 ```
 
-Zenoh router를 별도로 사용하는 경우 서버에서 외부 연결을 받을 수 있도록 실행합니다.
+## 주요 기능
+
+| 기능 | 설명 |
+| --- | --- |
+| 구역(region) 단위 운영 | 카메라·엣지·서버 구성을 구역으로 묶어 CLI/GUI 한 번으로 시작·중지 |
+| 엣지-서버 분산 추론 | 엣지는 2D heatmap/root/ReID, 서버는 다중 엣지 결합과 3D 자세(LOD-2) 담당 |
+| 우선순위 기반 LOD | 0.5초마다 전역 Rank를 계산해 계산 자원을 중요한 사람에게 배분 |
+| 증거 기반 상태 | 프로세스·agent heartbeat·실제 관측 도착을 분리 확인해 `running` 판정 |
+| 카메라 보정 | ArUco 마커 트리 + (선택) VGGT-Omega 자동 보정, 수동 보정 편집기 |
+| 기록·재생 | 원본 영상이 아닌 `SceneOutput` JSONL만 기록, 브라우저/Isaac에서 재생 |
+
+## 5분 체험 (GPU·카메라 불필요)
+
+합성 장면 파일을 브라우저 뷰어로 재생합니다. 자세한 내용은 [빠른 시작](docs/guide/01-quickstart.md)을 참고합니다.
 
 ```bash
-zenohd --listen tcp/0.0.0.0:7447
+git clone --recurse-submodules <이 저장소 URL> DT_SERVER && cd DT_SERVER
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e packages/dt_common -r apps/frontend_api/requirements.txt
+npm ci --prefix apps/frontend_api/web && npm run build --prefix apps/frontend_api/web
+python -m uvicorn apps.frontend_api.app.main:app --host 127.0.0.1 --port 8005
+# 브라우저에서 http://127.0.0.1:8005/viewer → "JSONL 파일 열기"
+#   → examples/synthetic_region/synthetic_scene.jsonl 선택
 ```
 
-방화벽이나 보안 그룹에서도 TCP 7447 포트를 허용해야 합니다.
+## 실제 배포 순서
 
-## Jetson edge client 설치
+1. [서버 설치](docs/guide/02-install-server.md): CUDA PyTorch, Zenoh router, manager, GUI
+2. [엣지 설치](docs/guide/03-install-edge.md): Jetson 환경, 카메라 등록, agent 등록·승인
+3. [새 구역 구성](docs/guide/05-new-region.md): 배포 manifest, 보정, ground, `regions.json`
+4. [운영](docs/guide/06-operations.md): 구역 시작/중지, 상태 판정, 기록·재생, 장애 처리
+5. (선택) [Isaac Sim 연동](docs/guide/04-isaac-sim.md)
 
-### 요구 환경
+메시지 형식과 좌표계를 직접 다루려면 [데이터 계약](docs/guide/07-contracts.md),
+문제가 생기면 [문제 해결](docs/guide/08-troubleshooting.md)을 봅니다.
 
-- Jetson Orin 계열
-- JetPack 6 / L4T R36
-- Python 3.10
-- JetPack에 포함된 CUDA, cuDNN, TensorRT
-- JetPack 버전과 호환되는 CUDA PyTorch 및 torchvision
+## 저장소 구조
 
-PyTorch wheel 선택은 [NVIDIA PyTorch for Jetson 설치 문서](https://docs.nvidia.com/deeplearning/frameworks/install-pytorch-jetson-platform/index.html)를 기준으로 합니다. `torch2trt`는 [NVIDIA 공식 저장소](https://github.com/NVIDIA-AI-IOT/torch2trt)에서 설치됩니다.
+| 경로 | 역할 |
+| --- | --- |
+| `packages/dt_common` | 모든 호스트가 공유하는 CPU 전용 계약 (엣지 토픽, ZNH2 코덱, `SceneOutput`, 보정·공간 기하) |
+| `apps/edge_manager` | 구역 실행의 단일 소유자 (`ControlPlane`), 장치 registry, REST API(8001), CLI |
+| `apps/edge_client` | Jetson 상시 agent와 엣지 추론 |
+| `apps/server_worker` | 서버 추론 루프 (연결 → Rank/LOD → 3D 자세 → 장면 병합) |
+| `apps/calibration_worker` | 카메라 보정 worker와 수동 보정 편집기 |
+| `apps/frontend_api` | 운영 GUI와 Three.js 장면 뷰어(8005) |
+| `apps/isaac_sim_client` | Isaac Sim 장면 구독 스크립트와 확장 |
+| `apps/deployments` | 구역 catalog와 배포 manifest 예시 (`center-b1-corridor`) |
+| `examples/` | 합성 장면 생성기 등 바로 실행 가능한 예제 |
 
-### 기본 설치
+## 라이선스와 선택 구성요소
 
-Jetson에서는 저장소 루트에서 다음을 실행합니다.
+DT_SERVER 자체는 **GNU LGPL v2.1 이상**으로 배포됩니다. 아래 구성요소는 이 저장소에
+**포함되지 않으며**, 필요할 때 사용자가 각 라이선스를 검토한 뒤 직접 설치합니다.
 
-```bash
-chmod +x apps/edge_client/install_edge.sh
-apps/edge_client/install_edge.sh
-source apps/edge_client/.venv/bin/activate
-```
+| 구성요소 | 용도 | 라이선스 | 없을 때 |
+| --- | --- | --- | --- |
+| Ultralytics YOLO | 엣지 ReID용 사람 검출 | AGPL-3.0 | `--no-reid`로 실행 (위치 기반 ID) |
+| VGGT-Omega (서브모듈) | 자동 카메라 보정 | FAIR Noncommercial | 수동 보정 편집기 사용 |
+| FastReID (서브모듈) | ReID 특징 추출 | Apache-2.0 | `--no-reid` |
+| 학습된 PoseNet 가중치 | 2D/3D 추론 | 가중치별 | `DT_POSENET_URL`로 직접 지정 |
 
-스크립트는 다음 작업을 수행합니다.
+자세한 의무 사항은 [라이선스 준수 가이드](docs/guide/09-license-compliance.md)를 참고합니다.
 
-1. 시스템 패키지와 `apps/edge_client/.venv` 준비
-2. Jetson용 CUDA PyTorch와 edge client 의존성 설치
-3. 누락된 FastReID/VGGT-Omega 서브모듈 초기화
-4. `torch2trt` 설치
-5. 샘플 데이터, pose checkpoint, ReID checkpoint 다운로드
-6. CUDA와 주요 Python import 검증
+## 참여와 지원
 
-## Edge client 설정 및 실행
+- 버그·질문·제안: GitHub Issues ([SUPPORT.md](SUPPORT.md))
+- 기여 방법: [CONTRIBUTING.md](CONTRIBUTING.md)
+- 보안 취약점·자격증명 노출 신고: [SECURITY.md](SECURITY.md)
 
-카메라는 `python apps/edge_client/camera_setup.py`로 엣지 로컬 설정에 등록합니다. Zenoh endpoint, topic과 모델 경로는 `apps/edge_client/config/config.py` 또는 `--cfg_focus`로 전달하는 YAML 파일에서 설정합니다.
-
-샘플 데이터로 실행:
-
-```bash
-cd apps/edge_client
-source .venv/bin/activate
-python inference.py \
-  --dataset \
-  --example_folder data/data_0705 \
-  --tensorrt \
-  --zenoh-endpoint SERVER_IP:7447
-```
-
-RTSP 카메라로 실행:
-
-```bash
-cd apps/edge_client
-source .venv/bin/activate
-python inference.py --tensorrt --zenoh-endpoint SERVER_IP:7447
-```
-
-Zenoh 송신 없이 로컬 추론만 확인하려면 `--no-zenoh`를 추가합니다.
-
-`data/data_0812_1`처럼 두 edge의 영상 8개와 `edge_info.txt`가 함께 있는
-데이터셋은 실행할 edge identity를 지정하면 해당 4개 카메라를 자동 선택합니다.
-저장소 루트에서도 동일하게 실행할 수 있습니다.
-
-```bash
-apps/edge_client/.venv/bin/python apps/edge_client/inference.py \
-  --dataset \
-  --example-folder apps/edge_client/data/data_0812_1 \
-  --edge-id edge_1 \
-  --edge-id-file apps/edge_client/config/edge_1.dataset.json \
-  --deployment apps/deployments/scene_0812_2.json \
-  --tensorrt \
-  --no-zenoh
-```
-
-첫 프레임만 빠르게 검증하려면 `--max-frames 1`을, ReID 엔진/모델을 제외하고
-3D pose 경로만 검증하려면 `--no-reid`를 추가합니다.
-
-USD calibration 데이터셋은 `--deployment`가 필수입니다. 이 manifest의 Ground와
-edge AOI를 `workspace.py` 정책으로 계산한 결과 현재 `edge_1`은 `328x108x20`,
-`edge_2`는 `300x108x16` cube를 사용합니다. deployment 없이 학습 기준의 고정
-`80x80x20` cube로 실행하는 오류는 시작 단계에서 차단됩니다.
-
-Edge 모델은 backbone heatmap과 root candidate까지만 계산합니다. 관절별 3D pose
-regression은 server worker가 담당하며, edge rootnet 모드에서는 `PoseRegressionNet`
-가 생성되거나 checkpoint에서 GPU로 적재되지 않습니다.
-
-`--tensorrt`를 처음 사용하면 pose와 FastReID checkpoint의 SHA-256, 입력/cube
-크기, precision과 Jetson/TensorRT 버전을 조합한 전용 FP16 엔진을 각각 생성하고
-PyTorch 출력과 비교 검증합니다. 같은 설정의 다음 실행부터는 생성된 엔진을 자동
-재사용합니다. 체크포인트나 설정이 바뀌면 별도 엔진을 자동 생성하며, 두 엔진을
-강제로 다시 만들려면 `--rebuild-tensorrt`를 사용합니다.
-`config.POSENET.TENSORRT: true`로 설정해도 `--tensorrt`와 동일하게 동작합니다.
-
-## 종료 및 상태 확인
-
-```bash
-docker compose logs -f
-docker compose down
-```
-
-운영 환경에서는 설정 파일에 RTSP 비밀번호를 직접 커밋하지 말고 별도 비밀 관리 수단을 사용하세요.
+> 이 엔진은 사람의 위치·자세를 다룹니다. 설치 현장의 개인정보 보호 법령과 내부 정책
+> (고지, 동의, 보관 기간)을 운영자가 직접 확인해야 하며, 소프트웨어가 그 적합성을
+> 보증하지 않습니다.
