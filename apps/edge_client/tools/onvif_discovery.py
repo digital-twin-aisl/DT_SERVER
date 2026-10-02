@@ -1,11 +1,15 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
+import os
 import socket
 import uuid
 import requests
 from requests.auth import HTTPDigestAuth
 import xml.etree.ElementTree as ET
 
-ONVIF_USER = "admin"
-ONVIF_PASSWORD = "password"
+# Never hard-code camera credentials; supply them through the environment.
+ONVIF_USER = os.environ.get("ONVIF_USER", "admin")
+ONVIF_PASSWORD = os.environ.get("ONVIF_PASSWORD", "")
 
 WS_DISCOVERY_ADDR = ("239.255.255.250", 3702)
 
@@ -195,6 +199,9 @@ def add_rtsp_credentials(uri, username, password):
 
 
 def main():
+    if not ONVIF_PASSWORD:
+        print("Set ONVIF_PASSWORD (and optionally ONVIF_USER) before running.")
+        return
     print("Searching ONVIF cameras...")
 
     devices = discover_onvif()

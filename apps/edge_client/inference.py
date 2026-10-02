@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # ruff: noqa: E402
 
 import argparse
@@ -20,18 +22,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EDGE_CLIENT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from apps.edge_client.src.protocol.zenoh import ZenohSender
-from apps.edge_client.src.protocol.edge import (
-    DEFAULT_IDENTITY_PATH,
+from dt_common.infrastructure.zenoh import LatestPublisher
+from dt_common.contracts.edge import (
     DEFAULT_TOPIC_ROOT,
     EdgeTopics,
+)
+from apps.edge_client.infrastructure.identity import (
+    DEFAULT_IDENTITY_PATH,
     load_edge_metadata,
     load_or_create_edge_id,
 )
 from apps.edge_client.src.reid.yolopose import extract_poses_from_frames
-from apps.edge_client.src.root.core.config import config as sp3d_config
-from apps.edge_client.src.root.core.config import update_config as update_sp3d_config
-from apps.edge_client.src.root.models.multi_person_posenet_ssv import (
+from apps.edge_client.src.root.core.config import config as pose_config
+from apps.edge_client.src.root.core.config import update_config as update_pose_config
+from apps.edge_client.src.root.models.multi_person_posenet import (
     get_multi_person_pose_net,
 )
 from apps.edge_client.src.utils.calibration import CalibrationData
@@ -52,7 +56,8 @@ from apps.edge_client.config.config import config as focus_config
 from apps.edge_client.config.config import update_config as update_focus_config
 from dt_common.spatial.workspace import build_edge_workspace, load_spatial_context
 from dt_common.inference_codec import encode_frame
-from dt_common.runtime_config import parse_runtime_args
+from dt_common.runtime_config import parse_runtime_args, configure_profile_paths
+from apps.edge_client.config.runtime import PROFILE_PATH_OPTIONS
 from dt_common.calibration.identity import calibration_digest
 
 
@@ -80,6 +85,12 @@ def parse_args(argv=None):
         help="Force regeneration of the configuration-specific pose engines",
     )
     parser.add_argument("--dataset", action="store_true")
+    parser.add_argument(
+        "--allow-dataset-calibration-override",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Explicitly use deployment calibration despite different dataset calibration (experimental)",
+    )
     parser.add_argument(
         "--camera-config",
         help="Edge-private YAML containing live RTSP camera sources",
@@ -114,13 +125,16 @@ def parse_args(argv=None):
     parser.add_argument(
         "--max-frames",
         type=int,
-        help="Stop after this many frames (useful for dataset smoke tests)",
+        help="Stop after this many frames for a bounded dataset run",
     )
+    configure_profile_paths(parser, PROFILE_PATH_OPTIONS)
     args = parse_runtime_args(parser, argv)
     if not 1 <= args.rtsp_buffer_frames <= 32:
         parser.error("--rtsp-buffer-frames must be between 1 and 32")
     if args.dataset and not args.example_folder:
         parser.error("--dataset requires --example-folder")
+    if args.allow_dataset_calibration_override and not args.dataset:
+        parser.error("--allow-dataset-calibration-override requires --dataset")
     if args.max_frames is not None and args.max_frames < 1:
         parser.error("--max-frames must be at least 1")
     if min(args.rtsp_open_timeout_ms, args.rtsp_read_timeout_ms) < 1:
@@ -170,8 +184,10 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def validate_dataset_spatial_context(dataset_path, spatial_context):
-    """Prevent absolute-USD datasets from using the legacy fixed workspace."""
+def validate_dataset_spatial_context(
+    dataset_path, spatial_context, *, allow_calibration_override=False,
+):
+    """Require matching geometry unless a calibration experiment opts in."""
     calibration_path = find_dataset_calibration(dataset_path)
     if calibration_path is None:
         return
@@ -183,6 +199,16 @@ def validate_dataset_spatial_context(dataset_path, spatial_context):
         )
     calibration_sha256 = file_sha256(calibration_path)
     if calibration_sha256 != spatial_context.calibration_sha256:
+        if allow_calibration_override:
+            print(
+                "WARNING: explicit dataset calibration override; "
+                f"dataset={calibration_path} dataset_sha256={calibration_sha256}; "
+                f"applied={spatial_context.calibration_path} "
+                f"applied_sha256={spatial_context.calibration_sha256}. "
+                "Geometry accuracy is not validated by this experiment.",
+                flush=True,
+            )
+            return
         raise ValueError(
             "dataset calibration does not match the deployment calibration: "
             f"{calibration_path}"
@@ -229,7 +255,7 @@ def resolve_live_cameras(args, edge_metadata, spatial_context, edge_id):
     selected = select_live_cameras(
         cameras,
         required_camera_ids,
-        sp3d_config.NUM_VIEWS,
+        pose_config.NUM_VIEWS,
     )
     print(
         "Selected live RTSP cameras: "
@@ -240,18 +266,18 @@ def resolve_live_cameras(args, edge_metadata, spatial_context, edge_id):
 
 def load_models(use_tensorrt, use_reid, rebuild_tensorrt=False):
     torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.enabled = sp3d_config.CUDNN.ENABLED
-    torch.backends.cudnn.benchmark = sp3d_config.CUDNN.BENCHMARK
-    torch.backends.cudnn.deterministic = sp3d_config.CUDNN.DETERMINISTIC
+    torch.backends.cudnn.enabled = pose_config.CUDNN.ENABLED
+    torch.backends.cudnn.benchmark = pose_config.CUDNN.BENCHMARK
+    torch.backends.cudnn.deterministic = pose_config.CUDNN.DETERMINISTIC
 
     device = torch.device("cuda")
     torch.tensor([1], device=device)  # CUDA 메모리 할당 확인
 
     # ProjectLayer copies cfg.TRANSFORM while the pose model is constructed.
     # Build preprocessing first so that the affine transform is available.
-    pose_preprocess = PREPROCESS(sp3d_config)
+    pose_preprocess = PREPROCESS(pose_config)
     checkpoint = resolve_edge_path(focus_config.POSENET.CKPT)
-    pose_model = get_multi_person_pose_net(sp3d_config, inference_mode="rootnet")
+    pose_model = get_multi_person_pose_net(pose_config)
     checkpoint_state = torch.load(
         checkpoint,
         map_location=device,
@@ -269,7 +295,7 @@ def load_models(use_tensorrt, use_reid, rebuild_tensorrt=False):
         pose_model = load_tensorrt_model(
             pose_model,
             checkpoint,
-            sp3d_config,
+            pose_config,
             mode="fp16",
             force_rebuild=rebuild_tensorrt,
         )
@@ -277,6 +303,7 @@ def load_models(use_tensorrt, use_reid, rebuild_tensorrt=False):
     reid_engine = None
     yolo_model = None
     if use_reid:
+        require_ultralytics()
         from apps.edge_client.src.reid.feature_extract import (
             build_feature_extractor,
             build_trt_feature_extractor,
@@ -297,7 +324,7 @@ def load_models(use_tensorrt, use_reid, rebuild_tensorrt=False):
 
             yolo_model = build_trt_yolo(
                 yolo_checkpoint,
-                batch_size=sp3d_config.NUM_VIEWS,
+                batch_size=pose_config.NUM_VIEWS,
                 image_size=int(focus_config.YOLO.IMAGE_SIZE),
                 force_rebuild=rebuild_tensorrt,
             )
@@ -348,11 +375,6 @@ def serialize_output(
     return encode_frame(output)
 
 
-def count_valid_roots(roots):
-    values = np.asarray(roots).reshape(-1, 5)
-    return int(((values[:, 3] >= 0) & np.isfinite(values[:, 4])).sum())
-
-
 def print_startup_metadata(*, edge_id, edge_metadata, args, spatial_context,
                            live_cameras, use_tensorrt, zenoh_endpoint, inference_topic):
     metadata = {
@@ -361,6 +383,8 @@ def print_startup_metadata(*, edge_id, edge_metadata, args, spatial_context,
         "camera_ids": (list(spatial_context.edge_camera_ids[edge_id]) if spatial_context else
                        [int(camera["id"]) for camera in live_cameras or []]),
         "tensorrt": use_tensorrt, "dataset": args.dataset,
+        "example_folder": args.example_folder if args.dataset else None,
+        "allow_dataset_calibration_override": args.allow_dataset_calibration_override,
         "deployment": args.deployment,
         "timestamp_kind": "dataset_relative" if args.dataset else "receive_unix",
         "server_router": {"endpoint": zenoh_endpoint, "topic": inference_topic,
@@ -427,7 +451,7 @@ def create_input_process(
             else select_dataset_camera_ids(
                 args.example_folder,
                 edge_id,
-                sp3d_config.NUM_VIEWS,
+                pose_config.NUM_VIEWS,
             )
         )
         process = ExampleDataset(
@@ -439,7 +463,7 @@ def create_input_process(
         )
         if spatial_context is None:
             CalibrationData(
-                sp3d_config,
+                pose_config,
                 example_path=args.example_folder,
                 camera_ids=camera_ids,
             )
@@ -451,7 +475,7 @@ def create_input_process(
                     f"expected {expected_ids}, got {process.camera_ids}"
                 )
             CalibrationData(
-                sp3d_config,
+                pose_config,
                 calibration_path=spatial_context.calibration_path,
                 camera_ids=expected_ids,
                 world_origin_m=spatial_context.world_origin_m,
@@ -467,7 +491,7 @@ def create_input_process(
         else [camera["id"] for camera in live_cameras]
     )
     CalibrationData(
-        sp3d_config,
+        pose_config,
         cameras=live_cameras if spatial_context is None else None,
         calibration_path=spatial_context.calibration_path if spatial_context else None,
         camera_ids=camera_ids,
@@ -486,9 +510,22 @@ def create_input_process(
         open_timeout_ms=args.rtsp_open_timeout_ms,
         read_timeout_ms=args.rtsp_read_timeout_ms,
         reconnect_delay=args.rtsp_reconnect_delay,
-        expected_size=sp3d_config.NETWORK.IMAGE_SIZE_ORIG,
+        expected_size=pose_config.NETWORK.IMAGE_SIZE_ORIG,
         buffer_depth=args.rtsp_buffer_frames,
     )
+
+
+def require_ultralytics():
+    """ReID person detection uses Ultralytics YOLO, an optional AGPL-3.0 add-on."""
+    import importlib.util
+
+    if importlib.util.find_spec("ultralytics") is None:
+        raise RuntimeError(
+            "Edge ReID needs the optional 'ultralytics' package (AGPL-3.0), "
+            "which is not installed. Run with --no-reid, or install it with "
+            "apps/edge_client/requirements-reid-ultralytics.txt after reviewing "
+            "its license (see docs/guide/09-license-compliance.md)."
+        )
 
 
 def extract_reid(
@@ -552,7 +589,7 @@ def main():
     if cfg_focus:
         update_focus_config(resolve_edge_path(cfg_focus) if args.cfg_focus else
                             resolve_identity_setting(cfg_focus, args.edge_id_file))
-    update_sp3d_config(resolve_edge_path(focus_config.POSENET.CONFIG))
+    update_pose_config(resolve_edge_path(focus_config.POSENET.CONFIG))
     use_tensorrt = (
         bool(inference_defaults.get("tensorrt", focus_config.POSENET.TENSORRT))
         if args.tensorrt is None
@@ -580,8 +617,11 @@ def main():
     if spatial_context is not None and edge_id not in spatial_context.edge_camera_ids:
         raise ValueError(f"edge {edge_id!r} is not enabled in the deployment")
     if args.dataset:
-        validate_dataset_spatial_context(args.example_folder, spatial_context)
-    sp3d_config.SPATIAL_CONTEXT = spatial_context
+        validate_dataset_spatial_context(
+            args.example_folder, spatial_context,
+            allow_calibration_override=args.allow_dataset_calibration_override,
+        )
+    pose_config.SPATIAL_CONTEXT = spatial_context
     live_cameras = (
         None
         if args.dataset
@@ -634,12 +674,12 @@ def main():
             workspace = build_edge_workspace(
                 spatial_context,
                 edge_id,
-                sp3d_config.CAMS,
-                sp3d_config.NETWORK.IMAGE_SIZE_ORIG,
-                sp3d_config.MULTI_PERSON.SPACE_SIZE,
-                sp3d_config.MULTI_PERSON.INITIAL_CUBE_SIZE,
+                pose_config.CAMS,
+                pose_config.NETWORK.IMAGE_SIZE_ORIG,
+                pose_config.MULTI_PERSON.SPACE_SIZE,
+                pose_config.MULTI_PERSON.INITIAL_CUBE_SIZE,
             )
-            sp3d_config.EDGE_WORKSPACE = workspace
+            pose_config.EDGE_WORKSPACE = workspace
             spatial_identity = {
                 **spatial_context.identity(),
                 "edge_id": edge_id,
@@ -653,9 +693,9 @@ def main():
                 f"{workspace.valid_mask.size}"
             )
         else:
-            sp3d_config.EDGE_WORKSPACE = None
+            pose_config.EDGE_WORKSPACE = None
             spatial_identity = None
-        effective_calibration = calibration_digest(sp3d_config.CAMS)
+        effective_calibration = calibration_digest(pose_config.CAMS)
         if args.validate_only:
             resolve_edge_path(focus_config.POSENET.CKPT)
             print("Configuration validation passed (camera/network/GPU readiness not probed)")
@@ -673,8 +713,12 @@ def main():
         camera_ids = input_process.camera_ids
 
         if not args.no_zenoh:
-            sender = ZenohSender(topic=inference_topic, endpoint=zenoh_endpoint,
-                                 config_path=args.zenoh_config, queue_size=2)
+            sender = LatestPublisher(
+                topic=inference_topic,
+                endpoint=zenoh_endpoint,
+                config_path=args.zenoh_config,
+                queue_size=2,
+            )
         pose_preprocess, pose_model, reid_engine, yolo_model = load_models(
             use_tensorrt,
             not args.no_reid,

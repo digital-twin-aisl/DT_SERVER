@@ -1,4 +1,7 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -17,19 +20,22 @@ import zenoh
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from apps.edge_client.src.protocol.edge import (  # noqa: E402
-    DEFAULT_IDENTITY_PATH,
+import apps  # noqa: E402,F401 - direct-script checkout bootstrap
+from dt_common.contracts.edge import (  # noqa: E402
     DEFAULT_TOPIC_ROOT,
     SCHEMA_VERSION,
     EdgeTopics,
     decode_json,
     encode_json,
+    validate_edge_id,
+)
+from apps.edge_client.infrastructure.identity import (  # noqa: E402
+    DEFAULT_IDENTITY_PATH,
     load_edge_metadata,
     load_or_create_edge_id,
     save_edge_metadata,
-    validate_edge_id,
 )
-from apps.edge_client.src.protocol.zenoh import make_zenoh_config  # noqa: E402
+from dt_common.infrastructure.zenoh import make_zenoh_config  # noqa: E402
 from apps.edge_client.src.camera_status import (  # noqa: E402
     DEFAULT_CAMERA_PING_TIMEOUT,
     build_camera_status_message,
@@ -44,6 +50,7 @@ from apps.edge_client.src.calibration_result import (  # noqa: E402
     apply_calibration_result,
     import_external_calibration_result,
 )
+from apps.edge_client.application.runtime import EdgeInferenceRuntime  # noqa: E402
 
 
 AGENT_VERSION = "0.1.0"
@@ -232,6 +239,10 @@ class EdgeAgent:
         self.started_at = time.time()
         self.stop_event = threading.Event()
         self._session: Any = None
+        self.inference_runtime = EdgeInferenceRuntime(
+            edge_id, self.identity_path, self.camera_config, endpoint,
+        )
+        self._runtime_command_lock = threading.Lock()
 
     def _status(self) -> dict[str, Any]:
         return {
@@ -249,6 +260,7 @@ class EdgeAgent:
                 "agent_started_at": self.started_at,
                 "zenoh_endpoint": self.endpoint,
                 "topic_root": self.topics.root,
+                "inference": self.inference_runtime.status(),
             },
         }
 
@@ -325,6 +337,9 @@ class EdgeAgent:
 
             command_id = str(message["command_id"])
             command = str(message["command"])
+            if message.get('expires_at') is not None and time.time() > float(message['expires_at']):
+                self._publish_ack(command_id, command, False, error='command expired')
+                return
             print(f"[command] id={command_id} command={command}", flush=True)
 
             if command == "ping":
@@ -339,6 +354,11 @@ class EdgeAgent:
             elif command == "shutdown":
                 self._publish_ack(command_id, command, True, {"message": "stopping"})
                 self.stop_event.set()
+            elif command in {'ensure_inference', 'stop_inference', 'inference_logs'}:
+                parameters = message.get('parameters') or {}
+                if not isinstance(parameters, dict):
+                    raise ValueError('command parameters must be an object')
+                threading.Thread(target=self._handle_runtime, args=(command_id, command, parameters), daemon=True).start()
             elif command == "capture_calibration_features":
                 parameters = message.get("parameters") or {}
                 if not isinstance(parameters, dict):
@@ -369,6 +389,28 @@ class EdgeAgent:
         except Exception as exc:
             print(f"[command] invalid message: {exc}", file=sys.stderr, flush=True)
 
+    def _handle_runtime(self, command_id, command, parameters):
+        if not self._runtime_command_lock.acquire(blocking=False):
+            self._publish_ack(command_id, command, False, error='another runtime command is in progress')
+            return
+        try:
+            if command == 'ensure_inference':
+                if not self._calibration_lock.acquire(blocking=False):
+                    raise ValueError('calibration is in progress')
+                try:
+                    result = self.inference_runtime.ensure(parameters)
+                finally:
+                    self._calibration_lock.release()
+            elif command == 'stop_inference':
+                result = self.inference_runtime.stop(parameters.get('run_id'))
+            else:
+                result = {'text': self.inference_runtime.worker.logs()}
+            self._publish_ack(command_id, command, True, result)
+        except Exception as exc:
+            self._publish_ack(command_id, command, False, error=str(exc))
+        finally:
+            self._runtime_command_lock.release()
+
     def _capture_calibration_features(
         self, command_id: str, parameters: dict[str, Any]
     ) -> None:
@@ -383,6 +425,8 @@ class EdgeAgent:
         try:
             if not load_edge_metadata(self.identity_path).get("approved"):
                 raise PermissionError("edge is not approved for calibration capture")
+            if self.inference_runtime.run_id:
+                raise ValueError('stop region inference before calibration capture')
             checkpoint = self.calibration_checkpoint
             if checkpoint is None:
                 raise ValueError(
@@ -444,6 +488,8 @@ class EdgeAgent:
         try:
             if not load_edge_metadata(self.identity_path).get("approved"):
                 raise PermissionError("edge is not approved for calibration updates")
+            if self.inference_runtime.run_id:
+                raise ValueError('stop region inference before applying calibration')
             camera_ids = apply_calibration_result(
                 self.camera_config,
                 self.edge_id,
@@ -518,6 +564,8 @@ class EdgeAgent:
                 }
             )
             save_edge_metadata(self.identity_path, current)
+            if not current['approved']:
+                self.inference_runtime.stop()
             self.display_name = current["display_name"]
             self._publish_ack(
                 config_id,
@@ -568,13 +616,22 @@ class EdgeAgent:
                     flush=True,
                 )
             try:
+                last_status = 0.0
                 while not self.stop_event.is_set():
-                    session.put(self.topics.status, encode_json(self._status()))
+                    try:
+                        self.inference_runtime.tick()
+                    except Exception as exc:
+                        self.inference_runtime.stop()
+                        self.inference_runtime.error = str(exc)
+                    if time.monotonic() - last_status >= self.heartbeat_interval:
+                        session.put(self.topics.status, encode_json(self._status()))
+                        last_status = time.monotonic()
                     if once:
                         time.sleep(0.2)
                         break
-                    self.stop_event.wait(self.heartbeat_interval)
+                    self.stop_event.wait(min(1.0, self.heartbeat_interval))
             finally:
+                self.inference_runtime.stop()
                 _ = command_subscriber, config_subscriber
                 self._session = None
 
@@ -703,7 +760,14 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, stop_agent)
     signal.signal(signal.SIGTERM, stop_agent)
-    agent.run(args.once)
+    # One persistent agent owns a physical edge's inference process group.
+    lock_path = Path(args.identity_file).resolve().with_suffix('.agent.lock')
+    with lock_path.open('w') as ownership:
+        try:
+            fcntl.flock(ownership, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SystemExit('another agent already owns this identity') from exc
+        agent.run(args.once)
 
 
 if __name__ == "__main__":

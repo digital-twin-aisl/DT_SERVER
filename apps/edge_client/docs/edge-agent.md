@@ -14,9 +14,9 @@ python apps/edge_client/agent.py init \
   --edge-id edge_1 \
   --display-name dt_jetson_1 \
   --replace-edge-id \
-  --endpoint 'udp/SERVER_IP:10020?rel=1' \
+  --endpoint tcp/SERVER_IP:7447 \
   --camera-config apps/edge_client/config/cameras.local.yaml \
-  --deployment apps/deployments/scene_0812_2.json \
+  --deployment apps/deployments/scene_0812_poc.json \
   --calibration-result apps/deployments/calibration_result_20260814-123941.json \
   --tensorrt
 
@@ -63,7 +63,7 @@ ID는 기본적으로 `apps/edge_client/config/edge.local.json`에 저장되고 
   "display_name": "dt_jetson_1",
   "camera_config": "cameras.local.yaml",
   "camera_ids": [2, 4, 6, 8],
-  "zenoh_endpoint": "udp/SERVER_IP:10020?rel=1",
+  "zenoh_endpoint": "tcp/SERVER_IP:7447",
   "topic_root": "dt/edges",
   "topics": {
     "status": "dt/edges/edge_1/status",
@@ -80,15 +80,19 @@ ID는 기본적으로 `apps/edge_client/config/edge.local.json`에 저장되고 
 기본값은 다음 agent 및 inference 실행부터 자동 사용됩니다. CLI 인자를 전달하면
 저장값보다 CLI가 우선합니다.
 
-추론기도 같은 identity 파일을 읽으므로 토픽을 따로 전달하지 않습니다.
+평소 추론은 서버의 구역 관리 명령으로 시작합니다. manager가 agent에 명령하고,
+agent가 같은 identity 파일을 읽는 추론기를 실행하므로 토픽을 따로 전달하지
+않습니다.
 
 ```bash
-apps/edge_client/.venv/bin/python apps/edge_client/inference.py
+python -m apps.edge_manager region start center-b1-corridor
 ```
 
 Identity에 `camera_config`와 `camera_ids`가 있으면 실시간 추론은 해당 로컬
 RTSP 설정을 읽고 deployment의 카메라 순서와 대조합니다. `camera_config`의 상대
-경로는 identity 파일이 있는 디렉터리를 기준으로 합니다.
+경로는 identity 파일이 있는 디렉터리를 기준으로 합니다. 개발·진단을 위해
+`inference.py`를 직접 실행할 때는 manager가 소유한 구역 추론을 먼저 중지해야
+합니다.
 
 실시간 모델의 intrinsic, distortion, extrinsic은 모두 같은
 `cameras.local.yaml`에서 읽습니다. 각 카메라에 `intrinsic`과 `extrinsic`이 모두

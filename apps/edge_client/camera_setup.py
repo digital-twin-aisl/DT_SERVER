@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Register one camera in the edge-local YAML configuration."""
 
 import argparse
@@ -26,7 +28,7 @@ from apps.edge_client.src.camera_status import (  # noqa: E402
     DEFAULT_CAMERA_PING_TIMEOUT,
     publish_camera_status_once,
 )
-from apps.edge_client.src.protocol.edge import DEFAULT_TOPIC_ROOT  # noqa: E402
+from dt_common.contracts.edge import DEFAULT_TOPIC_ROOT  # noqa: E402
 
 
 DEFAULT_CONFIG = Path(__file__).parent / "config" / "cameras.local.yaml"
@@ -111,10 +113,6 @@ def camera_key(number):
     return f"camera/{number}"
 
 
-def external_camera_key(edge_id, number):
-    return f"{edge_id}/{camera_key(number)}"
-
-
 def load_edge_metadata(path):
     try:
         metadata = json.loads(path.read_text(encoding="utf-8"))
@@ -126,10 +124,6 @@ def load_edge_metadata(path):
             "edge_id가 없습니다. 먼저 `python apps/edge_client/agent.py init`을 실행하세요."
         )
     return metadata
-
-
-def load_edge_id(path):
-    return load_edge_metadata(path)["edge_id"]
 
 
 def publish_camera_change(args, edge_metadata):
@@ -870,7 +864,7 @@ def main():
     camera_id = str(int(camera_id))
     name = input(f"카메라 이름 [{camera_key(camera_id)}]: ").strip() or camera_id
     raw_url = input(
-        "RTSP 주소 (계정 제외, 예: rtsp://192.168.0.10:554/stream1): "
+        "RTSP 주소 (계정 제외, 예: rtsp://192.0.2.10:554/stream1): "
     ).strip()
     username = input("사용자 이름 (없으면 Enter): ").strip()
     password = getpass("비밀번호: ") if username else ""

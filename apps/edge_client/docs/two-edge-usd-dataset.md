@@ -1,9 +1,10 @@
 # Two-edge USD VoxelPose dataset run
 
-The shared `data_0812_1` recording is split by physical camera number:
+The `data_0812_1` recording is stored in two edge-specific directories and
+split by physical camera number:
 
-- `edge_1`: cameras `2, 4, 6, 8`
-- `edge_2`: cameras `1, 3, 5, 7`
+- `data_0812_1_edge_1`: cameras `2, 4, 6, 8`
+- `data_0812_1_edge_2`: cameras `1, 3, 5, 7`
 
 Both edges load the same calibration result and express roots in absolute USD
 world millimetres. The server uses the same camera ordering and calibration for
@@ -61,7 +62,7 @@ python inference.py \
 cd /path/to/DT_SERVER/apps/edge_client
 python inference.py \
   --dataset \
-  --example_folder data/data_0812_1 \
+  --example-folder data/data_0812_1_edge_1 \
   --edge-id edge_1 \
   --edge-id-file config/edge_1.dataset.json \
   --deployment ../deployments/scene_0812_2.json \
@@ -75,7 +76,7 @@ python inference.py \
 cd /path/to/DT_SERVER/apps/edge_client
 python inference.py \
   --dataset \
-  --example_folder data/data_0812_1 \
+  --example-folder data/data_0812_1_edge_2 \
   --edge-id edge_2 \
   --edge-id-file config/edge_2.dataset.json \
   --deployment ../deployments/scene_0812_2.json \

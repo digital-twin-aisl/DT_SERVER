@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 VENV_PATH="${SCRIPT_DIR}/.venv"
 PYTORCH_INDEX="https://pypi.jetson-ai-lab.io/jp6/cu126"
+# Optional third-party components with licenses other than LGPL-2.1:
+#   DT_WITH_VGGT=1         VGGT-Omega (FAIR Noncommercial Research License),
+#                          used only for manager-driven calibration capture.
+#   DT_WITH_ULTRALYTICS=1  Ultralytics YOLO (AGPL-3.0), used only for ReID.
+# See docs/guide/09-license-compliance.md before enabling either.
+DT_WITH_VGGT="${DT_WITH_VGGT:-1}"
+DT_WITH_ULTRALYTICS="${DT_WITH_ULTRALYTICS:-0}"
 
 die() { echo "[ERROR] $*" >&2; exit 1; }
 log() { echo "[INFO] $*"; }
@@ -35,7 +44,7 @@ if [[ ! -f "${FASTREID_PATH}/fastreid/__init__.py" ]]; then
 fi
 
 VGGT_SOURCE="${REPOSITORY_ROOT}/apps/calibration_worker/vggt-omega"
-if [[ ! -f "${VGGT_SOURCE}/pyproject.toml" ]]; then
+if [[ "$DT_WITH_VGGT" == 1 && ! -f "${VGGT_SOURCE}/pyproject.toml" ]]; then
     log "Initializing vggt-omega submodule"
     git -C "${REPOSITORY_ROOT}" submodule update --init --depth 1 -- \
         apps/calibration_worker/vggt-omega
@@ -56,7 +65,9 @@ else
 fi
 
 VGGT_WHEELS=("${SCRIPT_DIR}"/wheels/vggt_omega-*.whl)
-if (( ${#VGGT_WHEELS[@]} > 1 )); then
+if [[ "$DT_WITH_VGGT" != 1 ]]; then
+    log "Skipping vggt-omega (DT_WITH_VGGT=0); calibration capture is disabled"
+elif (( ${#VGGT_WHEELS[@]} > 1 )); then
     die "multiple vggt-omega wheels found under ${SCRIPT_DIR}/wheels"
 elif (( ${#VGGT_WHEELS[@]} == 1 )); then
     log "Installing bundled vggt-omega wheel"
@@ -67,6 +78,9 @@ elif [[ -f "${REPOSITORY_ROOT}/apps/calibration_worker/vggt-omega/pyproject.toml
         "${REPOSITORY_ROOT}/apps/calibration_worker/vggt-omega"
 else
     die "vggt-omega is missing; bundle edge dependencies with tools/vendor_dependencies.sh"
+fi
+if [[ "$DT_WITH_VGGT" == 1 ]]; then
+    log "NOTICE: vggt-omega is under the FAIR Noncommercial Research License"
 fi
 
 log "Installing PyTorch from Jetson AI Lab"
@@ -86,28 +100,40 @@ ln -sfn ../../nvidia/cu12/lib/libcudss.so.0 \
 
 log "Installing edge client dependencies"
 python -m pip install --no-cache-dir -r "${SCRIPT_DIR}/requirements.txt"
+if [[ "$DT_WITH_ULTRALYTICS" == 1 ]]; then
+    log "Installing optional Ultralytics YOLO for ReID (AGPL-3.0)"
+    python -m pip install --no-cache-dir \
+        -r "${SCRIPT_DIR}/requirements-reid-ultralytics.txt"
+else
+    log "Skipping Ultralytics (DT_WITH_ULTRALYTICS=0); run the edge with --no-reid"
+fi
 
 log "Installing torch2trt"
 python -m pip install --no-deps --no-build-isolation \
     git+https://github.com/NVIDIA-AI-IOT/torch2trt.git
 
-log "Downloading sample data and model files"
+log "Downloading model files"
 python "${SCRIPT_DIR}/src/utils/download_from_drive.py"
 
 log "Verifying installation"
+DT_WITH_VGGT="$DT_WITH_VGGT" DT_WITH_ULTRALYTICS="$DT_WITH_ULTRALYTICS" \
 PYTHONPATH="${FASTREID_PATH}${PYTHONPATH:+:${PYTHONPATH}}" python - <<'PY'
+import os
 import cv2
 import onnx
 import onnxoptimizer
 import tensorrt
 import torch
 import torchvision
-import ultralytics
-import vggt_omega
 import zenoh
 import zstandard
 import fastreid
 from torch2trt import TRTModule, torch2trt
+
+if os.environ["DT_WITH_VGGT"] == "1":
+    import vggt_omega  # noqa: F401
+if os.environ["DT_WITH_ULTRALYTICS"] == "1":
+    import ultralytics  # noqa: F401
 
 if not torch.cuda.is_available():
     raise SystemExit("CUDA-enabled PyTorch is required")

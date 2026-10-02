@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """TensorRT engine creation and caching for the edge pose model."""
 
 from __future__ import annotations
@@ -20,7 +22,6 @@ ENGINE_CACHE_SCHEMA = 1
 ENGINE_FILES = {
     "backbone": "backbone.pth",
     "root_v2v_net": "root_v2v_net.pth",
-    "pose_v2v_net": "pose_v2v_net.pth",
 }
 DEFAULT_WORKSPACE_SIZE = 1 << 30
 
@@ -55,7 +56,6 @@ def _hardware_identity() -> dict[str, Any]:
 def build_engine_spec(model, checkpoint_path, cfg, mode="fp16"):
     """Return every value that affects the serialized TensorRT engines."""
     checkpoint = Path(checkpoint_path).resolve()
-    include_pose = getattr(model, "inference_mode", None) != "rootnet"
     spec = {
         "schema": ENGINE_CACHE_SCHEMA,
         "checkpoint": {
@@ -69,13 +69,7 @@ def build_engine_spec(model, checkpoint_path, cfg, mode="fp16"):
         "image_size": [int(value) for value in cfg.NETWORK.IMAGE_SIZE],
         "num_joints": int(cfg.NETWORK.NUM_JOINTS),
         "root_cube_size": [int(value) for value in model.root_net.cube_size],
-        "pose_cube_size": [int(value) for value in cfg.PICT_STRUCT.CUBE_SIZE],
-        "inference_mode": getattr(model, "inference_mode", None),
-        "components": [
-            "backbone",
-            "root_v2v_net",
-            *(["pose_v2v_net"] if include_pose else []),
-        ],
+        "components": ["backbone", "root_v2v_net"],
         "hardware": _hardware_identity(),
     }
     return spec
@@ -201,14 +195,6 @@ def export_tensorrt(model, output_dir, cfg, spec, mode="fp16"):
         "backbone": model.backbone,
         "root_v2v_net": model.root_net.v2v_net,
     }
-    if "pose_v2v_net" in spec["components"]:
-        pose_cube_size = tuple(int(value) for value in cfg.PICT_STRUCT.CUBE_SIZE)
-        examples["pose_v2v_net"] = torch.ones(
-            (1, int(cfg.NETWORK.NUM_JOINTS), *pose_cube_size),
-            device=device,
-        )
-        modules["pose_v2v_net"] = model.pose_net.v2v_net
-
     for component in spec["components"]:
         converted = _convert_component(
             component,
@@ -300,11 +286,5 @@ def load_tensorrt_model(
         "root_v2v_net",
         device,
     )
-    if "pose_v2v_net" in spec["components"]:
-        model.pose_net.v2v_net = _load_component(
-            engine_dir,
-            "pose_v2v_net",
-            device,
-        )
     print(f"TensorRT pose model ready: precision={mode}")
     return model

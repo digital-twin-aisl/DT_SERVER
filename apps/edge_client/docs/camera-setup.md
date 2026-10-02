@@ -73,7 +73,7 @@ deployment에 지정된 순서와 정확히 일치해야 합니다. 예를 들�
 ```bash
 python apps/edge_client/inference.py \
   --edge-id-file apps/edge_client/config/edge_1.dataset.json \
-  --deployment apps/deployments/scene_0812_2.json \
+  --deployment apps/deployments/scene_0812_poc.json \
   --tensorrt
 ```
 

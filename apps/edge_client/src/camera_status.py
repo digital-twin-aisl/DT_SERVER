@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Build and publish privacy-limited camera status snapshots over Zenoh."""
 
 from concurrent.futures import ThreadPoolExecutor
@@ -10,8 +12,8 @@ from urllib.parse import urlsplit
 import yaml
 import zenoh
 
-from apps.edge_client.src.protocol.edge import SCHEMA_VERSION, EdgeTopics, encode_json
-from apps.edge_client.src.protocol.zenoh import make_zenoh_config
+from dt_common.contracts.edge import SCHEMA_VERSION, EdgeTopics, encode_json
+from dt_common.infrastructure.zenoh import make_zenoh_config
 
 
 DEFAULT_CAMERA_PING_TIMEOUT = 1.0

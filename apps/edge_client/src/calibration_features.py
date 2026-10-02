@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Capture local CCTV frames and turn them into transportable DINO tokens."""
 
 from __future__ import annotations

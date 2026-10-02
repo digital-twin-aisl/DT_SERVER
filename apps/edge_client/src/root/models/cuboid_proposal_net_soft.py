@@ -1,6 +1,8 @@
 # ------------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
+# Derived from microsoft/voxelpose-pytorch; modified for DT_SERVER.
+# SPDX-License-Identifier: MIT
 # ------------------------------------------------------------------------------
 
 import torch
@@ -39,8 +41,6 @@ class ProposalLayerSoft(nn.Module):
             else workspace.xy_axes
         )
         self.num_cand = cfg.MULTI_PERSON.MAX_PEOPLE_NUM
-        self.root_id = cfg.DATASET.ROOTIDX
-        self.num_joints = cfg.NETWORK.NUM_JOINTS
         self.threshold = cfg.MULTI_PERSON.THRESHOLD
 
         self._cached_constants = {}
@@ -133,7 +133,6 @@ class CuboidProposalNetSoft(nn.Module):
         )
         self.root_id = cfg.DATASET.ROOTIDX
         self.rootnet_roothm = cfg.NETWORK.ROOTNET_ROOTHM
-        self.rootnet_train_synth = cfg.NETWORK.ROOTNET_TRAIN_SYNTH
         self.max_num_people = cfg.MULTI_PERSON.MAX_PEOPLE_NUM
         self.root_nms_distance = float(cfg.MULTI_PERSON.ROOT_NMS_DISTANCE)
         spatial_context = getattr(cfg, "SPATIAL_CONTEXT", None)
@@ -165,7 +164,6 @@ class CuboidProposalNetSoft(nn.Module):
 
         self.project_layer = ProjectLayer(
             cfg,
-            mode="rootnet",
             cube_size=self.cube_size,
             workspace=self.workspace,
         )

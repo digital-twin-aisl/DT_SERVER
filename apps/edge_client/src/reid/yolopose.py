@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 import numpy as np
 
 SELECTED_KEYPOINTS = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
@@ -80,16 +82,3 @@ def extract_poses_from_frames(
         _persons_from_result(result, frame, edge_id, camera_id, frame_num)
         for result, frame, camera_id in zip(results, frames, camera_ids)
     ]
-
-
-def extract_poses_from_frame(
-    model, frame, edge_id=1, cam_id=0, frame_num=0
-) -> list[dict]:
-    """Backward-compatible single-camera wrapper."""
-    return extract_poses_from_frames(
-        model,
-        [frame],
-        edge_id=edge_id,
-        camera_ids=[cam_id],
-        frame_num=frame_num,
-    )[0]

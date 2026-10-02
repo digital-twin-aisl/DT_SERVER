@@ -1,11 +1,12 @@
 # Core inference
+# Ultralytics YOLO (AGPL-3.0) is optional and only needed for ReID; see
+# requirements-reid-ultralytics.txt.
 numpy==1.24.4
 opencv-python>=4.6,<5
 Pillow
 PyYAML
 easydict
 scipy
-ultralytics==8.3.141
 zstandard
 
 # ReID
@@ -27,7 +28,6 @@ onnxsim
 
 # Utilities
 gdown
-imageio
 matplotlib
 
 # Protocols

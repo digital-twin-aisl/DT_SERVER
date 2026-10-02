@@ -1,0 +1,44 @@
+# Template for apps/edge_client/config/cameras.local.yaml (git-ignored).
+#
+#   cp apps/edge_client/config/cameras.example.yaml apps/edge_client/config/cameras.local.yaml
+#
+# Prefer the interactive tool, which also verifies the stream:
+#   apps/edge_client/.venv/bin/python apps/edge_client/camera_setup.py
+#
+# NEVER commit the local file: it holds RTSP addresses and credentials.
+# `id` must match the camera numbers assigned to this edge in the deployment
+# manifest (e.g. edge_1 -> 2, 4, 6, 8). Extrinsics come from the deployment's
+# calibration result, not from this file.
+CAMERAS:
+- id: '2'
+  name: camera2
+  url: rtsp://USER:PASSWORD@192.0.2.12:554/stream1
+  location: null
+  twin_id: null
+  intrinsic:
+    camera_matrix:
+    - [1060.0, 0, 960.0]
+    - [0, 1060.0, 540.0]
+    - [0, 0, 1]
+    distortion_coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
+    image_size: [1920, 1080]
+    method: opencv_checkerboard
+    rms_error: null
+    schema_version: 1
+    calibrated_at: null
+- id: '4'
+  name: camera4
+  url: rtsp://USER:PASSWORD@192.0.2.14:554/stream1
+  location: null
+  twin_id: null
+  intrinsic:
+    camera_matrix:
+    - [1060.0, 0, 960.0]
+    - [0, 1060.0, 540.0]
+    - [0, 0, 1]
+    distortion_coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
+    image_size: [1920, 1080]
+    method: opencv_checkerboard
+    rms_error: null
+    schema_version: 1
+    calibrated_at: null

@@ -1,0 +1,11 @@
+# OPTIONAL: person detection for edge ReID.
+#
+# Ultralytics is licensed under AGPL-3.0 (or a commercial Enterprise license).
+# It is NOT distributed with DT_SERVER and is not required for root/pose
+# synchronization; run the edge with --no-reid to work without it. Installing
+# it and distributing the combined program may subject that distribution to
+# AGPL-3.0 terms. Review docs/guide/09-license-compliance.md first.
+#
+# The YOLO pose weights (e.g. yolo11n-pose.pt) are downloaded separately and
+# carry the same license.
+ultralytics==8.3.141
