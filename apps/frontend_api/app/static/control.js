@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+// SPDX-FileCopyrightText: 2025-2026 Electronics and Telecommunications Research Institute (ETRI) and Sejong University
 // SPDX-License-Identifier: LGPL-2.1-or-later
 const $ = id => document.getElementById(id);
 const states = {running:'동작 중', starting:'준비 중', validating:'검증 중', degraded:'일부 장애', failed:'실패', stopped:'중지됨', stopping:'중지 중', completed:'완료', interrupted:'관리 서비스 중단'};

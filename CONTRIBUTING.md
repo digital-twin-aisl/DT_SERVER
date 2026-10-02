@@ -1,6 +1,6 @@
 # 기여 가이드
 
-DT_SERVER에 관심을 가져 주셔서 감사합니다. 버그 보고, 문서 개선, 코드 기여 모두 환영합니다.
+intelligent-synchronization에 관심을 가져 주셔서 감사합니다. 버그 보고, 문서 개선, 코드 기여 모두 환영합니다.
 
 ## 시작하기 전에
 
@@ -45,7 +45,7 @@ reuse lint
 새 소스 파일 맨 위에 다음 헤더를 둡니다.
 
 ```python
-# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-FileCopyrightText: 2025-2026 Electronics and Telecommunications Research Institute (ETRI) and Sejong University
 # SPDX-License-Identifier: LGPL-2.1-or-later
 ```
 

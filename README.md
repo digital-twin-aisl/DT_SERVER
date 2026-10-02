@@ -1,11 +1,14 @@
-# DT_SERVER: 디지털 트윈 동기화 엔진
+# intelligent-synchronization: 디지털 트윈 동기화 엔진
+
+> `DT_SERVER`는 이 프로젝트의 개발 코드명이며, 저장소 이름과 경로·환경변수에 남아 있습니다.
+> 별도의 외부 오픈소스가 아닙니다.
 
 여러 대의 CCTV/RTSP 카메라 관측을 **엣지(Jetson)** 와 **GPU 서버**에서 나누어 처리하고,
 사람의 **전역 ID·3D 위치·15관절 자세**를 하나의 3D 장면(`SceneOutput`)으로 동기화하는
 분산 디지털 트윈 엔진입니다. 장면은 브라우저 뷰어(Three.js)와 NVIDIA Isaac Sim으로
 실시간 전달되고, 필요하면 JSONL로 기록해 재생할 수 있습니다.
 
-- **라이선스**: [LGPL-2.1-or-later](LICENSE). 제3자 구성요소는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)를 참고합니다.
+- **라이선스**: [LGPL-2.1-or-later](LICENSE). 저작권: 한국전자통신연구원(ETRI), 세종대학교. 제3자 구성요소는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)를 참고합니다.
 - **버전**: [CHANGELOG.md](CHANGELOG.md) (Semantic Versioning, `dt-common` 패키지 버전과 동일)
 - **문서**: [활용 가이드](docs/guide/README.md) · [아키텍처](ARCHITECTURE.md)
 
@@ -73,7 +76,7 @@ python -m uvicorn apps.frontend_api.app.main:app --host 127.0.0.1 --port 8005
 
 ## 라이선스와 선택 구성요소
 
-DT_SERVER 자체는 **GNU LGPL v2.1 이상**으로 배포됩니다. 아래 구성요소는 이 저장소에
+intelligent-synchronization 자체는 **GNU LGPL v2.1 이상**으로 배포됩니다. 아래 구성요소는 이 저장소에
 **포함되지 않으며**, 필요할 때 사용자가 각 라이선스를 검토한 뒤 직접 설치합니다.
 
 | 구성요소 | 용도 | 라이선스 | 없을 때 |
@@ -81,7 +84,7 @@ DT_SERVER 자체는 **GNU LGPL v2.1 이상**으로 배포됩니다. 아래 구�
 | Ultralytics YOLO | 엣지 ReID용 사람 검출 | AGPL-3.0 | `--no-reid`로 실행 (위치 기반 ID) |
 | VGGT-Omega (서브모듈) | 자동 카메라 보정 | FAIR Noncommercial | 수동 보정 편집기 사용 |
 | FastReID (서브모듈) | ReID 특징 추출 | Apache-2.0 | `--no-reid` |
-| 학습된 PoseNet 가중치 | 2D/3D 추론 | 가중치별 | `DT_POSENET_URL`로 직접 지정 |
+| 학습된 PoseNet 가중치 | 2D/3D 추론 | 개발팀 가중치는 CC BY-NC-SA 4.0 (비배포) | 직접 학습해 `DT_POSENET_URL`로 지정 |
 
 자세한 의무 사항은 [라이선스 준수 가이드](docs/guide/09-license-compliance.md)를 참고합니다.
 

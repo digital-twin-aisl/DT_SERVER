@@ -1,7 +1,7 @@
 # Third-Party Notices
 
-DT_SERVER is licensed under LGPL-2.1-or-later (see `LICENSE`). This file lists
-third-party material that is included in, derived into, or used by DT_SERVER.
+intelligent-synchronization (development code name: DT_SERVER) is licensed under LGPL-2.1-or-later (see `LICENSE`). This file lists
+third-party material that is included in, derived into, or used by intelligent-synchronization.
 
 ## 1. Code derived into this repository
 
@@ -42,7 +42,10 @@ SOFTWARE
 
 The multi-view root/pose network design follows VoxelPose (Tu et al., ECCV 2020)
 and the root-heatmap formulation studied in SelfPose3d (Srivastav et al., CVPR 2024).
-No SelfPose3d source code is included.
+No SelfPose3d source code is included. The project's own trained checkpoint
+(`POC_posenet.pth.tar`) was fine-tuned from SelfPose3d's released models, which
+are licensed CC BY-NC-SA 4.0; it is therefore not distributed with this LGPL
+repository and, if shared, must be shared separately under CC BY-NC-SA 4.0.
 
 ## 2. Git submodules (not distributed; fetched from upstream on demand)
 

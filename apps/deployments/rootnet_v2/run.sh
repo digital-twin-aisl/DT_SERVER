@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-FileCopyrightText: 2025-2026 Electronics and Telecommunications Research Institute (ETRI) and Sejong University
 # SPDX-License-Identifier: LGPL-2.1-or-later
 # Direct diagnostic launch; does not start/stop the edge manager or agent.
 set -euo pipefail

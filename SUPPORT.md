@@ -17,7 +17,7 @@ GitHub Issues에서 알맞은 양식을 골라 주세요.
 
 버그 보고에는 다음을 포함하면 빠르게 도와드릴 수 있습니다.
 
-- DT_SERVER 버전(태그 또는 커밋), `dt-common` 버전
+- intelligent-synchronization 버전(태그 또는 커밋), `dt-common` 버전
 - 호스트 종류(서버 GPU/드라이버/CUDA, Jetson JetPack 버전), Python 버전
 - 실행한 명령과 `region status --json` 출력
 - `data/manager/runs/<run_id>/`의 로그 끝부분

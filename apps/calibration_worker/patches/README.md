@@ -10,6 +10,6 @@ git submodule update --init apps/calibration_worker/vggt-omega
 git -C apps/calibration_worker/vggt-omega apply ../patches/vggt-omega-patch-tokens.patch
 ```
 
-**라이선스**: 이 패치는 VGGT-Omega 코드의 수정본이므로 DT_SERVER의 LGPL이 아니라
+**라이선스**: 이 패치는 VGGT-Omega 코드의 수정본이므로 intelligent-synchronization의 LGPL이 아니라
 **FAIR Noncommercial Research License**(`LICENSES/LicenseRef-FAIR-Noncommercial-Research.txt`)를
 따릅니다. 비상업 연구 목적에만 사용할 수 있습니다.

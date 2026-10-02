@@ -1,7 +1,7 @@
 # ------------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
-# Derived from microsoft/voxelpose-pytorch; modified for DT_SERVER.
+# Derived from microsoft/voxelpose-pytorch; modified for intelligent-synchronization.
 # SPDX-License-Identifier: MIT
 # ------------------------------------------------------------------------------
 

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+// SPDX-FileCopyrightText: 2025-2026 Electronics and Telecommunications Research Institute (ETRI) and Sejong University
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // SceneOutput JSONL: index byte ranges, keep poses on disk until displayed.
 export const MAX_RECORDING_BYTES = 1024 * 1024 * 1024;

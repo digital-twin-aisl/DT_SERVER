@@ -1,5 +1,5 @@
 version = 1
-SPDX-PackageName = "DT_SERVER"
+SPDX-PackageName = "intelligent-synchronization"
 
 # Files without an in-file header (JSON, YAML, Markdown, USD, GLB, ...) are
 # project files under the project license. Per-file headers take precedence,
@@ -7,7 +7,7 @@ SPDX-PackageName = "DT_SERVER"
 [[annotations]]
 path = "**"
 precedence = "closest"
-SPDX-FileCopyrightText = "2025-2026 DT_SERVER contributors"
+SPDX-FileCopyrightText = "2025-2026 Electronics and Telecommunications Research Institute (ETRI) and Sejong University"
 SPDX-License-Identifier = "LGPL-2.1-or-later"
 
 
@@ -16,5 +16,5 @@ SPDX-License-Identifier = "LGPL-2.1-or-later"
 [[annotations]]
 path = "apps/calibration_worker/patches/vggt-omega-*.patch"
 precedence = "override"
-SPDX-FileCopyrightText = "Meta Platforms, Inc. and affiliates; 2025-2026 DT_SERVER contributors"
+SPDX-FileCopyrightText = "Meta Platforms, Inc. and affiliates; 2025-2026 Electronics and Telecommunications Research Institute (ETRI) and Sejong University"
 SPDX-License-Identifier = "LicenseRef-FAIR-Noncommercial-Research"

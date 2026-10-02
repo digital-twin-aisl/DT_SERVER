@@ -2,7 +2,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 # SPDX-License-Identifier: MIT
-# Derived from microsoft/voxelpose-pytorch; modified for DT_SERVER.
+# Derived from microsoft/voxelpose-pytorch; modified for intelligent-synchronization.
 # ------------------------------------------------------------------------------
 
 from __future__ import absolute_import
