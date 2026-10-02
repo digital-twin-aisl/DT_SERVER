@@ -1,8 +1,9 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Privacy-preserving calibration feature bundle shared by edge and server."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from io import BytesIO
 import hashlib
 import json
@@ -17,7 +18,7 @@ BUNDLE_SCHEMA_VERSION = 1
 PREPROCESS_NAME = "undistort-letterbox-rgb-v1"
 DEFAULT_IMAGE_SIZE = 512
 DEFAULT_CHUNK_BYTES = 512 * 1024
-MAX_BUNDLE_BYTES = 256 * 1024 * 1024
+from dt_common.contracts.chunks import ChunkCollector, MAX_BUNDLE_BYTES  # noqa: F401
 
 
 def file_sha256(path: str | Path) -> str:
@@ -102,37 +103,6 @@ def split_payload(payload: bytes, chunk_bytes: int = DEFAULT_CHUNK_BYTES) -> lis
     return [payload[offset : offset + chunk_bytes] for offset in range(0, len(payload), chunk_bytes)]
 
 
-@dataclass
-class ChunkCollector:
-    expected_count: int
-    expected_sha256: str
-    expected_size: int
-
-    def __post_init__(self) -> None:
-        if self.expected_count <= 0 or self.expected_size <= 0:
-            raise ValueError("invalid transfer dimensions")
-        if self.expected_size > MAX_BUNDLE_BYTES:
-            raise ValueError("feature bundle exceeds the size limit")
-        self._chunks: dict[int, bytes] = {}
-
-    def add(self, index: int, payload: bytes) -> None:
-        if index < 0 or index >= self.expected_count:
-            raise ValueError("chunk index is out of range")
-        self._chunks.setdefault(index, bytes(payload))
-
-    @property
-    def complete(self) -> bool:
-        return len(self._chunks) == self.expected_count
-
-    def assemble(self) -> bytes:
-        if not self.complete:
-            raise ValueError("feature transfer is incomplete")
-        payload = b"".join(self._chunks[index] for index in range(self.expected_count))
-        if len(payload) != self.expected_size:
-            raise ValueError("feature transfer size mismatch")
-        if hashlib.sha256(payload).hexdigest() != self.expected_sha256:
-            raise ValueError("feature transfer checksum mismatch")
-        return payload
 
 
 def payload_sha256(payload: bytes) -> str:

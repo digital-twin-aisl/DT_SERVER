@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Convert USD-world calibration results to VoxelPose camera dictionaries."""
 
 from __future__ import annotations

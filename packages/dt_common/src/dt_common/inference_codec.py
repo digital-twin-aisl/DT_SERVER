@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Versioned, bounded inference messages shared by edge, server and replay.
 
 ZNH2 carries zstd-compressed JSON metadata followed by contiguous tensor bytes.

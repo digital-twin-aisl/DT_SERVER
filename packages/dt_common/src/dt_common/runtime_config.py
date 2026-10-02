@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Resolve portable JSON launch profiles while keeping CLI overrides explicit."""
 
 import argparse
@@ -5,23 +7,14 @@ import json
 from pathlib import Path
 
 
-PATH_OPTIONS = {
-    "deployment",
-    "camera_config",
-    "edge_id_file",
-    "zenoh_config",
-    "cfg_focus",
-    "pose_config",
-    "example_folder",
-    "metrics_dir",
-    "scene_zenoh_config",
-    "root_trajectory_output",
-    "viser_debug_output",
-    "record_inputs",
-    "replay_inputs",
-    "record_output",
-    "decision_output",
-}
+def configure_profile_paths(parser, names):
+    """The owning app declares which parser destinations represent paths."""
+    names = frozenset(names)
+    unknown = names - {action.dest for action in parser._actions}
+    if unknown:
+        raise ValueError("path options missing from parser: " + ", ".join(sorted(unknown)))
+    parser._dt_profile_paths = names
+    return parser
 
 
 def parse_runtime_args(parser, argv=None):
@@ -34,6 +27,10 @@ def parse_runtime_args(parser, argv=None):
         if not isinstance(document, dict) or document.get("schema_version") != 1:
             parser.error("runtime config requires schema_version=1")
         defaults = dict(document.get("arguments", {}))
+        # Generated profiles can retain the source profile's path base while
+        # snapshotting its arguments. Apps, not dt_common, name path options.
+        path_base = (path.parent / document.get("path_base", ".")).resolve()
+        path_options = getattr(parser, "_dt_profile_paths", frozenset())
         actions = {action.dest: action for action in parser._actions}
         unknown = set(defaults) - set(actions)
         if unknown:
@@ -54,9 +51,9 @@ def parse_runtime_args(parser, argv=None):
                 and type(value) is not bool
             ):
                 parser.error(f"{key} must be a JSON boolean")
-            if key in PATH_OPTIONS:
+            if key in path_options:
                 resolved = Path(value).expanduser()
-                defaults[key] = str((path.parent / resolved).resolve())
+                defaults[key] = str((path_base / resolved).resolve())
             elif action.type is json.loads and not isinstance(value, str):
                 # JSON profiles already contain decoded lists/objects.
                 defaults[key] = value

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Build one explicit, world-space inference workspace for each edge.
 
 The deployment manifest owns scene assets, camera assignment, and optional

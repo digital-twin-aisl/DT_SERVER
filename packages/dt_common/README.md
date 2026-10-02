@@ -5,10 +5,12 @@ Shared, CPU-side contracts used by more than one DT runtime:
 - deterministic calibration preprocessing and feature transport;
 - USD-world calibration conversion for VoxelPose;
 - Ground surface loading/cache validation;
-- edge workspace construction and identity hashing.
+- edge workspace construction and identity hashing;
+- portable per-run deployment/calibration snapshots (`deployment.py`);
+- bounded process recovery, process-group shutdown and rotating logs (`process.py`).
 
 Application-specific inference, transport clients, model code, and device
-management do not belong in this package. Runtime applications provide NumPy,
+policy do not belong in this package. Runtime applications provide NumPy,
 OpenCV, and optional OpenUSD dependencies appropriate for their platform.
 
 For local server development, install it from the repository root:
