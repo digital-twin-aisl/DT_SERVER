@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Non-blocking raw RGBA to MP4 encoding through FFmpeg."""
 
 from __future__ import annotations

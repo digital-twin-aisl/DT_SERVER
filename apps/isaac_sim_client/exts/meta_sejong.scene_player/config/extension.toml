@@ -1,0 +1,16 @@
+[package]
+version = "0.1.0"
+title = "Meta Sejong Scene Player"
+description = "Offline playback of recorded server roots and 15-joint poses."
+category = "Meta Sejong"
+authors = ["Meta Sejong"]
+keywords = ["pose", "scene", "playback", "recording"]
+readme = "docs/README.md"
+
+[dependencies]
+"omni.kit.uiapp" = {}
+"omni.kit.menu.utils" = {}
+"omni.usd" = {}
+
+[[python.module]]
+name = "meta_sejong.scene_player"

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Receive live people scenes and visualize roots and poses in Isaac Sim.
 
 The default transport is Zenoh. WebSocket support remains available for the
@@ -9,6 +11,7 @@ import atexit
 import json
 import math
 import os
+from pathlib import Path
 import queue
 import threading
 import traceback
@@ -18,11 +21,18 @@ import omni.usd
 from pxr import Gf, Sdf, UsdGeom, UsdShade
 
 
-DEFAULT_USD_PATH = "/home/dojan/All/2025_SejongUniv_All.usd"
+# The campus stage is not distributed; fall back to the repository ground.
+# __file__ is absent when the Script Editor exec()s this file without it.
+_SCRIPT_FILE = globals().get("__file__")
+DEFAULT_USD_PATH = (
+    str(Path(_SCRIPT_FILE).resolve().parents[2] / "Ground.usd") if _SCRIPT_FILE else ""
+)
 DEFAULT_ZENOH_ENDPOINT = "127.0.0.1:7447"
 DEFAULT_ZENOH_TOPIC = "meta-sejong/scene/v1"
 
 USD_PATH = os.environ.get("ISAAC_USD_PATH", DEFAULT_USD_PATH)
+if not USD_PATH:
+    raise RuntimeError("Set ISAAC_USD_PATH to the stage USD to open")
 SCENE_TRANSPORT = os.environ.get("ISAAC_SCENE_TRANSPORT", "zenoh").lower()
 ZENOH_ENDPOINT = os.environ.get("ISAAC_ZENOH_ENDPOINT", DEFAULT_ZENOH_ENDPOINT)
 ZENOH_TOPIC = os.environ.get("ISAAC_ZENOH_TOPIC", DEFAULT_ZENOH_TOPIC)

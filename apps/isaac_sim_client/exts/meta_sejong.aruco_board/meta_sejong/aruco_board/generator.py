@@ -1,7 +1,9 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """ArUco marker image and USD board generation.
 
 This module deliberately keeps Kit UI code out of the asset generation path so it
-can also be called from Isaac Sim scripts and covered by ordinary Python tests.
+can also be called from Isaac Sim scripts.
 """
 
 from __future__ import annotations

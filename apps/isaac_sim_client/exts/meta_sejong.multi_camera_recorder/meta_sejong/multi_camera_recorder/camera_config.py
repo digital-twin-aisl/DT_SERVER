@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 DT_SERVER contributors
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Hard-coded camera calibration used by the recorder.
 
 Cameras 2/4/6/8 are copied from edge_client/config/cameras.local.yaml.

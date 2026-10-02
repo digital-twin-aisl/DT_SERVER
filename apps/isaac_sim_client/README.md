@@ -1,5 +1,12 @@
 # Meta Sejong Isaac Sim 연동 클라이언트
 
+## 서버 출력 저장 및 오프라인 재생
+
+서버에 `--scene-recording PATH.jsonl`을 지정하면 최종 root/pose 결과를 저장합니다.
+`exts/meta_sejong.scene_player`의 **Meta Sejong Scene Player** Extension에서 파일을
+열어 재생·일시정지·배속·프레임 탐색을 할 수 있습니다. 재생에는 Zenoh나 모델이
+필요하지 않습니다. [설치와 사용법](exts/meta_sejong.scene_player/docs/README.md)을 참고하세요.
+
 ## 9-view 영상 녹화 Extension
 
 현재 Viewport와 보정 카메라 8대를 동시에 MP4로 저장하는
@@ -35,14 +42,14 @@ export DT_SERVER_DIR=/path/to/DT_SERVER
 export ISAAC_SIM_DIR=/path/to/isaac-sim-standalone-4.2.0
 export ISAAC_USD_PATH=/path/to/2025_SejongUniv_All.usd
 export ISAAC_SCENE_TRANSPORT=zenoh
-export ISAAC_ZENOH_ENDPOINT=192.168.0.73:20522
+export ISAAC_ZENOH_ENDPOINT=192.0.2.73:20522
 export ISAAC_ZENOH_TOPIC=meta-sejong/scene/v1
 ```
 
 `ISAAC_USD_PATH`에는 GPU 서버에 복사한 USD 파일의 절대경로를 지정합니다.
 USD에서 상대경로로 참조하는 텍스처와 하위 USD 파일도 동일한 디렉터리 구조로
-복사해야 합니다. 환경변수를 생략하면 개발 환경의 기존 경로
-`/home/dojan/All/2025_SejongUniv_All.usd`를 사용합니다.
+복사해야 합니다. 환경변수를 생략하면 저장소 루트의 `Ground.usd`(바닥 지오메트리만 포함)를
+사용합니다. 캠퍼스 전체 USD는 배포본에 포함되지 않습니다.
 
 `ISAAC_ZENOH_ENDPOINT`는 `inference.py`와 Isaac Sim 양쪽에서 접근 가능한
 Zenoh router 주소여야 합니다. 같은 머신에 기본 포트로 zenohd를 실행한다면
@@ -71,7 +78,7 @@ WebSocket transport도 사용할 경우에만 다음 패키지가 추가로 필�
 cd "$DT_SERVER_DIR"
 python apps/server_worker/inference.py \
     <기존 inference 옵션> \
-    --zenoh-endpoint 192.168.0.73:20522 \
+    --zenoh-endpoint 192.0.2.73:20522 \
     --scene-zenoh-topic meta-sejong/scene/v1
 ```
 
@@ -93,7 +100,7 @@ Isaac Sim을 실행하기 전에 일반 Python으로 토픽을 확인할 수 있
 ```bash
 cd "$DT_SERVER_DIR"
 python apps/server_worker/tools/scene_zenoh_subscriber.py \
-    --endpoint 192.168.0.73:20522 \
+    --endpoint 192.0.2.73:20522 \
     --topic meta-sejong/scene/v1
 ```
 
@@ -258,15 +265,15 @@ sudo ufw delete allow from "$ISAAC_VIEWER_PUBLIC_IP" to any port 10021 proto udp
 
 ### 대안: mesh VPN 주소로 실행
 
-Isaac Sim 호스트의 VPN IPv4가 `100.80.10.20`, DT_SERVER 호스트의 VPN IPv4가
-`100.80.10.10`이라고 가정합니다. 두 역할이 같은 RTX 서버라면 같은 IP를
+Isaac Sim 호스트의 VPN IPv4가 `198.51.100.20`, DT_SERVER 호스트의 VPN IPv4가
+`198.51.100.10`이라고 가정합니다. 두 역할이 같은 RTX 서버라면 같은 IP를
 사용하면 됩니다.
 
 Isaac Sim 호스트에서 저장소와 Isaac Sim 4.2.0을 준비한 후 실행합니다.
 
 ```bash
 export ISAAC_SIM_DIR=/path/to/isaac-sim-standalone-4.2.0
-export ISAAC_PUBLIC_IP=100.80.10.20
+export ISAAC_PUBLIC_IP=198.51.100.20
 
 cd "$DT_SERVER_DIR"
 apps/isaac_sim_client/run_remote_webrtc.sh
@@ -276,9 +283,9 @@ DT_SERVER/Frontend API 호스트에서는 브라우저가 접속할 Isaac 주소
 내부 주소를 설정합니다.
 
 ```bash
-export ISAAC_WEBRTC_PUBLIC_URL=http://100.80.10.20:8211
-export ISAAC_WEBRTC_SERVER=100.80.10.20
-export ISAAC_WEBRTC_INTERNAL_URL=http://100.80.10.20:8211
+export ISAAC_WEBRTC_PUBLIC_URL=http://198.51.100.20:8211
+export ISAAC_WEBRTC_SERVER=198.51.100.20
+export ISAAC_WEBRTC_INTERNAL_URL=http://198.51.100.20:8211
 
 cd "$DT_SERVER_DIR"
 docker compose up -d --build frontend_api
@@ -287,13 +294,13 @@ docker compose up -d --build frontend_api
 같은 VPN에 로그인한 외부 PC의 Chrome/Chromium에서 다음 주소를 엽니다.
 
 ```text
-http://100.80.10.10:8005/
+http://198.51.100.10:8005/
 ```
 
 대시보드가 아니라 Isaac Sim 화면만 바로 보려면 다음 주소를 엽니다.
 
 ```text
-http://100.80.10.20:8211/streaming/webrtc-demo/?server=100.80.10.20
+http://198.51.100.20:8211/streaming/webrtc-demo/?server=198.51.100.20
 ```
 
 ### 공인 IP/포트포워딩으로 직접 연결
